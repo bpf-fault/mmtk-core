@@ -1,5 +1,5 @@
 use crate::plan::Mutator;
-use crate::scheduler::GCWorker;
+use crate::scheduler::{GCWorker, WorkBucketStage};
 use crate::util::ObjectReference;
 use crate::util::VMWorkerThread;
 use crate::vm::slot::Slot;
@@ -105,6 +105,22 @@ pub trait RootsWorkFactory<SL: Slot>: Clone + Send + 'static {
     //     / transitive pinning / non-pinning) of each function.
     // 3.  Introduce a function to give the VM binding a way to update root edges without
     //     representing the roots as slots.  See: https://github.com/mmtk/mmtk-core/issues/710
+
+    /// Which bucket should VM root-scanning work packets themselves be queued into.
+    ///
+    /// Most VMs should use `Prepare`, but moving collectors with a dedicated forwarding root pass
+    /// can override this to return `SecondRoots` while that pass is active.
+    fn roots_work_bucket_stage(&self) -> WorkBucketStage {
+        WorkBucketStage::Prepare
+    }
+
+    /// Which bucket should the resulting root edge-processing work be queued into.
+    ///
+    /// Most tracing uses `Closure`, but forwarding root updates for mark-compact collectors should
+    /// use `SecondRoots`.
+    fn process_edges_roots_work_bucket_stage(&self) -> WorkBucketStage {
+        WorkBucketStage::Closure
+    }
 
     /// Create work packets to handle non-pinned roots.  The roots are represented as slots so that
     /// they can be updated.

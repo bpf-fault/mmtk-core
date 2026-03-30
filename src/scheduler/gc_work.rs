@@ -790,6 +790,22 @@ enum RootsKind {
 impl<VM: VMBinding, DPE: ProcessEdgesWork<VM = VM>, PPE: ProcessEdgesWork<VM = VM>>
     RootsWorkFactory<VM::VMSlot> for ProcessEdgesWorkRootsWorkFactory<VM, DPE, PPE>
 {
+    fn roots_work_bucket_stage(&self) -> WorkBucketStage {
+        if self.mmtk.scheduler.work_buckets[WorkBucketStage::SecondRoots].is_open() {
+            WorkBucketStage::SecondRoots
+        } else {
+            WorkBucketStage::Prepare
+        }
+    }
+
+    fn process_edges_roots_work_bucket_stage(&self) -> WorkBucketStage {
+        if self.mmtk.scheduler.work_buckets[WorkBucketStage::SecondRoots].is_open() {
+            WorkBucketStage::SecondRoots
+        } else {
+            WorkBucketStage::Closure
+        }
+    }
+
     fn create_process_roots_work(&mut self, slots: Vec<VM::VMSlot>) {
         // Note: We should use the same USDT name "mmtk:roots" for all the three kinds of roots. A
         // VM binding may not call all of the three methods in this impl. For example, the OpenJDK
@@ -800,10 +816,11 @@ impl<VM: VMBinding, DPE: ProcessEdgesWork<VM = VM>, PPE: ProcessEdgesWork<VM = V
         // different names, and our `capture.bt` mentions all of them, `bpftrace` may complain that
         // it cannot find one or more of those USDT trace points in the binary.
         probe!(mmtk, roots, RootsKind::NORMAL, slots.len());
+        let bucket = self.process_edges_roots_work_bucket_stage();
         crate::memory_manager::add_work_packet(
             self.mmtk,
-            WorkBucketStage::Closure,
-            DPE::new(slots, true, self.mmtk, WorkBucketStage::Closure),
+            bucket,
+            DPE::new(slots, true, self.mmtk, bucket),
         );
     }
 

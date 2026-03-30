@@ -192,6 +192,16 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         true
     }
 
+    /// Prevent future allocations from reusing the currently known regions.
+    ///
+    /// This is used by the concurrent UFFD path so mutators resume allocation in
+    /// fresh regions while previously allocated regions are still being compacted
+    /// from shadow mappings.
+    pub fn seal_existing_regions_for_uffd(&self) {
+        let mut sync = self.sync.write().unwrap();
+        sync.next_region = sync.all_regions.len();
+    }
+
     /// Reset the allocator state after a collection, so that the allocator will
     /// revisit regions which the garbage collector has compacted.
     pub fn reset_allocator(&self) {

@@ -52,6 +52,8 @@ pub struct CompressorSpace<VM: VMBinding> {
     scheduler: Arc<GCWorkScheduler<VM>>,
     #[cfg(feature = "uffd")]
     page_metadata: Mutex<Vec<RegionPageMetadata>>,
+    #[cfg(feature = "uffd")]
+    black_allocations: Mutex<Vec<ObjectReference>>,
 }
 
 #[cfg(feature = "uffd")]
@@ -114,9 +116,16 @@ impl<VM: VMBinding> SFT for CompressorSpace<VM> {
         true
     }
 
-    fn initialize_object_metadata(&self, _object: ObjectReference) {
+    fn initialize_object_metadata(&self, object: ObjectReference) {
+        if self.should_allocate_as_live() {
+            forwarding::MARK_SPEC.fetch_or_atomic::<u8>(
+                object.to_raw_address(),
+                1,
+                Ordering::SeqCst,
+            );
+        }
         #[cfg(feature = "vo_bit")]
-        crate::util::metadata::vo_bit::set_vo_bit(_object);
+        crate::util::metadata::vo_bit::set_vo_bit(object);
     }
 
     #[cfg(feature = "sanity")]
@@ -193,11 +202,62 @@ impl<VM: VMBinding> Space<VM> for CompressorSpace<VM> {
     }
 
     fn clear_side_log_bits(&self) {
-        unimplemented!()
+        let log_bit = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC;
+        if log_bit.is_on_side() {
+            let side_log_bit = log_bit.extract_side_spec();
+            self.pr.enumerate_regions(&mut |region: &AllocatedRegion<
+                forwarding::CompressorRegion,
+            >| {
+                let start = region.region.start();
+                let end = region.cursor();
+                if start < end {
+                    side_log_bit.bzero_metadata(start, end - start);
+                }
+            });
+        } else {
+            let mut enumerator = object_enum::ClosureObjectEnumerator::<_, VM>::new(|object| {
+                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
+            });
+            self.pr.enumerate_regions(&mut |region: &AllocatedRegion<
+                forwarding::CompressorRegion,
+            >| {
+                let start = region.region.start();
+                let end = region.cursor();
+                if start < end {
+                    enumerator.visit_address_range(start, end);
+                }
+            });
+        }
     }
 
     fn set_side_log_bits(&self) {
-        unimplemented!()
+        let log_bit = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC;
+        if log_bit.is_on_side() {
+            let side_log_bit = log_bit.extract_side_spec();
+            self.pr.enumerate_regions(&mut |region: &AllocatedRegion<
+                forwarding::CompressorRegion,
+            >| {
+                let start = region.region.start();
+                let end = region.cursor();
+                if start < end {
+                    side_log_bit.bset_metadata(start, end - start);
+                }
+            });
+        } else {
+            let mut enumerator = object_enum::ClosureObjectEnumerator::<_, VM>::new(|object| {
+                VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC
+                    .mark_as_unlogged::<VM>(object, Ordering::SeqCst);
+            });
+            self.pr.enumerate_regions(&mut |region: &AllocatedRegion<
+                forwarding::CompressorRegion,
+            >| {
+                let start = region.region.start();
+                let end = region.cursor();
+                if start < end {
+                    enumerator.visit_address_range(start, end);
+                }
+            });
+        }
     }
 }
 
@@ -257,6 +317,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             scheduler,
             #[cfg(feature = "uffd")]
             page_metadata: Mutex::new(vec![]),
+            #[cfg(feature = "uffd")]
+            black_allocations: Mutex::new(vec![]),
         }
     }
 
@@ -768,14 +830,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
-    #[cfg(not(feature = "uffd"))]
     pub fn add_compact_tasks(&'static self) {
         let compact_packets: Vec<Box<dyn GCWork<VM>>> =
             self.generate_tasks(&mut |_, i| Box::new(Compact::<VM>::new(self, i)));
         self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(compact_packets);
     }
 
-    #[cfg(not(feature = "uffd"))]
     pub fn compact_region(&self, worker: &mut GCWorker<VM>, index: usize) {
         self.pr.with_regions(&mut |regions| {
             let r = &regions[index];
@@ -839,6 +899,43 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         })
     }
 
+    /// Begin recording black allocations for the current concurrent-marking epoch.
+    #[cfg(feature = "uffd")]
+    pub fn snapshot_black_allocation_cursors(&self) {
+        self.black_allocations.lock().unwrap().clear();
+    }
+
+    /// Record a fully initialized black allocation during concurrent marking.
+    #[cfg(feature = "uffd")]
+    pub fn record_black_allocation(&self, object: ObjectReference) {
+        if self.should_allocate_as_live() && self.in_space(object) {
+            self.black_allocations.lock().unwrap().push(object);
+        }
+    }
+
+    /// Clear the recorded black allocations.
+    #[cfg(feature = "uffd")]
+    pub fn clear_black_allocation_snapshot(&self) {
+        self.black_allocations.lock().unwrap().clear();
+    }
+
+    /// Drain black allocations recorded during concurrent marking, marking the
+    /// last word of each object now that the object headers are fully initialized.
+    #[cfg(feature = "uffd")]
+    pub fn take_black_allocations(&self) -> Vec<ObjectReference> {
+        let mut black_allocations = self.black_allocations.lock().unwrap();
+        let objects = std::mem::take(&mut *black_allocations);
+        for &object in objects.iter() {
+            self.forwarding.mark_last_word_of_object(object);
+        }
+        objects
+    }
+
+    #[cfg(feature = "uffd")]
+    pub fn seal_regions_for_concurrent_uffd(&self) {
+        self.pr.seal_existing_regions_for_uffd();
+    }
+
     /// Finalize a region cursor after a concurrent UFFD phase.
     ///
     /// During the UFFD epoch mutators may continue allocating.  To avoid racing with
@@ -859,6 +956,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     /// Update references from the LOS into Compressor objects after forwarding is known.
+    pub fn update_object_references(&self, worker: &mut GCWorker<VM>, object: ObjectReference) {
+        self.update_references(worker, object);
+    }
+
     pub fn update_los_references(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
         los.enumerate_to_space_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
             &mut |o: ObjectReference| {
@@ -867,7 +968,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         ));
     }
 
-    #[cfg(not(feature = "uffd"))]
+    pub fn update_space_references(&self, worker: &mut GCWorker<VM>, space: &dyn Space<VM>) {
+        let mut enumerator =
+            object_enum::ClosureObjectEnumerator::<_, VM>::new(|o: ObjectReference| {
+                self.update_references(worker, o);
+            });
+        space.enumerate_objects(&mut enumerator);
+    }
+
     pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
         self.reset_allocator_after_compaction();
         self.update_los_references(worker, los);
@@ -903,20 +1011,17 @@ impl<VM: VMBinding> CalculateOffsetVector<VM> {
 }
 
 /// Compact live objects in a region.
-#[cfg(not(feature = "uffd"))]
 pub struct Compact<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
     index: usize,
 }
 
-#[cfg(not(feature = "uffd"))]
 impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         self.compressor_space.compact_region(worker, self.index);
     }
 }
 
-#[cfg(not(feature = "uffd"))]
 impl<VM: VMBinding> Compact<VM> {
     pub fn new(compressor_space: &'static CompressorSpace<VM>, index: usize) -> Self {
         Self {

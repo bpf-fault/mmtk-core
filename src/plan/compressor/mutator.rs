@@ -1,4 +1,10 @@
+#[cfg(feature = "uffd")]
+use crate::plan::barriers::SATBBarrier;
 use crate::plan::compressor::Compressor;
+#[cfg(feature = "uffd")]
+use crate::plan::concurrent::barrier::SATBBarrierSemantics;
+#[cfg(feature = "uffd")]
+use crate::plan::concurrent::Pause;
 use crate::plan::mutator_context::common_prepare_func;
 use crate::plan::mutator_context::Mutator;
 use crate::plan::mutator_context::MutatorBuilder;
@@ -35,6 +41,12 @@ lazy_static! {
     };
 }
 
+#[cfg(feature = "uffd")]
+type BarrierSemanticsType<VM> =
+    SATBBarrierSemantics<VM, Compressor<VM>, { crate::policy::compressor::TRACE_KIND_MARK }>;
+#[cfg(feature = "uffd")]
+type BarrierType<VM> = SATBBarrier<BarrierSemanticsType<VM>>;
+
 pub fn create_compressor_mutator<VM: VMBinding>(
     mutator_tls: VMMutatorThread,
     mmtk: &'static MMTK<VM>,
@@ -51,12 +63,57 @@ pub fn create_compressor_mutator<VM: VMBinding>(
             vec.push((AllocatorSelector::BumpPointer(0), &plan.compressor_space));
             vec
         }),
-        prepare_func: &common_prepare_func,
+        prepare_func: &compressor_mutator_prepare,
         release_func: &compressor_mutator_release,
     };
 
     let builder = MutatorBuilder::new(mutator_tls, mmtk, config);
-    builder.build()
+
+    #[cfg(feature = "uffd")]
+    let mut mutator = builder
+        .barrier(Box::new(SATBBarrier::new(BarrierSemanticsType::<VM>::new(
+            mmtk,
+            mutator_tls,
+        ))))
+        .build();
+
+    #[cfg(not(feature = "uffd"))]
+    let mutator = builder.build();
+
+    #[cfg(feature = "uffd")]
+    mutator
+        .barrier
+        .downcast_mut::<BarrierType<VM>>()
+        .unwrap()
+        .set_weak_ref_barrier_enabled(plan.is_concurrent_marking_active());
+
+    mutator
+}
+
+pub fn compressor_mutator_prepare<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWorkerThread) {
+    common_prepare_func(mutator, tls);
+
+    let bump_allocator = unsafe {
+        mutator
+            .allocators
+            .get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
+    }
+    .downcast_mut::<BumpAllocator<VM>>()
+    .unwrap();
+    bump_allocator.reset();
+
+    #[cfg(feature = "uffd")]
+    {
+        let current_pause = mutator.plan.concurrent().unwrap().current_pause().unwrap();
+        debug_assert_ne!(current_pause, Pause::FinalMark);
+        if current_pause == Pause::InitialMark {
+            mutator
+                .barrier
+                .downcast_mut::<BarrierType<VM>>()
+                .unwrap()
+                .set_weak_ref_barrier_enabled(true);
+        }
+    }
 }
 
 pub fn compressor_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWorkerThread) {
@@ -69,5 +126,19 @@ pub fn compressor_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls:
     .downcast_mut::<BumpAllocator<VM>>()
     .unwrap();
     bump_allocator.reset();
+
+    #[cfg(feature = "uffd")]
+    {
+        let current_pause = mutator.plan.concurrent().unwrap().current_pause().unwrap();
+        debug_assert_ne!(current_pause, Pause::InitialMark);
+        if current_pause == Pause::Full || current_pause == Pause::FinalMark {
+            mutator
+                .barrier
+                .downcast_mut::<BarrierType<VM>>()
+                .unwrap()
+                .set_weak_ref_barrier_enabled(false);
+        }
+    }
+
     common_release_func(mutator, tls);
 }

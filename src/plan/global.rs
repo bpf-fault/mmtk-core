@@ -205,6 +205,12 @@ pub trait Plan: 'static + HasSpaces + Sync + Downcast {
     /// This defines what space this plan will allocate objects into for different semantics.
     fn get_allocator_mapping(&self) -> &'static EnumMap<AllocationSemantics, AllocatorSelector>;
 
+    /// Notify the plan that an allocated object is now fully initialized and parsable by the VM.
+    ///
+    /// VM bindings may use this hook for plan-specific post-initialization bookkeeping that must
+    /// not observe partially initialized objects.
+    fn post_alloc_initialized(&self, _object: ObjectReference) {}
+
     /// Called when all mutators are paused. This is called before prepare.
     fn notify_mutators_paused(&self, _scheduler: &GCWorkScheduler<Self::VM>) {}
 

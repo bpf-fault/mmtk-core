@@ -477,9 +477,7 @@ impl ReferenceProcessor {
         // snapshot is materialized and can corrupt the shadow-driven page rebuild logic.
         // For this path, update the source reference object in place and let reconstruction
         // copy the fixed-up field into the mapped page.
-        let update_reference_in_place =
-            std::env::var("MMTK_COMPRESSOR_UFFD_CONCURRENT").map_or(false, |v| v == "1");
-        let reference_field_target = if update_reference_in_place {
+        let reference_field_target = if cfg!(feature = "uffd") {
             reference
         } else {
             new_reference

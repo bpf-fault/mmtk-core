@@ -15,7 +15,9 @@ use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::{self, ObjectEnumerator};
 use crate::util::{Address, ObjectReference};
+#[cfg(feature = "uffd")]
 use std::collections::HashSet;
+#[cfg(feature = "uffd")]
 use std::sync::Mutex;
 use crate::vm::slot::Slot;
 use crate::MMTK;
@@ -48,9 +50,11 @@ pub struct CompressorSpace<VM: VMBinding> {
     pr: RegionPageResource<VM, forwarding::CompressorRegion>,
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
+    #[cfg(feature = "uffd")]
     page_metadata: Mutex<Vec<RegionPageMetadata>>,
 }
 
+#[cfg(feature = "uffd")]
 #[derive(Clone, Debug)]
 pub struct PageCompactMetadata {
     /// The first source object whose compacted destination overlaps this page.
@@ -61,6 +65,7 @@ pub struct PageCompactMetadata {
     pub first_obj_page_offset: u32,
 }
 
+#[cfg(feature = "uffd")]
 #[derive(Clone, Debug)]
 pub struct RegionPageMetadata {
     pub region_start: Address,
@@ -250,6 +255,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             forwarding: forwarding::ForwardingMetadata::new(),
             common,
             scheduler,
+            #[cfg(feature = "uffd")]
             page_metadata: Mutex::new(vec![]),
         }
     }
@@ -350,6 +356,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// for each destination page, we record the first source object whose compacted
     /// bytes overlap that page, and the byte offset within that object where the
     /// page begins.
+    #[cfg(feature = "uffd")]
     pub fn build_all_page_metadata(&self) {
         let metadata = self.pr.with_regions(&mut |regions| {
             regions
@@ -367,6 +374,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     /// Get page metadata for a region previously built by `build_all_page_metadata`.
+    #[cfg(feature = "uffd")]
     pub fn region_page_metadata(&self, index: usize) -> Option<RegionPageMetadata> {
         self.page_metadata.lock().unwrap().get(index).cloned()
     }
@@ -377,7 +385,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// overlap the requested destination page from the region shadow into `dst_page`.
     ///
     /// IMPORTANT: this method does **not** update references yet. It is the low-level
-    /// copy primitive we need before adding ART-style page-local reference rewriting.
+    #[cfg(feature = "uffd")]
+    /// Reconstruct one destination page from the shadow copy of a region.
+    ///
+    /// Copies object data from the shadow and rewrites internal references
+    /// so that the resulting page is self-consistent for mutator access.
     ///
     /// Returns `true` if any live data was copied into the page, `false` if the page is
     /// logically empty and should be zero-filled.
@@ -386,7 +398,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         region_index: usize,
         page_index: usize,
         shadow_region_start: Address,
-        rewrite_references: bool,
         dst_page: &mut [u8],
     ) -> bool {
         const PAGE_SIZE: usize = crate::util::constants::BYTES_IN_PAGE;
@@ -450,53 +461,45 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 let dst_offset = overlap_start - page_start;
                 let copy_len = overlap_end - overlap_start;
 
-                if rewrite_references {
-                    let words = copied_size.div_ceil(std::mem::size_of::<usize>());
-                    let mut temp_obj_words = vec![0usize; words];
-                    let temp_obj_addr = Address::from_mut_ptr(temp_obj_words.as_mut_ptr() as *mut u8);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            obj_shadow_addr.to_ptr::<u8>(),
-                            temp_obj_addr.to_mut_ptr::<u8>(),
-                            copied_size,
-                        );
-                    }
-                    let temp_obj = unsafe {
-                        ObjectReference::from_raw_address_unchecked(temp_obj_addr)
-                    };
-                    VM::VMScanning::scan_object_for_slot_rewrite(
-                        crate::util::opaque_pointer::VMWorkerThread(
-                            crate::util::opaque_pointer::VMThread::UNINITIALIZED,
-                        ),
-                        temp_obj,
-                        &mut |slot: VM::VMSlot| {
-                            if let Some(o) = slot.load() {
-                                let new_ref = if self.in_space(o) && Self::is_marked(o) {
-                                    self.forward(o, false)
-                                } else {
-                                    o
-                                };
-                                if new_ref != o {
-                                    slot.store(new_ref);
-                                }
-                            }
-                        },
+                // Copy object from shadow into a temp buffer, rewrite references,
+                // then copy the relevant slice into the destination page.
+                let words = copied_size.div_ceil(std::mem::size_of::<usize>());
+                let mut temp_obj_words = vec![0usize; words];
+                let temp_obj_addr = Address::from_mut_ptr(temp_obj_words.as_mut_ptr() as *mut u8);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        obj_shadow_addr.to_ptr::<u8>(),
+                        temp_obj_addr.to_mut_ptr::<u8>(),
+                        copied_size,
                     );
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            temp_obj_addr.add(src_offset).to_ptr::<u8>(),
-                            dst_page.as_mut_ptr().add(dst_offset),
-                            copy_len,
-                        );
-                    }
-                } else {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (obj_shadow_addr + src_offset).to_ptr::<u8>(),
-                            dst_page.as_mut_ptr().add(dst_offset),
-                            copy_len,
-                        );
-                    }
+                }
+                let temp_obj = unsafe {
+                    ObjectReference::from_raw_address_unchecked(temp_obj_addr)
+                };
+                VM::VMScanning::scan_object_for_slot_rewrite(
+                    crate::util::opaque_pointer::VMWorkerThread(
+                        crate::util::opaque_pointer::VMThread::UNINITIALIZED,
+                    ),
+                    temp_obj,
+                    &mut |slot: VM::VMSlot| {
+                        if let Some(o) = slot.load() {
+                            let new_ref = if self.in_space(o) && Self::is_marked(o) {
+                                self.forward(o, false)
+                            } else {
+                                o
+                            };
+                            if new_ref != o {
+                                slot.store(new_ref);
+                            }
+                        }
+                    },
+                );
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        temp_obj_addr.add(src_offset).to_ptr::<u8>(),
+                        dst_page.as_mut_ptr().add(dst_offset),
+                        copy_len,
+                    );
                 }
                 copied_any = true;
             });
@@ -506,11 +509,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     /// Validate the resolved compacted bytes in a region against a direct
     /// object-by-object copy from the shadow region.
+    #[cfg(feature = "uffd")]
     pub fn validate_region_compaction_from_shadow(
         &self,
         region_index: usize,
         shadow_region_start: Address,
-        rewrite_references: bool,
     ) -> Result<(), String> {
         let Some(meta) = self.region_page_metadata(region_index) else {
             return Ok(());
@@ -529,53 +532,43 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 let copied_size = VM::VMObjectModel::get_size_when_copied(shadow_obj);
                 let new_obj = self.forward(obj, false);
                 let dst_off = new_obj.to_raw_address() - meta.region_start;
-                if rewrite_references {
-                    let words = copied_size.div_ceil(std::mem::size_of::<usize>());
-                    let mut temp_obj_words = vec![0usize; words];
-                    let temp_obj_addr = Address::from_mut_ptr(temp_obj_words.as_mut_ptr() as *mut u8);
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            obj_shadow_addr.to_ptr::<u8>(),
-                            temp_obj_addr.to_mut_ptr::<u8>(),
-                            copied_size,
-                        );
-                    }
-                    let temp_obj = unsafe {
-                        ObjectReference::from_raw_address_unchecked(temp_obj_addr)
-                    };
-                    VM::VMScanning::scan_object_for_slot_rewrite(
-                        crate::util::opaque_pointer::VMWorkerThread(
-                            crate::util::opaque_pointer::VMThread::UNINITIALIZED,
-                        ),
-                        temp_obj,
-                        &mut |slot: VM::VMSlot| {
-                            if let Some(o) = slot.load() {
-                                let new_ref = if self.in_space(o) && Self::is_marked(o) {
-                                    self.forward(o, false)
-                                } else {
-                                    o
-                                };
-                                if new_ref != o {
-                                    slot.store(new_ref);
-                                }
-                            }
-                        },
+                let words = copied_size.div_ceil(std::mem::size_of::<usize>());
+                let mut temp_obj_words = vec![0usize; words];
+                let temp_obj_addr = Address::from_mut_ptr(temp_obj_words.as_mut_ptr() as *mut u8);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        obj_shadow_addr.to_ptr::<u8>(),
+                        temp_obj_addr.to_mut_ptr::<u8>(),
+                        copied_size,
                     );
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            temp_obj_addr.to_ptr::<u8>(),
-                            expected.as_mut_ptr().add(dst_off),
-                            copied_size,
-                        );
-                    }
-                } else {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            obj_shadow_addr.to_ptr::<u8>(),
-                            expected.as_mut_ptr().add(dst_off),
-                            copied_size,
-                        );
-                    }
+                }
+                let temp_obj = unsafe {
+                    ObjectReference::from_raw_address_unchecked(temp_obj_addr)
+                };
+                VM::VMScanning::scan_object_for_slot_rewrite(
+                    crate::util::opaque_pointer::VMWorkerThread(
+                        crate::util::opaque_pointer::VMThread::UNINITIALIZED,
+                    ),
+                    temp_obj,
+                    &mut |slot: VM::VMSlot| {
+                        if let Some(o) = slot.load() {
+                            let new_ref = if self.in_space(o) && Self::is_marked(o) {
+                                self.forward(o, false)
+                            } else {
+                                o
+                            };
+                            if new_ref != o {
+                                slot.store(new_ref);
+                            }
+                        }
+                    },
+                );
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        temp_obj_addr.to_ptr::<u8>(),
+                        expected.as_mut_ptr().add(dst_off),
+                        copied_size,
+                    );
                 }
             });
 
@@ -598,6 +591,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     /// Collect all valid post-compaction destination object starts.
+    #[cfg(feature = "uffd")]
     pub fn collect_destination_objects(&self) -> HashSet<ObjectReference> {
         let page_metadata = self.page_metadata.lock().unwrap().clone();
         let mut objects = HashSet::new();
@@ -612,6 +606,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     /// Validate that all Compressor-space references inside compacted Compressor objects
     /// point to valid destination object starts.
+    #[cfg(feature = "uffd")]
     pub fn validate_updated_references(
         &self,
         worker: &mut GCWorker<VM>,
@@ -654,6 +649,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         Ok(())
     }
 
+    #[cfg(feature = "uffd")]
     fn build_region_page_metadata(
         &self,
         region_start: Address,
@@ -748,12 +744,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
+    #[cfg(not(feature = "uffd"))]
     pub fn add_compact_tasks(&'static self) {
         let compact_packets: Vec<Box<dyn GCWork<VM>>> =
             self.generate_tasks(&mut |_, i| Box::new(Compact::<VM>::new(self, i)));
         self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(compact_packets);
     }
 
+    #[cfg(not(feature = "uffd"))]
     pub fn compact_region(&self, worker: &mut GCWorker<VM>, index: usize) {
         self.pr.with_regions(&mut |regions| {
             let r = &regions[index];
@@ -802,83 +800,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         });
     }
 
-    /// Compact a region by copying objects only (no reference updating).
-    /// Used in the concurrent compaction path: objects are copied first,
-    /// references are updated in a separate pass after all regions are compacted.
-    /// Returns the end address of the compacted data in this region.
-    pub fn compact_region_copy_only(&self, index: usize) -> Address {
-        self.pr.with_regions(&mut |regions| {
-            let r = &regions[index];
-            let start = r.region.start();
-            let end = r.cursor();
-            #[cfg(feature = "vo_bit")]
-            {
-                crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
-            }
-            let mut to = start;
-            self.forwarding
-                .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
-                    let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
-                    let new_object = self.forward(obj, false);
-                    debug_assert!(
-                        new_object.to_raw_address() >= to,
-                        "compact_region_copy_only: forwarding {obj} -> {0} should be >= {to}",
-                        new_object.to_raw_address()
-                    );
-                    let end_of_new_object =
-                        VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
-                    #[cfg(feature = "vo_bit")]
-                    vo_bit::set_vo_bit(new_object);
-                    to = new_object.to_object_start::<VM>() + copied_size;
-                    debug_assert_eq!(end_of_new_object, to);
-                    // NOTE: no update_references here — deferred to a later pass
-                });
-            self.pr.reset_cursor(r, to);
-            to
-        })
-    }
-
-    /// Update references for all live objects in a compacted region.
-    /// Called after all regions have been compacted (copy-only).
-    pub fn update_references_region(&self, worker: &mut GCWorker<VM>, index: usize) {
-        self.pr.with_regions(&mut |regions| {
-            let r = &regions[index];
-            let start = r.region.start();
-            let source_end = self
-                .region_page_metadata(index)
-                .map(|m| m.source_end)
-                .unwrap_or_else(|| r.cursor());
-            self.forwarding
-                .scan_marked_objects(start, source_end, &mut |obj: ObjectReference| {
-                    let new_object = self.forward(obj, false);
-                    self.update_references(worker, new_object);
-                });
-        });
-    }
-
     /// Get the number of allocated regions.
+    #[cfg(feature = "uffd")]
     pub fn num_regions(&self) -> usize {
         self.pr.with_regions(&mut |regions| regions.len())
     }
 
     /// Get region start address and cursor for a given index.
+    #[cfg(feature = "uffd")]
     pub fn region_info(&self, index: usize) -> (Address, Address) {
         self.pr.with_regions(&mut |regions| {
             let r = &regions[index];
             (r.region.start(), r.cursor())
         })
-    }
-
-    /// Reset a region cursor to the compacted end previously computed in page metadata.
-    pub fn reset_region_cursor_to_compacted_end(&self, index: usize) {
-        let Some(meta) = self.region_page_metadata(index) else {
-            return;
-        };
-        self.pr.with_regions(&mut |regions| {
-            let r = &regions[index];
-            self.pr.reset_cursor(r, meta.compacted_end);
-        });
     }
 
     /// Finalize a region cursor after a concurrent UFFD phase.
@@ -887,6 +821,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// then there were no post-resume allocations in the region and we can reclaim the
     /// hole by resetting to the compacted end. Otherwise, retain the current cursor so
     /// allocations made during the concurrent phase remain part of the region.
+    #[cfg(feature = "uffd")]
     pub fn finalize_region_cursor_after_concurrent_uffd(&self, index: usize) {
         let Some(meta) = self.region_page_metadata(index) else {
             return;
@@ -912,6 +847,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         ));
     }
 
+    #[cfg(not(feature = "uffd"))]
     pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
         self.reset_allocator_after_compaction();
         self.update_los_references(worker, los);
@@ -947,17 +883,20 @@ impl<VM: VMBinding> CalculateOffsetVector<VM> {
 }
 
 /// Compact live objects in a region.
+#[cfg(not(feature = "uffd"))]
 pub struct Compact<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
     index: usize,
 }
 
+#[cfg(not(feature = "uffd"))]
 impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         self.compressor_space.compact_region(worker, self.index);
     }
 }
 
+#[cfg(not(feature = "uffd"))]
 impl<VM: VMBinding> Compact<VM> {
     pub fn new(compressor_space: &'static CompressorSpace<VM>, index: usize) -> Self {
         Self {

@@ -199,6 +199,13 @@ nogc_multi_space = []
 # non-moving objects; but compacting all objects will be more space-efficient.
 compressor_single_space = []
 
+# Enable userfaultfd-based concurrent compaction for the Compressor plan (Linux only).
+# When enabled, the Compressor uses a two-pause protocol modeled after Android ART:
+# an initial pause (mark + forwarding + mremap/register + resume mutators), a concurrent
+# phase (background page processing + mutator fault handling), and a final pause
+# (resolve remaining pages + teardown).
+uffd = []
+
 # To collect statistics for each GC work packet. Enabling this may introduce a small overhead (several percentage slowdown on benchmark time).
 work_packet_stats = []
 

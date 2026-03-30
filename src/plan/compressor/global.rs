@@ -1,6 +1,8 @@
 use super::gc_work::CompressorWorkContext;
+#[cfg(not(feature = "uffd"))]
+use super::gc_work::AfterCompact;
 use super::gc_work::{
-    AfterCompact, ForwardingProcessEdges, GenerateWork, MarkingProcessEdges, UpdateReferences,
+    ForwardingProcessEdges, GenerateWork, MarkingProcessEdges, UpdateReferences,
 };
 use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
 use crate::plan::global::CreateGeneralPlanArgs;
@@ -21,33 +23,36 @@ use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
 use enum_map::EnumMap;
 use mmtk_macros::{HasSpaces, PlanTraceObject};
-#[cfg(target_os = "linux")]
+#[cfg(feature = "uffd")]
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(feature = "uffd")]
 use std::sync::{Arc, Mutex};
-#[cfg(target_os = "linux")]
+#[cfg(feature = "uffd")]
 use std::thread::JoinHandle;
 
 /// [`Compressor`] implements a stop-the-world and parallel implementation of
 /// the Compressor, as described in Kermany and Petrank,
 /// [The Compressor: concurrent, incremental, and parallel compaction](https://dl.acm.org/doi/10.1145/1133255.1134023).
+///
+/// With `feature = "uffd"` (Linux only), the Compressor uses a two-pause concurrent
+/// compaction protocol modeled after Android ART's mark-compact collector.
 #[derive(HasSpaces, PlanTraceObject)]
 pub struct Compressor<VM: VMBinding> {
     #[parent]
     pub common: CommonPlan<VM>,
     #[space]
     pub compressor_space: CompressorSpace<VM>,
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     uffd_concurrent_active: AtomicBool,
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     uffd_concurrent_pause: AtomicU8,
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     uffd_final_pause_requested: AtomicBool,
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     uffd_concurrent_regions_remaining: AtomicUsize,
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     uffd_context: Mutex<Option<Arc<crate::policy::compressor::uffd::UffdContext<VM>>>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     uffd_handler_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -59,12 +64,12 @@ pub const COMPRESSOR_CONSTRAINTS: PlanConstraints = PlanConstraints {
     ..PlanConstraints::default()
 };
 
-#[cfg(target_os = "linux")]
-const UFFD_CONCURRENT_PAUSE_NONE: u8 = 0;
-#[cfg(target_os = "linux")]
-const UFFD_CONCURRENT_PAUSE_INITIAL: u8 = 1;
-#[cfg(target_os = "linux")]
-const UFFD_CONCURRENT_PAUSE_FINAL: u8 = 2;
+#[cfg(feature = "uffd")]
+const UFFD_PAUSE_NONE: u8 = 0;
+#[cfg(feature = "uffd")]
+const UFFD_PAUSE_INITIAL: u8 = 1;
+#[cfg(feature = "uffd")]
+const UFFD_PAUSE_FINAL: u8 = 2;
 
 impl<VM: VMBinding> Plan for Compressor<VM> {
     fn constraints(&self) -> &'static PlanConstraints {
@@ -72,9 +77,8 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
     }
 
     fn collection_required(&self, space_full: bool, _space: Option<SpaceStats<Self::VM>>) -> bool {
-        #[cfg(target_os = "linux")]
-        if self.is_uffd_concurrent_enabled()
-            && self.uffd_concurrent_active.load(Ordering::Acquire)
+        #[cfg(feature = "uffd")]
+        if self.uffd_concurrent_active.load(Ordering::Acquire)
             && self.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained()
         {
             return true;
@@ -95,10 +99,8 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
     }
 
     fn prepare(&mut self, tls: VMWorkerThread) {
-        #[cfg(target_os = "linux")]
-        if self.is_uffd_concurrent_enabled()
-            && self.current_uffd_concurrent_pause() == UFFD_CONCURRENT_PAUSE_FINAL
-        {
+        #[cfg(feature = "uffd")]
+        if self.current_uffd_pause() == UFFD_PAUSE_FINAL {
             return;
         }
         self.common.prepare(tls, true);
@@ -106,10 +108,8 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
     }
 
     fn release(&mut self, tls: VMWorkerThread) {
-        #[cfg(target_os = "linux")]
-        if self.is_uffd_concurrent_enabled()
-            && self.current_uffd_concurrent_pause() == UFFD_CONCURRENT_PAUSE_INITIAL
-        {
+        #[cfg(feature = "uffd")]
+        if self.current_uffd_pause() == UFFD_PAUSE_INITIAL {
             return;
         }
         self.common.release(tls, true);
@@ -118,35 +118,28 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
         self.common.end_of_gc(tls);
-        #[cfg(target_os = "linux")]
-        if self.is_uffd_concurrent_enabled() {
-            match self.current_uffd_concurrent_pause() {
-                UFFD_CONCURRENT_PAUSE_INITIAL => {
-                    // Mutators will resume after this pause while the UFFD epoch is still active.
-                    // Match MMTk's concurrent-allocation discipline and tell spaces to allocate
-                    // new objects as already-live during this window. This is particularly
-                    // important for LOS: otherwise post-resume large-object allocations would be
-                    // inserted into the treadmill's alloc_nursery and violate the old STW-only
-                    // invariant checked in `LargeObjectSpace::release()`.
-                    self.set_uffd_concurrent_allocation_state(true);
-                    self.uffd_concurrent_active.store(true, Ordering::Release);
-                    self.uffd_final_pause_requested.store(false, Ordering::Release);
-                    self.uffd_concurrent_regions_remaining.store(0, Ordering::Release);
-                    self.uffd_concurrent_pause
-                        .store(UFFD_CONCURRENT_PAUSE_NONE, Ordering::Release);
-                }
-                UFFD_CONCURRENT_PAUSE_FINAL => {
-                    // The split concurrent epoch is complete; restore normal allocation behavior
-                    // before mutators resume.
-                    self.set_uffd_concurrent_allocation_state(false);
-                    self.uffd_concurrent_active.store(false, Ordering::Release);
-                    self.uffd_final_pause_requested.store(false, Ordering::Release);
-                    self.uffd_concurrent_regions_remaining.store(0, Ordering::Release);
-                    self.uffd_concurrent_pause
-                        .store(UFFD_CONCURRENT_PAUSE_NONE, Ordering::Release);
-                }
-                _ => {}
+        #[cfg(feature = "uffd")]
+        match self.current_uffd_pause() {
+            UFFD_PAUSE_INITIAL => {
+                // Mutators will resume while the UFFD epoch is active.
+                // Tell all spaces to treat new allocations as already-live so that
+                // LOS objects go to to_space (not alloc_nursery) and the treadmill
+                // invariant in LargeObjectSpace::release() is preserved.
+                self.set_allocate_as_live(true);
+                self.uffd_concurrent_active.store(true, Ordering::Release);
+                self.uffd_final_pause_requested.store(false, Ordering::Release);
+                self.uffd_concurrent_regions_remaining.store(0, Ordering::Release);
+                self.uffd_concurrent_pause.store(UFFD_PAUSE_NONE, Ordering::Release);
             }
+            UFFD_PAUSE_FINAL => {
+                // Concurrent epoch is complete; restore normal allocation.
+                self.set_allocate_as_live(false);
+                self.uffd_concurrent_active.store(false, Ordering::Release);
+                self.uffd_final_pause_requested.store(false, Ordering::Release);
+                self.uffd_concurrent_regions_remaining.store(0, Ordering::Release);
+                self.uffd_concurrent_pause.store(UFFD_PAUSE_NONE, Ordering::Release);
+            }
+            _ => {}
         }
     }
 
@@ -155,39 +148,28 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
     }
 
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
-        #[cfg(target_os = "linux")]
-        if self.is_uffd_concurrent_enabled() && self.uffd_concurrent_active.load(Ordering::Acquire)
-        {
-            self.uffd_concurrent_pause
-                .store(UFFD_CONCURRENT_PAUSE_FINAL, Ordering::Release);
-            // ART updates roots before mutator resume in the compaction pause.
-            // Our final cleanup pause should only stop/flush mutators and finish
-            // the UFFD epoch; it should not enqueue another marking-style root scan.
+        // --- Final UFFD cleanup pause ---
+        #[cfg(feature = "uffd")]
+        if self.uffd_concurrent_active.load(Ordering::Acquire) {
+            self.uffd_concurrent_pause.store(UFFD_PAUSE_FINAL, Ordering::Release);
             scheduler.work_buckets[WorkBucketStage::Unconstrained]
                 .add(StopMutators::<CompressorWorkContext<VM>>::new_no_roots());
             scheduler.work_buckets[WorkBucketStage::Compact].add(
-                super::gc_work::UffdConcurrentFinish::<VM>::new(
-                    self,
-                    &self.compressor_space,
-                ),
+                super::gc_work::UffdConcurrentFinish::<VM>::new(self, &self.compressor_space),
             );
             scheduler.work_buckets[WorkBucketStage::Release]
                 .add(Release::<CompressorWorkContext<VM>>::new(self));
-
             if !*self.base().options.no_reference_types {
                 use crate::util::reference_processor::RefEnqueue;
                 scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
             }
-
             scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
             return;
         }
 
-        // TODO use schedule_common once it can work with the Compressor
-        // The main issue there is that we need to ForwardingProcessEdges
-        // in FinalizableForwarding.
+        // --- Initial / STW collection ---
 
-        // Stop & scan mutators (mutator scanning can happen before STW)
+        // Stop & scan mutators
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add(StopMutators::<CompressorWorkContext<VM>>::new());
 
@@ -200,35 +182,22 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             CompressorSpace::<VM>::add_offset_vector_tasks,
         ));
 
-        #[cfg(target_os = "linux")]
-        let use_uffd_concurrent = self.is_uffd_concurrent_enabled();
-        #[cfg(not(target_os = "linux"))]
-        let use_uffd_concurrent = false;
-        #[cfg(target_os = "linux")]
-        let use_uffd = std::env::var("MMTK_COMPRESSOR_UFFD").map_or(false, |v| v == "1");
-        #[cfg(not(target_os = "linux"))]
-        let use_uffd = false;
-
-        if use_uffd_concurrent {
-            #[cfg(target_os = "linux")]
-            self.uffd_concurrent_pause
-                .store(UFFD_CONCURRENT_PAUSE_INITIAL, Ordering::Release);
-        }
-
-        // Build page-granular metadata whenever any userfaultfd-based Compressor
-        // path is enabled.
-        if use_uffd_concurrent || use_uffd {
+        #[cfg(feature = "uffd")]
+        {
+            self.uffd_concurrent_pause.store(UFFD_PAUSE_INITIAL, Ordering::Release);
+            // Build page metadata for UFFD page reconstruction.
             scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(
                 &self.compressor_space,
                 CompressorSpace::<VM>::build_all_page_metadata,
             ));
         }
 
-        // scan roots to update their references
+        // Scan roots to update references
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
 
-        if use_uffd_concurrent {
-            #[cfg(target_os = "linux")]
+        // Compact phase
+        #[cfg(feature = "uffd")]
+        {
             scheduler.work_buckets[WorkBucketStage::Compact].add(
                 super::gc_work::UffdConcurrentSetup::<VM>::new(
                     self,
@@ -236,22 +205,13 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                     &self.common.los,
                 ),
             );
-        } else if use_uffd {
-            #[cfg(target_os = "linux")]
-            {
-                scheduler.work_buckets[WorkBucketStage::Compact].add(
-                    super::gc_work::UffdCompact::<VM>::new(
-                        &self.compressor_space,
-                        &self.common.los,
-                    ),
-                );
-            }
-        } else {
+        }
+        #[cfg(not(feature = "uffd"))]
+        {
             scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
                 &self.compressor_space,
                 CompressorSpace::<VM>::add_compact_tasks,
             ));
-
             scheduler.work_buckets[WorkBucketStage::Compact].set_sentinel(Box::new(
                 AfterCompact::<VM>::new(&self.compressor_space, &self.common.los),
             ));
@@ -270,12 +230,11 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                 .add(WeakRefProcessing::<VM>::new());
             scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
                 .add(PhantomRefProcessing::<VM>::new());
-
             use crate::util::reference_processor::RefForwarding;
             scheduler.work_buckets[WorkBucketStage::RefForwarding]
                 .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
-
-            if !use_uffd_concurrent {
+            #[cfg(not(feature = "uffd"))]
+            {
                 use crate::util::reference_processor::RefEnqueue;
                 scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
             }
@@ -291,13 +250,10 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
         scheduler.work_buckets[WorkBucketStage::VMRefClosure]
             .set_sentinel(Box::new(VMProcessWeakRefs::<MarkingProcessEdges<VM>>::new()));
-
         scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
             .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
-
-        if !use_uffd_concurrent {
-            scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
-        }
+        #[cfg(not(feature = "uffd"))]
+        scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
 
         #[cfg(feature = "analysis")]
         {
@@ -310,11 +266,6 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
     }
 
     fn current_gc_may_move_object(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        if self.is_uffd_concurrent_enabled() && self.uffd_concurrent_active.load(Ordering::Acquire)
-        {
-            return true;
-        }
         true
     }
 
@@ -339,45 +290,38 @@ impl<VM: VMBinding> Compressor<VM> {
                 VMRequest::discontiguous(),
             )),
             common: CommonPlan::new(plan_args),
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "uffd")]
             uffd_concurrent_active: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
-            uffd_concurrent_pause: AtomicU8::new(UFFD_CONCURRENT_PAUSE_NONE),
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "uffd")]
+            uffd_concurrent_pause: AtomicU8::new(UFFD_PAUSE_NONE),
+            #[cfg(feature = "uffd")]
             uffd_final_pause_requested: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "uffd")]
             uffd_concurrent_regions_remaining: AtomicUsize::new(0),
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "uffd")]
             uffd_context: Mutex::new(None),
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "uffd")]
             uffd_handler_thread: Mutex::new(None),
         };
 
         res.verify_side_metadata_sanity();
-
         res
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn is_uffd_concurrent_enabled(&self) -> bool {
-        std::env::var("MMTK_COMPRESSOR_UFFD_CONCURRENT").map_or(false, |v| v == "1")
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn current_uffd_concurrent_pause(&self) -> u8 {
+    #[cfg(feature = "uffd")]
+    pub fn current_uffd_pause(&self) -> u8 {
         self.uffd_concurrent_pause.load(Ordering::Acquire)
     }
 
-    #[cfg(target_os = "linux")]
-    fn set_uffd_concurrent_allocation_state(&self, active: bool) {
+    #[cfg(feature = "uffd")]
+    fn set_allocate_as_live(&self, active: bool) {
         use crate::plan::global::HasSpaces;
-
         self.for_each_space(&mut |space: &dyn Space<VM>| {
             space.set_allocate_as_live(active);
         });
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     pub fn set_uffd_context(
         &self,
         ctx: Arc<crate::policy::compressor::uffd::UffdContext<VM>>,
@@ -387,37 +331,32 @@ impl<VM: VMBinding> Compressor<VM> {
         *self.uffd_handler_thread.lock().unwrap() = Some(handler);
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn uffd_context(&self) -> Option<Arc<crate::policy::compressor::uffd::UffdContext<VM>>> {
-        self.uffd_context.lock().unwrap().clone()
-    }
-
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     pub fn take_uffd_context(
         &self,
     ) -> Option<Arc<crate::policy::compressor::uffd::UffdContext<VM>>> {
         self.uffd_context.lock().unwrap().take()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     pub fn take_uffd_handler_thread(&self) -> Option<JoinHandle<()>> {
         self.uffd_handler_thread.lock().unwrap().take()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     pub fn set_uffd_concurrent_regions_remaining(&self, regions: usize) {
         self.uffd_concurrent_regions_remaining
             .store(regions, Ordering::Release);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     pub fn on_uffd_concurrent_region_processed(&self) -> bool {
         self.uffd_concurrent_regions_remaining
             .fetch_sub(1, Ordering::AcqRel)
             == 1
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "uffd")]
     pub fn request_uffd_final_pause_if_needed(&self) -> bool {
         self.uffd_final_pause_requested
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)

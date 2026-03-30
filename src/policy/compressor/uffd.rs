@@ -157,8 +157,7 @@ pub struct UffdContext<VM: VMBinding> {
     uffd: RawFd,
     /// Compressor space used to reconstruct destination pages from shadow.
     compressor_space: &'static CompressorSpace<VM>,
-    /// If true, rewrite references in each page during page reconstruction.
-    page_local_fixup: bool,
+
     /// Shadow mappings for each region.
     pub shadows: Vec<RegionShadow>,
     /// ART-style page state per region/page.
@@ -178,7 +177,6 @@ impl<VM: VMBinding> UffdContext<VM> {
     /// Regions are not yet registered — call `mremap_and_register` for each region.
     pub fn new(
         compressor_space: &'static CompressorSpace<VM>,
-        page_local_fixup: bool,
     ) -> io::Result<Self> {
         let uffd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_NONBLOCK) } as RawFd;
         if uffd < 0 {
@@ -200,7 +198,6 @@ impl<VM: VMBinding> UffdContext<VM> {
         Ok(UffdContext {
             uffd,
             compressor_space,
-            page_local_fixup,
             shadows: Vec::new(),
             page_states: Vec::new(),
             page_buffers: Vec::new(),
@@ -315,7 +312,6 @@ impl<VM: VMBinding> UffdContext<VM> {
             shadow.region_index,
             page_idx,
             unsafe { Address::from_usize(shadow.shadow_start) },
-            self.page_local_fixup,
             &mut buf[..],
         );
         buf
@@ -385,25 +381,6 @@ impl<VM: VMBinding> UffdContext<VM> {
                 let buf = self.build_page_buffer(region_idx, page_idx);
                 self.store_processed_page_buffer(region_idx, page_idx, buf);
                 self.store_page_state(region_idx, page_idx, PageState::Processed);
-                Ok(1)
-            }
-            Err(PageState::ProcessedAndMapped) => Ok(0),
-            Err(_) => Ok(0),
-        }
-    }
-
-    /// Map a page that is already in the ART-style `Processed` state.
-    fn try_map_processed_page(&self, region_idx: usize, page_idx: usize) -> io::Result<u64> {
-        match self.compare_exchange_page_state(
-            region_idx,
-            page_idx,
-            PageState::Processed,
-            PageState::ProcessedAndMapping,
-        ) {
-            Ok(_) => {
-                let buf = self.take_processed_page_buffer(region_idx, page_idx)?;
-                self.map_page_from_buffer(region_idx, page_idx, &buf)?;
-                self.store_page_state(region_idx, page_idx, PageState::ProcessedAndMapped);
                 Ok(1)
             }
             Err(PageState::ProcessedAndMapped) => Ok(0),
@@ -551,21 +528,6 @@ impl<VM: VMBinding> UffdContext<VM> {
             let num_pages = self.shadows[region_idx].region_size / PAGE_SIZE;
             for page_idx in 0..num_pages {
                 total_pages += self.try_resolve_fault_page(region_idx, page_idx)?;
-            }
-        }
-        Ok(total_pages)
-    }
-
-    /// Process all pages into ART-style `Processed` state, then map them.
-    pub fn resolve_all_pages(&self) -> io::Result<u64> {
-        let mut total_pages = 0u64;
-        for region_idx in 0..self.shadows.len() {
-            let _ = self.process_region_pages(region_idx)?;
-        }
-        for region_idx in 0..self.shadows.len() {
-            let num_pages = self.shadows[region_idx].region_size / PAGE_SIZE;
-            for page_idx in 0..num_pages {
-                total_pages += self.try_map_processed_page(region_idx, page_idx)?;
             }
         }
         Ok(total_pages)

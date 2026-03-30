@@ -226,6 +226,7 @@ impl<C: GCWorkContext> StopMutators<C> {
 
     /// Create a `StopMutators` work packet that only stops and flushes mutators.
     /// It does not enqueue mutator-root or VM-root scanning packets.
+    #[cfg(feature = "uffd")]
     pub fn new_no_roots() -> Self {
         Self {
             skip_mutator_roots: true,

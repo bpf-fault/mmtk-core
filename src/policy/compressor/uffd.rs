@@ -17,7 +17,7 @@ use crate::vm::VMBinding;
 use std::fmt;
 use std::io;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -164,6 +164,8 @@ pub struct UffdContext<VM: VMBinding> {
     page_states: Vec<Vec<AtomicU8>>,
     /// Processed-but-not-yet-mapped page buffers.
     page_buffers: Vec<Vec<Mutex<Option<Box<[u8; PAGE_SIZE]>>>>>,
+    /// Whether a region has already been unregistered/unmapped.
+    region_cleaned: Vec<AtomicBool>,
     /// Signal to stop the handler thread.
     all_done: Arc<AtomicBool>,
     /// Number of uffd fault messages handled.
@@ -175,9 +177,7 @@ pub struct UffdContext<VM: VMBinding> {
 impl<VM: VMBinding> UffdContext<VM> {
     /// Create userfaultfd and set up the API handshake.
     /// Regions are not yet registered — call `mremap_and_register` for each region.
-    pub fn new(
-        compressor_space: &'static CompressorSpace<VM>,
-    ) -> io::Result<Self> {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>) -> io::Result<Self> {
         let uffd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_NONBLOCK) } as RawFd;
         if uffd < 0 {
             return Err(io::Error::last_os_error());
@@ -201,6 +201,7 @@ impl<VM: VMBinding> UffdContext<VM> {
             shadows: Vec::new(),
             page_states: Vec::new(),
             page_buffers: Vec::new(),
+            region_cleaned: Vec::new(),
             all_done: Arc::new(AtomicBool::new(false)),
             faults_handled: Arc::new(AtomicU64::new(0)),
             pages_resolved: Arc::new(AtomicU64::new(0)),
@@ -248,13 +249,17 @@ impl<VM: VMBinding> UffdContext<VM> {
             shadow_start: shadow as usize,
             region_size,
         });
-        self.page_states
-            .push((0..num_pages).map(|_| AtomicU8::new(PageState::Unprocessed as u8)).collect());
+        self.page_states.push(
+            (0..num_pages)
+                .map(|_| AtomicU8::new(PageState::Unprocessed as u8))
+                .collect(),
+        );
         let mut buffers = Vec::with_capacity(num_pages);
         for _ in 0..num_pages {
             buffers.push(Mutex::new(None));
         }
         self.page_buffers.push(buffers);
+        self.region_cleaned.push(AtomicBool::new(false));
         Ok(())
     }
 
@@ -368,23 +373,69 @@ impl<VM: VMBinding> UffdContext<VM> {
         Ok(())
     }
 
-    /// GC-style page processing analogous to ART's `DoPageCompactionWithStateChange` with
-    /// `map_immediately = false`.
-    fn try_process_page_for_gc(&self, region_idx: usize, page_idx: usize) -> io::Result<u64> {
-        match self.compare_exchange_page_state(
-            region_idx,
-            page_idx,
-            PageState::Unprocessed,
-            PageState::Processing,
-        ) {
-            Ok(_) => {
-                let buf = self.build_page_buffer(region_idx, page_idx);
-                self.store_processed_page_buffer(region_idx, page_idx, buf);
-                self.store_page_state(region_idx, page_idx, PageState::Processed);
-                Ok(1)
+    /// ART-style background processing for a page.
+    ///
+    /// This mirrors the GC-thread side of `DoPageCompactionWithStateChange()` and
+    /// `MapMovingSpacePages()`: compact into a temporary buffer, then map the page.
+    fn try_process_or_map_page_for_gc(
+        &self,
+        region_idx: usize,
+        page_idx: usize,
+    ) -> io::Result<u64> {
+        let mut backoff = 0u32;
+        loop {
+            let state = self.load_page_state(region_idx, page_idx);
+            if state.is_wait_state() {
+                self.backoff_wait(backoff);
+                backoff = backoff.saturating_add(1);
+                continue;
             }
-            Err(PageState::ProcessedAndMapped) => Ok(0),
-            Err(_) => Ok(0),
+            match state {
+                PageState::Unprocessed => {
+                    match self.compare_exchange_page_state(
+                        region_idx,
+                        page_idx,
+                        PageState::Unprocessed,
+                        PageState::Processing,
+                    ) {
+                        Ok(_) => {
+                            let buf = self.build_page_buffer(region_idx, page_idx);
+                            self.store_processed_page_buffer(region_idx, page_idx, buf);
+                            self.store_page_state(region_idx, page_idx, PageState::Processed);
+                            continue;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                PageState::Processed => {
+                    match self.compare_exchange_page_state(
+                        region_idx,
+                        page_idx,
+                        PageState::Processed,
+                        PageState::ProcessedAndMapping,
+                    ) {
+                        Ok(_) => {
+                            let buf = self.take_processed_page_buffer(region_idx, page_idx)?;
+                            self.map_page_from_buffer(region_idx, page_idx, &buf)?;
+                            self.store_page_state(
+                                region_idx,
+                                page_idx,
+                                PageState::ProcessedAndMapped,
+                            );
+                            return Ok(1);
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                PageState::ProcessedAndMapped => return Ok(0),
+                PageState::Processing
+                | PageState::ProcessingAndMapping
+                | PageState::MutatorProcessing
+                | PageState::ProcessedAndMapping => {
+                    self.backoff_wait(backoff);
+                    backoff = backoff.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -511,26 +562,43 @@ impl<VM: VMBinding> UffdContext<VM> {
         })
     }
 
-    /// Background-GC processing for one region: compact pages into buffers, but do not map them.
-    pub fn process_region_pages(&self, region_idx: usize) -> io::Result<u64> {
-        let mut processed = 0u64;
+    /// Background-GC processing for one region.
+    ///
+    /// Like ART's `CompactMovingSpace()`, we walk pages in reverse order so cleanup
+    /// can happen incrementally as the concurrent phase advances.
+    pub fn process_region_pages_in_reverse(&self, region_idx: usize) -> io::Result<u64> {
+        let mut mapped = 0u64;
         let num_pages = self.shadows[region_idx].region_size / PAGE_SIZE;
-        for page_idx in 0..num_pages {
-            processed += self.try_process_page_for_gc(region_idx, page_idx)?;
+        for page_idx in (0..num_pages).rev() {
+            mapped += self.try_process_or_map_page_for_gc(region_idx, page_idx)?;
         }
-        Ok(processed)
+        Ok(mapped)
     }
 
-    /// Finish the concurrent epoch by resolving every page that is not yet mapped.
-    pub fn resolve_remaining_pages(&self) -> io::Result<u64> {
-        let mut total_pages = 0u64;
-        for region_idx in 0..self.shadows.len() {
-            let num_pages = self.shadows[region_idx].region_size / PAGE_SIZE;
-            for page_idx in 0..num_pages {
-                total_pages += self.try_resolve_fault_page(region_idx, page_idx)?;
-            }
+    /// Unregister one region from userfaultfd and unmap its shadow after every page
+    /// in the region has been materialized.
+    pub fn cleanup_region(&self, region_idx: usize) -> io::Result<()> {
+        if self.region_cleaned[region_idx].load(Ordering::Acquire) {
+            return Ok(());
         }
-        Ok(total_pages)
+
+        let shadow = &self.shadows[region_idx];
+        let range = UffdioRange {
+            start: shadow.original_start as u64,
+            len: shadow.region_size as u64,
+        };
+        let ret = unsafe { libc::ioctl(self.uffd, UFFDIO_UNREGISTER, &range as *const _) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let ret =
+            unsafe { libc::munmap(shadow.shadow_start as *mut libc::c_void, shadow.region_size) };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.region_cleaned[region_idx].store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn page_state_counts(&self) -> [u64; 7] {
@@ -559,20 +627,16 @@ impl<VM: VMBinding> UffdContext<VM> {
         self.pages_resolved.load(Ordering::Relaxed)
     }
 
-    /// Cleanup: unregister, unmap shadows, close uffd.
+    /// Cleanup any remaining registered regions and close the UFFD file descriptor.
     pub fn teardown(&self) {
-        for s in &self.shadows {
-            let range = UffdioRange {
-                start: s.original_start as u64,
-                len: s.region_size as u64,
-            };
-            unsafe {
-                libc::ioctl(self.uffd, UFFDIO_UNREGISTER, &range as *const _);
-            }
-        }
-        for s in &self.shadows {
-            unsafe {
-                libc::munmap(s.shadow_start as *mut libc::c_void, s.region_size);
+        for region_idx in 0..self.shadows.len() {
+            if !self.region_cleaned[region_idx].load(Ordering::Acquire) {
+                if let Err(e) = self.cleanup_region(region_idx) {
+                    error!(
+                        "UffdContext: failed to cleanup remaining region {} during teardown: {}",
+                        region_idx, e
+                    );
+                }
             }
         }
         unsafe {

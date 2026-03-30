@@ -164,6 +164,34 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         alloc.set_cursor(new);
     }
 
+    /// Reset the allocation cursor for a region only if it is still at `current`.
+    ///
+    /// This is the concurrent-safe counterpart to [`Self::reset_cursor`].  It takes
+    /// the page-resource write lock so it does not race with mutator allocations,
+    /// mirroring the way ART only reclaims from-space after it knows no future page
+    /// processing depends on the old contents.
+    pub fn reset_cursor_if_unchanged(
+        &self,
+        region_index: usize,
+        current: Address,
+        address: Address,
+    ) -> bool {
+        let mut sync = self.sync.write().unwrap();
+        let Some(alloc) = sync.all_regions.get(region_index) else {
+            return false;
+        };
+        if alloc.cursor() != current {
+            return false;
+        }
+
+        let new = address.align_up(BYTES_IN_PAGE);
+        let pages = (current - new) / BYTES_IN_PAGE;
+        self.common().accounting.release(pages);
+        alloc.set_cursor(new);
+        sync.next_region = sync.next_region.min(region_index);
+        true
+    }
+
     /// Reset the allocator state after a collection, so that the allocator will
     /// revisit regions which the garbage collector has compacted.
     pub fn reset_allocator(&self) {

@@ -15,6 +15,8 @@ use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::{self, ObjectEnumerator};
 use crate::util::{Address, ObjectReference};
+use std::collections::HashSet;
+use std::sync::Mutex;
 use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
@@ -46,6 +48,27 @@ pub struct CompressorSpace<VM: VMBinding> {
     pr: RegionPageResource<VM, forwarding::CompressorRegion>,
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
+    page_metadata: Mutex<Vec<RegionPageMetadata>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PageCompactMetadata {
+    /// The first source object whose compacted destination overlaps this page.
+    pub first_obj: Option<ObjectReference>,
+    /// If the page starts in the middle of `first_obj`, this is the byte offset
+    /// within that object where the page begins. Zero if the page begins at the
+    /// start of `first_obj` or if the page has no live data.
+    pub first_obj_page_offset: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct RegionPageMetadata {
+    pub region_start: Address,
+    /// End of the original occupied portion of the region before compaction.
+    pub source_end: Address,
+    /// End of the compacted destination data in the region.
+    pub compacted_end: Address,
+    pub pages: Vec<PageCompactMetadata>,
 }
 
 impl<VM: VMBinding> SFT for CompressorSpace<VM> {
@@ -227,6 +250,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             forwarding: forwarding::ForwardingMetadata::new(),
             common,
             scheduler,
+            page_metadata: Mutex::new(vec![]),
         }
     }
 
@@ -320,6 +344,377 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.forwarding.calculate_offset_vector(region, cursor);
     }
 
+    /// Build page-granular compaction metadata for all regions.
+    ///
+    /// This is the main prerequisite for ART-style page-fault-driven compaction:
+    /// for each destination page, we record the first source object whose compacted
+    /// bytes overlap that page, and the byte offset within that object where the
+    /// page begins.
+    pub fn build_all_page_metadata(&self) {
+        let metadata = self.pr.with_regions(&mut |regions| {
+            regions
+                .iter()
+                .map(|r| self.build_region_page_metadata(r.region.start(), r.cursor()))
+                .collect::<Vec<_>>()
+        });
+        let total_pages: usize = metadata.iter().map(|m| m.pages.len()).sum();
+        info!(
+            "Compressor page metadata built: {} regions, {} destination pages",
+            metadata.len(),
+            total_pages
+        );
+        *self.page_metadata.lock().unwrap() = metadata;
+    }
+
+    /// Get page metadata for a region previously built by `build_all_page_metadata`.
+    pub fn region_page_metadata(&self, index: usize) -> Option<RegionPageMetadata> {
+        self.page_metadata.lock().unwrap().get(index).cloned()
+    }
+
+    /// Reconstruct one compacted destination page from a shadow copy of the region.
+    ///
+    /// This is a raw-byte page builder: it copies the portions of compacted objects that
+    /// overlap the requested destination page from the region shadow into `dst_page`.
+    ///
+    /// IMPORTANT: this method does **not** update references yet. It is the low-level
+    /// copy primitive we need before adding ART-style page-local reference rewriting.
+    ///
+    /// Returns `true` if any live data was copied into the page, `false` if the page is
+    /// logically empty and should be zero-filled.
+    pub fn build_page_from_shadow(
+        &self,
+        region_index: usize,
+        page_index: usize,
+        shadow_region_start: Address,
+        rewrite_references: bool,
+        dst_page: &mut [u8],
+    ) -> bool {
+        const PAGE_SIZE: usize = crate::util::constants::BYTES_IN_PAGE;
+        assert!(dst_page.len() >= PAGE_SIZE, "dst_page must be at least one page");
+        dst_page[..PAGE_SIZE].fill(0);
+
+        let Some(meta) = self.region_page_metadata(region_index) else {
+            return false;
+        };
+        if page_index >= meta.pages.len() {
+            return false;
+        }
+        let Some(first_obj) = meta.pages[page_index].first_obj else {
+            return false;
+        };
+
+        let region_start = meta.region_start;
+        let region_cursor = meta.source_end;
+        let page_start = meta.region_start + page_index * PAGE_SIZE;
+        let page_end = page_start + PAGE_SIZE;
+
+        let mut started = false;
+        let mut done = false;
+        let mut copied_any = false;
+
+        self.forwarding
+            .scan_marked_objects(region_start, region_cursor, &mut |obj: ObjectReference| {
+                if done {
+                    return;
+                }
+                if !started {
+                    if obj != first_obj {
+                        return;
+                    }
+                    started = true;
+                }
+
+                let obj_shadow_addr = shadow_region_start + (obj.to_raw_address() - region_start);
+                let shadow_obj = ObjectReference::from_raw_address(obj_shadow_addr)
+                    .expect("shadow object address should be valid");
+                let copied_size = VM::VMObjectModel::get_size_when_copied(shadow_obj);
+                let new_obj = self.forward(obj, false);
+                let dst_start = new_obj.to_raw_address();
+                let dst_end = dst_start + copied_size;
+
+                if dst_start >= page_end {
+                    done = true;
+                    return;
+                }
+                if dst_end <= page_start {
+                    return;
+                }
+
+                let overlap_start = if dst_start > page_start { dst_start } else { page_start };
+                let overlap_end = if dst_end < page_end { dst_end } else { page_end };
+                if overlap_end <= overlap_start {
+                    return;
+                }
+
+                let src_offset = overlap_start - dst_start;
+                let dst_offset = overlap_start - page_start;
+                let copy_len = overlap_end - overlap_start;
+
+                if rewrite_references {
+                    let words = copied_size.div_ceil(std::mem::size_of::<usize>());
+                    let mut temp_obj_words = vec![0usize; words];
+                    let temp_obj_addr = Address::from_mut_ptr(temp_obj_words.as_mut_ptr() as *mut u8);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            obj_shadow_addr.to_ptr::<u8>(),
+                            temp_obj_addr.to_mut_ptr::<u8>(),
+                            copied_size,
+                        );
+                    }
+                    let temp_obj = unsafe {
+                        ObjectReference::from_raw_address_unchecked(temp_obj_addr)
+                    };
+                    VM::VMScanning::scan_object_for_slot_rewrite(
+                        crate::util::opaque_pointer::VMWorkerThread(
+                            crate::util::opaque_pointer::VMThread::UNINITIALIZED,
+                        ),
+                        temp_obj,
+                        &mut |slot: VM::VMSlot| {
+                            if let Some(o) = slot.load() {
+                                let new_ref = if self.in_space(o) && Self::is_marked(o) {
+                                    self.forward(o, false)
+                                } else {
+                                    o
+                                };
+                                if new_ref != o {
+                                    slot.store(new_ref);
+                                }
+                            }
+                        },
+                    );
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            temp_obj_addr.add(src_offset).to_ptr::<u8>(),
+                            dst_page.as_mut_ptr().add(dst_offset),
+                            copy_len,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (obj_shadow_addr + src_offset).to_ptr::<u8>(),
+                            dst_page.as_mut_ptr().add(dst_offset),
+                            copy_len,
+                        );
+                    }
+                }
+                copied_any = true;
+            });
+
+        copied_any
+    }
+
+    /// Validate the resolved compacted bytes in a region against a direct
+    /// object-by-object copy from the shadow region.
+    pub fn validate_region_compaction_from_shadow(
+        &self,
+        region_index: usize,
+        shadow_region_start: Address,
+        rewrite_references: bool,
+    ) -> Result<(), String> {
+        let Some(meta) = self.region_page_metadata(region_index) else {
+            return Ok(());
+        };
+        let live_bytes = meta.compacted_end - meta.region_start;
+        if live_bytes == 0 {
+            return Ok(());
+        }
+
+        let mut expected = vec![0u8; live_bytes];
+        self.forwarding
+            .scan_marked_objects(meta.region_start, meta.source_end, &mut |obj: ObjectReference| {
+                let obj_shadow_addr = shadow_region_start + (obj.to_raw_address() - meta.region_start);
+                let shadow_obj = ObjectReference::from_raw_address(obj_shadow_addr)
+                    .expect("shadow object address should be valid");
+                let copied_size = VM::VMObjectModel::get_size_when_copied(shadow_obj);
+                let new_obj = self.forward(obj, false);
+                let dst_off = new_obj.to_raw_address() - meta.region_start;
+                if rewrite_references {
+                    let words = copied_size.div_ceil(std::mem::size_of::<usize>());
+                    let mut temp_obj_words = vec![0usize; words];
+                    let temp_obj_addr = Address::from_mut_ptr(temp_obj_words.as_mut_ptr() as *mut u8);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            obj_shadow_addr.to_ptr::<u8>(),
+                            temp_obj_addr.to_mut_ptr::<u8>(),
+                            copied_size,
+                        );
+                    }
+                    let temp_obj = unsafe {
+                        ObjectReference::from_raw_address_unchecked(temp_obj_addr)
+                    };
+                    VM::VMScanning::scan_object_for_slot_rewrite(
+                        crate::util::opaque_pointer::VMWorkerThread(
+                            crate::util::opaque_pointer::VMThread::UNINITIALIZED,
+                        ),
+                        temp_obj,
+                        &mut |slot: VM::VMSlot| {
+                            if let Some(o) = slot.load() {
+                                let new_ref = if self.in_space(o) && Self::is_marked(o) {
+                                    self.forward(o, false)
+                                } else {
+                                    o
+                                };
+                                if new_ref != o {
+                                    slot.store(new_ref);
+                                }
+                            }
+                        },
+                    );
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            temp_obj_addr.to_ptr::<u8>(),
+                            expected.as_mut_ptr().add(dst_off),
+                            copied_size,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            obj_shadow_addr.to_ptr::<u8>(),
+                            expected.as_mut_ptr().add(dst_off),
+                            copied_size,
+                        );
+                    }
+                }
+            });
+
+        let actual = unsafe {
+            std::slice::from_raw_parts(meta.region_start.to_ptr::<u8>(), live_bytes)
+        };
+        if expected != actual {
+            for i in 0..live_bytes {
+                if expected[i] != actual[i] {
+                    return Err(format!(
+                        "region {} mismatch at byte {} (expected 0x{:02x}, actual 0x{:02x})",
+                        region_index, i, expected[i], actual[i]
+                    ));
+                }
+            }
+            return Err(format!("region {} mismatch with unknown differing byte", region_index));
+        }
+
+        Ok(())
+    }
+
+    /// Collect all valid post-compaction destination object starts.
+    pub fn collect_destination_objects(&self) -> HashSet<ObjectReference> {
+        let page_metadata = self.page_metadata.lock().unwrap().clone();
+        let mut objects = HashSet::new();
+        for meta in page_metadata {
+            self.forwarding
+                .scan_marked_objects(meta.region_start, meta.source_end, &mut |obj: ObjectReference| {
+                    objects.insert(self.forward(obj, false));
+                });
+        }
+        objects
+    }
+
+    /// Validate that all Compressor-space references inside compacted Compressor objects
+    /// point to valid destination object starts.
+    pub fn validate_updated_references(
+        &self,
+        worker: &mut GCWorker<VM>,
+        valid_objects: &HashSet<ObjectReference>,
+    ) -> Result<(), String> {
+        let page_metadata = self.page_metadata.lock().unwrap().clone();
+        for meta in page_metadata {
+            let mut err = None;
+            self.forwarding
+                .scan_marked_objects(meta.region_start, meta.source_end, &mut |obj: ObjectReference| {
+                    if err.is_some() {
+                        return;
+                    }
+                    let new_object = self.forward(obj, false);
+                    if !VM::VMObjectModel::is_object_sane(new_object) {
+                        err = Some(format!(
+                            "invalid destination object after fixup: {} (from {})",
+                            new_object, obj
+                        ));
+                        return;
+                    }
+                    VM::VMScanning::scan_object(worker.tls, new_object, &mut |s: VM::VMSlot| {
+                        if err.is_some() {
+                            return;
+                        }
+                        if let Some(referent) = s.load() {
+                            if self.in_space(referent) && !valid_objects.contains(&referent) {
+                                err = Some(format!(
+                                    "stale/invalid Compressor ref {} found in object {} (from {})",
+                                    referent, new_object, obj
+                                ));
+                            }
+                        }
+                    });
+                });
+            if let Some(err) = err {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn build_region_page_metadata(
+        &self,
+        region_start: Address,
+        cursor: Address,
+    ) -> RegionPageMetadata {
+        const PAGE_SIZE: usize = crate::util::constants::BYTES_IN_PAGE;
+
+        let mut compacted_end = region_start;
+        self.forwarding
+            .scan_marked_objects(region_start, cursor, &mut |obj: ObjectReference| {
+                let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                let new_obj = self.forward(obj, false);
+                let obj_end = new_obj.to_raw_address() + copied_size;
+                if obj_end > compacted_end {
+                    compacted_end = obj_end;
+                }
+            });
+
+        let used_bytes = compacted_end - region_start;
+        let num_pages = used_bytes.div_ceil(PAGE_SIZE);
+        let mut pages = vec![
+            PageCompactMetadata {
+                first_obj: None,
+                first_obj_page_offset: 0,
+            };
+            num_pages
+        ];
+
+        self.forwarding
+            .scan_marked_objects(region_start, cursor, &mut |obj: ObjectReference| {
+                let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                let new_obj = self.forward(obj, false);
+                let dst_start = new_obj.to_raw_address();
+                let dst_end = dst_start + copied_size;
+                if dst_end <= region_start {
+                    return;
+                }
+                let first_page = (dst_start - region_start) / PAGE_SIZE;
+                let last_page = (dst_end - 1 - region_start) / PAGE_SIZE;
+                for page_idx in first_page..=last_page {
+                    if pages[page_idx].first_obj.is_none() {
+                        let page_start = region_start + page_idx * PAGE_SIZE;
+                        let offset = if page_start > dst_start {
+                            page_start - dst_start
+                        } else {
+                            0
+                        };
+                        pages[page_idx].first_obj = Some(obj);
+                        pages[page_idx].first_obj_page_offset = offset as u32;
+                    }
+                }
+            });
+
+        RegionPageMetadata {
+            region_start,
+            source_end: cursor,
+            compacted_end,
+            pages,
+        }
+    }
+
     pub fn forward(&self, object: ObjectReference, _vo_bit_valid: bool) -> ObjectReference {
         if !self.in_space(object) {
             return object;
@@ -407,14 +802,119 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         });
     }
 
-    pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
+    /// Compact a region by copying objects only (no reference updating).
+    /// Used in the concurrent compaction path: objects are copied first,
+    /// references are updated in a separate pass after all regions are compacted.
+    /// Returns the end address of the compacted data in this region.
+    pub fn compact_region_copy_only(&self, index: usize) -> Address {
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            let start = r.region.start();
+            let end = r.cursor();
+            #[cfg(feature = "vo_bit")]
+            {
+                crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
+            }
+            let mut to = start;
+            self.forwarding
+                .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
+                    let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
+                    let new_object = self.forward(obj, false);
+                    debug_assert!(
+                        new_object.to_raw_address() >= to,
+                        "compact_region_copy_only: forwarding {obj} -> {0} should be >= {to}",
+                        new_object.to_raw_address()
+                    );
+                    let end_of_new_object =
+                        VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
+                    #[cfg(feature = "vo_bit")]
+                    vo_bit::set_vo_bit(new_object);
+                    to = new_object.to_object_start::<VM>() + copied_size;
+                    debug_assert_eq!(end_of_new_object, to);
+                    // NOTE: no update_references here — deferred to a later pass
+                });
+            self.pr.reset_cursor(r, to);
+            to
+        })
+    }
+
+    /// Update references for all live objects in a compacted region.
+    /// Called after all regions have been compacted (copy-only).
+    pub fn update_references_region(&self, worker: &mut GCWorker<VM>, index: usize) {
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            let start = r.region.start();
+            let source_end = self
+                .region_page_metadata(index)
+                .map(|m| m.source_end)
+                .unwrap_or_else(|| r.cursor());
+            self.forwarding
+                .scan_marked_objects(start, source_end, &mut |obj: ObjectReference| {
+                    let new_object = self.forward(obj, false);
+                    self.update_references(worker, new_object);
+                });
+        });
+    }
+
+    /// Get the number of allocated regions.
+    pub fn num_regions(&self) -> usize {
+        self.pr.with_regions(&mut |regions| regions.len())
+    }
+
+    /// Get region start address and cursor for a given index.
+    pub fn region_info(&self, index: usize) -> (Address, Address) {
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            (r.region.start(), r.cursor())
+        })
+    }
+
+    /// Reset a region cursor to the compacted end previously computed in page metadata.
+    pub fn reset_region_cursor_to_compacted_end(&self, index: usize) {
+        let Some(meta) = self.region_page_metadata(index) else {
+            return;
+        };
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            self.pr.reset_cursor(r, meta.compacted_end);
+        });
+    }
+
+    /// Finalize a region cursor after a concurrent UFFD phase.
+    ///
+    /// If the region cursor did not move past the original pre-compaction `source_end`,
+    /// then there were no post-resume allocations in the region and we can reclaim the
+    /// hole by resetting to the compacted end. Otherwise, retain the current cursor so
+    /// allocations made during the concurrent phase remain part of the region.
+    pub fn finalize_region_cursor_after_concurrent_uffd(&self, index: usize) {
+        let Some(meta) = self.region_page_metadata(index) else {
+            return;
+        };
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            if r.cursor() <= meta.source_end {
+                self.pr.reset_cursor(r, meta.compacted_end);
+            }
+        });
+    }
+
+    pub fn reset_allocator_after_compaction(&self) {
         self.pr.reset_allocator();
-        // Update references from the LOS to Compressor too.
+    }
+
+    /// Update references from the LOS into Compressor objects after forwarding is known.
+    pub fn update_los_references(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
         los.enumerate_to_space_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
             &mut |o: ObjectReference| {
                 self.update_references(worker, o);
             },
         ));
+    }
+
+    pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
+        self.reset_allocator_after_compaction();
+        self.update_los_references(worker, los);
     }
 }
 

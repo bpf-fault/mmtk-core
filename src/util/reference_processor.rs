@@ -471,6 +471,20 @@ impl ReferenceProcessor {
         let new_reference = Self::get_forwarded_reference(reference);
         trace!(" forwarded to: {}", new_reference);
 
+        // In the concurrent UFFD Compressor path, moving-space pages are reconstructed
+        // from a shadow copy of the pre-compaction heap. If we eagerly write the updated
+        // referent into `new_reference` here, that mutates a destination address before the
+        // snapshot is materialized and can corrupt the shadow-driven page rebuild logic.
+        // For this path, update the source reference object in place and let reconstruction
+        // copy the fixed-up field into the mapped page.
+        let update_reference_in_place =
+            std::env::var("MMTK_COMPRESSOR_UFFD_CONCURRENT").map_or(false, |v| v == "1");
+        let reference_field_target = if update_reference_in_place {
+            reference
+        } else {
+            new_reference
+        };
+
         // Get the old referent.
         let maybe_old_referent = VM::VMReferenceGlue::get_referent(reference);
         trace!(" referent: {:?}", maybe_old_referent);
@@ -498,13 +512,13 @@ impl ReferenceProcessor {
             // copying collector.
 
             // Update the referent
-            VM::VMReferenceGlue::set_referent(new_reference, new_referent);
+            VM::VMReferenceGlue::set_referent(reference_field_target, new_referent);
             Some(new_reference)
         } else {
             // Referent is unreachable. Clear the referent and enqueue the reference object.
             trace!("  UNREACHABLE referent: {}", old_referent);
 
-            VM::VMReferenceGlue::clear_referent(new_reference);
+            VM::VMReferenceGlue::clear_referent(reference_field_target);
             enqueued_references.push(new_reference);
             None
         }

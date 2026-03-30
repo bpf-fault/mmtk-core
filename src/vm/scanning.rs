@@ -196,6 +196,19 @@ pub trait Scanning<VM: VMBinding> {
         slot_visitor: &mut SV,
     );
 
+    /// Scan an object for slot-rewriting purposes without VM-specific side effects such as
+    /// enqueuing weak-reference candidates.
+    ///
+    /// By default this delegates to [`Scanning::scan_object`]. VM bindings that attach extra
+    /// semantics to ordinary object scanning can override this with a side-effect-free variant.
+    fn scan_object_for_slot_rewrite<SV: SlotVisitor<VM::VMSlot>>(
+        tls: VMWorkerThread,
+        object: ObjectReference,
+        slot_visitor: &mut SV,
+    ) {
+        Self::scan_object(tls, object, slot_visitor)
+    }
+
     /// Delegated scanning of a object, visiting each reference field encountered, and tracing the
     /// objects pointed by each field.
     ///

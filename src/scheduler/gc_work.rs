@@ -195,6 +195,9 @@ pub struct StopMutators<C: GCWorkContext> {
     /// If this is true, we skip creating [`ScanMutatorRoots`] work packets for mutators.
     /// By default, this is false.
     skip_mutator_roots: bool,
+    /// If this is true, we skip creating [`ScanVMSpecificRoots`] work packets.
+    /// By default, this is false.
+    skip_vm_specific_roots: bool,
     /// Flush mutators once they are stopped. By default this is false. [`ScanMutatorRoots`] will flush mutators.
     flush_mutator: bool,
     phantom: PhantomData<C>,
@@ -204,15 +207,29 @@ impl<C: GCWorkContext> StopMutators<C> {
     pub fn new() -> Self {
         Self {
             skip_mutator_roots: false,
+            skip_vm_specific_roots: false,
             flush_mutator: false,
             phantom: PhantomData,
         }
     }
 
     /// Create a `StopMutators` work packet that does not create `ScanMutatorRoots` work packets for mutators, and will simply flush mutators.
+    /// VM-specific roots are still scanned.
     pub fn new_no_scan_roots() -> Self {
         Self {
             skip_mutator_roots: true,
+            skip_vm_specific_roots: false,
+            flush_mutator: true,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Create a `StopMutators` work packet that only stops and flushes mutators.
+    /// It does not enqueue mutator-root or VM-root scanning packets.
+    pub fn new_no_roots() -> Self {
+        Self {
+            skip_mutator_roots: true,
+            skip_vm_specific_roots: true,
             flush_mutator: true,
             phantom: PhantomData,
         }
@@ -238,7 +255,10 @@ impl<C: GCWorkContext> GCWork<C::VM> for StopMutators<C> {
         trace!("stop_all_mutators end");
         mmtk.get_plan().notify_mutators_paused(&mmtk.scheduler);
         mmtk.scheduler.notify_mutators_paused(mmtk);
-        mmtk.scheduler.work_buckets[WorkBucketStage::Prepare].add(ScanVMSpecificRoots::<C>::new());
+        if !self.skip_vm_specific_roots {
+            mmtk.scheduler.work_buckets[WorkBucketStage::Prepare]
+                .add(ScanVMSpecificRoots::<C>::new());
+        }
     }
 }
 

@@ -4,6 +4,8 @@ use super::gc_work::CaptureBlackAllocations;
 use super::gc_work::CompressorWorkContext;
 #[cfg(feature = "uffd")]
 use super::gc_work::ConcurrentCompressorGCWorkContext;
+use super::gc_work::LogBucketTiming;
+use super::gc_work::TimedPrepare;
 use super::gc_work::{ForwardingProcessEdges, GenerateWork, MarkingProcessEdges, UpdateReferences};
 #[cfg(feature = "uffd")]
 use super::gc_work::{ValidateMutatorRoots, ValidateVmSpecificRoots};
@@ -454,21 +456,35 @@ impl<VM: VMBinding> Compressor<VM> {
     }
 
     fn schedule_stw_full_gc(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        const PREPARE_LABEL: &str = "Compressor STW: Prepare bucket";
+        const FORWARDING_LABEL: &str = "Compressor STW: CalculateForwarding bucket";
+        const SECOND_ROOTS_LABEL: &str = "Compressor STW: SecondRoots bucket";
+        const COMPACT_LABEL: &str = "Compressor STW: Compact bucket";
+
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add(StopMutators::<CompressorWorkContext<VM>>::new());
         scheduler.work_buckets[WorkBucketStage::Prepare]
-            .add(Prepare::<CompressorWorkContext<VM>>::new(self));
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(
+            .add(TimedPrepare::<CompressorWorkContext<VM>>::new(self, PREPARE_LABEL));
+        scheduler.work_buckets[WorkBucketStage::Prepare]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(PREPARE_LABEL)));
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new_timed(
             &self.compressor_space,
             CompressorSpace::<VM>::add_offset_vector_tasks,
+            FORWARDING_LABEL,
         ));
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
-        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(FORWARDING_LABEL)));
+        scheduler.work_buckets[WorkBucketStage::SecondRoots]
+            .add(UpdateReferences::<VM>::new_timed(SECOND_ROOTS_LABEL));
+        scheduler.work_buckets[WorkBucketStage::SecondRoots]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(SECOND_ROOTS_LABEL)));
+        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new_timed(
             &self.compressor_space,
             CompressorSpace::<VM>::add_compact_tasks,
+            COMPACT_LABEL,
         ));
         scheduler.work_buckets[WorkBucketStage::Compact].set_sentinel(Box::new(
-            AfterCompact::<VM>::new(&self.compressor_space, &self.common.los),
+            AfterCompact::<VM>::new_timed(&self.compressor_space, &self.common.los, COMPACT_LABEL),
         ));
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<CompressorWorkContext<VM>>::new(self));
@@ -558,31 +574,47 @@ impl<VM: VMBinding> Compressor<VM> {
 
     #[cfg(feature = "uffd")]
     fn schedule_initial_mark(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        const PREPARE_LABEL: &str = "Compressor InitialMark: Prepare bucket";
+
         self.set_ref_closure_buckets_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
             ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_MARK>>,
         >::new());
-        scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<
+        scheduler.work_buckets[WorkBucketStage::Prepare].add(TimedPrepare::<
             ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,
-        >::new(self));
+        >::new(self, PREPARE_LABEL));
+        scheduler.work_buckets[WorkBucketStage::Prepare]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(PREPARE_LABEL)));
     }
 
     #[cfg(feature = "uffd")]
     fn schedule_final_mark(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        const PREPARE_LABEL: &str = "Compressor FinalMark: Prepare bucket";
+        const FORWARDING_LABEL: &str = "Compressor FinalMark: CalculateForwarding bucket";
+        const SECOND_ROOTS_LABEL: &str = "Compressor FinalMark: SecondRoots bucket";
+
         self.set_ref_closure_buckets_enabled(true);
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add(StopMutators::<CompressorWorkContext<VM>>::new());
         scheduler.work_buckets[WorkBucketStage::Prepare]
-            .add(Prepare::<CompressorWorkContext<VM>>::new(self));
+            .add(TimedPrepare::<CompressorWorkContext<VM>>::new(self, PREPARE_LABEL));
+        scheduler.work_buckets[WorkBucketStage::Prepare]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(PREPARE_LABEL)));
         scheduler.work_buckets[WorkBucketStage::Closure].add(CaptureBlackAllocations::<VM>::new(
             self,
             &self.compressor_space,
         ));
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new_timed(
             &self.compressor_space,
             CompressorSpace::<VM>::add_offset_vector_tasks,
+            FORWARDING_LABEL,
         ));
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(FORWARDING_LABEL)));
+        scheduler.work_buckets[WorkBucketStage::SecondRoots]
+            .add(UpdateReferences::<VM>::new_timed(SECOND_ROOTS_LABEL));
+        scheduler.work_buckets[WorkBucketStage::SecondRoots]
+            .set_sentinel(Box::new(LogBucketTiming::<VM>::new(SECOND_ROOTS_LABEL)));
         if std::env::var_os("MMTK_VALIDATE_MUTATOR_ROOTS").is_some() {
             scheduler.work_buckets[WorkBucketStage::Compact]
                 .add(ValidateMutatorRoots::<VM>::new(&self.compressor_space));

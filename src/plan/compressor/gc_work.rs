@@ -1,4 +1,5 @@
 use super::global::Compressor;
+use crate::plan::Plan;
 use crate::policy::compressor::{CompressorSpace, TRACE_KIND_FORWARD_ROOT, TRACE_KIND_MARK};
 use crate::policy::largeobjectspace::LargeObjectSpace;
 #[cfg(feature = "uffd")]
@@ -14,24 +15,52 @@ use crate::vm::{ActivePlan, Scanning, VMBinding};
 use crate::MMTK;
 use std::marker::{PhantomData, Send};
 use std::sync::OnceLock;
-#[cfg(feature = "uffd")]
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashMap, collections::HashSet, sync::Arc, sync::Mutex, time::Instant};
 
 fn compressor_perf_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
 }
 
+fn compressor_bucket_timings() -> &'static Mutex<HashMap<&'static str, Instant>> {
+    static TIMINGS: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    TIMINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn start_compressor_bucket_timing(label: &'static str) {
+    if compressor_perf_trace_enabled() {
+        compressor_bucket_timings()
+            .lock()
+            .unwrap()
+            .insert(label, Instant::now());
+    }
+}
+
+fn finish_compressor_bucket_timing(label: &'static str) -> Option<u128> {
+    if !compressor_perf_trace_enabled() {
+        return None;
+    }
+    compressor_bucket_timings()
+        .lock()
+        .unwrap()
+        .remove(label)
+        .map(|start| start.elapsed().as_millis())
+}
+
 /// Generate more packets by calling a method on [`CompressorSpace`].
 pub struct GenerateWork<VM: VMBinding, F: Fn(&'static CompressorSpace<VM>) + Send + 'static> {
     compressor_space: &'static CompressorSpace<VM>,
     f: F,
+    timing_label: Option<&'static str>,
 }
 
 impl<VM: VMBinding, F: Fn(&'static CompressorSpace<VM>) + Send + 'static> GCWork<VM>
     for GenerateWork<VM, F>
 {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        if let Some(label) = self.timing_label {
+            start_compressor_bucket_timing(label);
+        }
         (self.f)(self.compressor_space);
     }
 }
@@ -41,6 +70,80 @@ impl<VM: VMBinding, F: Fn(&'static CompressorSpace<VM>) + Send + 'static> Genera
         Self {
             compressor_space,
             f,
+            timing_label: None,
+        }
+    }
+
+    pub fn new_timed(
+        compressor_space: &'static CompressorSpace<VM>,
+        f: F,
+        timing_label: &'static str,
+    ) -> Self {
+        Self {
+            compressor_space,
+            f,
+            timing_label: Some(timing_label),
+        }
+    }
+}
+
+pub struct LogBucketTiming<VM: VMBinding> {
+    label: &'static str,
+    phantom: PhantomData<VM>,
+}
+
+impl<VM: VMBinding> LogBucketTiming<VM> {
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for LogBucketTiming<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        if let Some(elapsed_ms) = finish_compressor_bucket_timing(self.label) {
+            info!("{} completed in {} ms", self.label, elapsed_ms);
+        }
+    }
+}
+
+pub struct TimedPrepare<C: crate::scheduler::GCWorkContext> {
+    pub plan: *const C::PlanType,
+    timing_label: &'static str,
+}
+
+unsafe impl<C: crate::scheduler::GCWorkContext> Send for TimedPrepare<C> {}
+
+impl<C: crate::scheduler::GCWorkContext> TimedPrepare<C> {
+    pub fn new(plan: *const C::PlanType, timing_label: &'static str) -> Self {
+        Self { plan, timing_label }
+    }
+}
+
+impl<C: crate::scheduler::GCWorkContext> GCWork<C::VM> for TimedPrepare<C> {
+    fn do_work(&mut self, worker: &mut GCWorker<C::VM>, mmtk: &'static MMTK<C::VM>) {
+        start_compressor_bucket_timing(self.timing_label);
+
+        trace!("Prepare Global");
+        let plan_mut: &mut C::PlanType = unsafe { &mut *(self.plan as *const _ as *mut _) };
+        plan_mut.prepare(worker.tls);
+
+        if plan_mut.constraints().needs_prepare_mutator {
+            let prepare_mutator_packets = <C::VM as VMBinding>::VMActivePlan::mutators()
+                .map(|mutator| Box::new(PrepareMutator::<C::VM>::new(mutator)) as _)
+                .collect::<Vec<_>>();
+            debug_assert_eq!(
+                prepare_mutator_packets.len(),
+                <C::VM as VMBinding>::VMActivePlan::number_of_mutators()
+            );
+            mmtk.scheduler.work_buckets[WorkBucketStage::Prepare].bulk_add(prepare_mutator_packets);
+        }
+
+        for w in &mmtk.scheduler.worker_group.workers_shared {
+            let result = w.designated_work.push(Box::new(PrepareCollector));
+            debug_assert!(result.is_ok());
         }
     }
 }
@@ -97,6 +200,7 @@ impl<VM: VMBinding> CaptureBlackAllocations<VM> {
 /// to update object references.
 pub struct UpdateReferences<VM: VMBinding> {
     p: PhantomData<VM>,
+    timing_label: Option<&'static str>,
 }
 
 unsafe impl<VM: VMBinding> Send for UpdateReferences<VM> {}
@@ -104,6 +208,9 @@ unsafe impl<VM: VMBinding> Send for UpdateReferences<VM> {}
 impl<VM: VMBinding> GCWork<VM> for UpdateReferences<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         let start = std::time::Instant::now();
+        if let Some(label) = self.timing_label {
+            start_compressor_bucket_timing(label);
+        }
         // The following needs to be done right before the second round of root scanning
         VM::VMScanning::prepare_for_roots_re_scanning();
         mmtk.state.prepare_for_stack_scanning();
@@ -132,7 +239,17 @@ impl<VM: VMBinding> GCWork<VM> for UpdateReferences<VM> {
 
 impl<VM: VMBinding> UpdateReferences<VM> {
     pub fn new() -> Self {
-        Self { p: PhantomData }
+        Self {
+            p: PhantomData,
+            timing_label: None,
+        }
+    }
+
+    pub fn new_timed(timing_label: &'static str) -> Self {
+        Self {
+            p: PhantomData,
+            timing_label: Some(timing_label),
+        }
     }
 }
 
@@ -269,11 +386,17 @@ impl<VM: VMBinding> ValidateVmSpecificRoots<VM> {
 pub struct AfterCompact<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
     los: &'static LargeObjectSpace<VM>,
+    timing_label: Option<&'static str>,
 }
 
 impl<VM: VMBinding> GCWork<VM> for AfterCompact<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         self.compressor_space.after_compact(worker, self.los);
+        if let Some(label) = self.timing_label {
+            if let Some(elapsed_ms) = finish_compressor_bucket_timing(label) {
+                info!("{} completed in {} ms", label, elapsed_ms);
+            }
+        }
     }
 }
 
@@ -285,6 +408,19 @@ impl<VM: VMBinding> AfterCompact<VM> {
         Self {
             compressor_space,
             los,
+            timing_label: None,
+        }
+    }
+
+    pub fn new_timed(
+        compressor_space: &'static CompressorSpace<VM>,
+        los: &'static LargeObjectSpace<VM>,
+        timing_label: &'static str,
+    ) -> Self {
+        Self {
+            compressor_space,
+            los,
+            timing_label: Some(timing_label),
         }
     }
 }
@@ -398,11 +534,16 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
             return;
         }
 
+        let page_metadata_start = std::time::Instant::now();
         self.compressor_space.build_all_page_metadata();
+        let page_metadata_ms = page_metadata_start.elapsed().as_millis();
 
+        let uffd_new_start = std::time::Instant::now();
         let mut uffd_ctx = UffdContext::new(self.compressor_space)
             .unwrap_or_else(|e| panic!("UffdConcurrentSetup: uffd creation failed: {}", e));
+        let uffd_new_ms = uffd_new_start.elapsed().as_millis();
 
+        let register_start = std::time::Instant::now();
         let mut total_registered_pages = 0usize;
         let mut total_source_pages = 0usize;
         let mut moving_regions = 0usize;
@@ -440,9 +581,10 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
                 });
         }
 
+        let register_ms = register_start.elapsed().as_millis();
         if compressor_perf_trace_enabled() {
             info!(
-                "UffdConcurrentSetup: registered {} destination pages across {} regions (source_pages={}, moving_regions={}, static_regions={}, max_region_pages={})",
+                "UffdConcurrentSetup: registered {} destination pages across {} regions (source_pages={}, moving_regions={}, static_regions={}, max_region_pages={}, page_metadata={} ms, uffd_new={} ms, register={} ms)",
                 total_registered_pages,
                 num_regions,
                 total_source_pages,
@@ -450,33 +592,64 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
                 static_regions,
                 num_regions
                     * (crate::policy::compressor::forwarding::CompressorRegion::BYTES
-                        / crate::util::constants::BYTES_IN_PAGE)
+                        / crate::util::constants::BYTES_IN_PAGE),
+                page_metadata_ms,
+                uffd_new_ms,
+                register_ms
             );
         }
 
         // ART's `CompactionPause()` updates immune / non-moving spaces and roots
         // before mutators resume. Update all MMTk-managed non-moving spaces that can
         // hold references into Compressor, not just LOS.
+        let los_update_start = std::time::Instant::now();
         self.compressor_space
             .update_los_references(worker, self.los);
+        let los_update_ms = los_update_start.elapsed().as_millis();
+
+        let immortal_update_start = std::time::Instant::now();
         self.compressor_space
             .update_space_references(worker, self.plan.common.get_immortal());
+        let immortal_update_ms = immortal_update_start.elapsed().as_millis();
+
+        let nonmoving_update_start = std::time::Instant::now();
         self.compressor_space
             .update_space_references(worker, self.plan.common.get_nonmoving());
+        let nonmoving_update_ms = nonmoving_update_start.elapsed().as_millis();
+
         #[cfg(feature = "vm_space")]
-        self.compressor_space
-            .update_space_references(worker, &self.plan.common.base.vm_space);
+        let vm_space_update_ms = {
+            let vm_space_update_start = std::time::Instant::now();
+            self.compressor_space
+                .update_space_references(worker, &self.plan.common.base.vm_space);
+            vm_space_update_start.elapsed().as_millis()
+        };
+        #[cfg(not(feature = "vm_space"))]
+        let vm_space_update_ms = 0;
 
+        let seal_start = std::time::Instant::now();
         self.compressor_space.seal_regions_for_concurrent_uffd();
+        let seal_ms = seal_start.elapsed().as_millis();
 
+        let spawn_start = std::time::Instant::now();
         let uffd_arc = Arc::new(uffd_ctx);
         let handler = UffdContext::spawn_handler_thread(uffd_arc.clone());
         spawn_background_compactor(self.plan, self.compressor_space, uffd_arc, handler);
         self.plan.mark_uffd_epoch_ready();
+        let spawn_ms = spawn_start.elapsed().as_millis();
         if compressor_perf_trace_enabled() {
             info!(
-                "Compressor FinalMark: UffdConcurrentSetup completed in {} ms",
-                start.elapsed().as_millis()
+                "Compressor FinalMark: UffdConcurrentSetup completed in {} ms (page_metadata={} ms, uffd_new={} ms, register={} ms, update_los={} ms, update_immortal={} ms, update_nonmoving={} ms, update_vm_space={} ms, seal={} ms, spawn={} ms)",
+                start.elapsed().as_millis(),
+                page_metadata_ms,
+                uffd_new_ms,
+                register_ms,
+                los_update_ms,
+                immortal_update_ms,
+                nonmoving_update_ms,
+                vm_space_update_ms,
+                seal_ms,
+                spawn_ms
             );
         }
     }

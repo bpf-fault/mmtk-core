@@ -61,7 +61,22 @@ impl std::default::Default for BumpPointer {
 }
 
 impl<VM: VMBinding> BumpAllocator<VM> {
+    fn retire_current_buffer(&self) {
+        if self.bump_pointer.limit.is_zero() {
+            return;
+        }
+        let start = self.bump_pointer.limit - BLOCK_SIZE;
+        if self.bump_pointer.cursor > start {
+            self.space.on_bump_alloc_buffer_retired(
+                start,
+                self.bump_pointer.cursor,
+                self.bump_pointer.limit,
+            );
+        }
+    }
+
     pub(crate) fn set_limit(&mut self, start: Address, limit: Address) {
+        self.retire_current_buffer();
         self.bump_pointer.reset(start, limit);
     }
 
@@ -73,6 +88,15 @@ impl<VM: VMBinding> BumpAllocator<VM> {
     pub(crate) fn rebind(&mut self, space: &'static dyn Space<VM>) {
         self.reset();
         self.space = space;
+    }
+
+    pub(crate) fn current_buffer(&self) -> Option<(Address, Address, Address)> {
+        if self.bump_pointer.limit.is_zero() {
+            None
+        } else {
+            let start = self.bump_pointer.limit - BLOCK_SIZE;
+            Some((start, self.bump_pointer.cursor, self.bump_pointer.limit))
+        }
     }
 }
 

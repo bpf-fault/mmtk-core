@@ -468,6 +468,12 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Notification that a thread-local bump-allocation buffer for this space is no longer active.
+    ///
+    /// Plans with concurrent black-allocation tracking can override this to record the live prefix
+    /// of the retired buffer. The default implementation is a no-op.
+    fn on_bump_alloc_buffer_retired(&self, _start: Address, _cursor: Address, _limit: Address) {}
+
     /// Clear the side log bits for allocated regions in this space.
     /// This method is only called if the plan knows the log bits are side metadata.
     fn clear_side_log_bits(&self);

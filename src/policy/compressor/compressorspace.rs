@@ -4,7 +4,11 @@ use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
+#[cfg(feature = "uffd")]
+use crate::plan::AllocationSemantics;
 use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
+#[cfg(feature = "uffd")]
+use crate::util::alloc::BumpAllocator;
 use crate::util::copy::CopySemantics;
 use crate::util::heap::regionpageresource::AllocatedRegion;
 use crate::util::heap::{PageResource, RegionPageResource};
@@ -22,7 +26,7 @@ use atomic::Ordering;
 #[cfg(feature = "uffd")]
 use std::collections::HashSet;
 #[cfg(feature = "uffd")]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 #[cfg(feature = "uffd")]
 use std::sync::{Mutex, OnceLock, RwLock};
@@ -61,9 +65,19 @@ pub struct CompressorSpace<VM: VMBinding> {
     #[cfg(feature = "uffd")]
     page_metadata: RwLock<Vec<RegionPageMetadata>>,
     #[cfg(feature = "uffd")]
-    black_allocations: Mutex<Vec<ObjectReference>>,
+    black_allocation_buffers: Mutex<Vec<BlackAllocationBuffer>>,
+    #[cfg(feature = "uffd")]
+    black_allocation_tracking_active: AtomicBool,
     #[cfg(feature = "uffd")]
     compaction_region_limit: AtomicUsize,
+}
+
+#[cfg(feature = "uffd")]
+#[derive(Clone, Debug)]
+struct BlackAllocationBuffer {
+    start: Address,
+    used_end: Address,
+    limit: Address,
 }
 
 #[cfg(feature = "uffd")]
@@ -213,6 +227,13 @@ impl<VM: VMBinding> Space<VM> for CompressorSpace<VM> {
         self.pr.enumerate(enumerator);
     }
 
+    fn on_bump_alloc_buffer_retired(&self, start: Address, cursor: Address, limit: Address) {
+        #[cfg(feature = "uffd")]
+        self.record_retired_bump_alloc_buffer(start, cursor, limit);
+        #[cfg(not(feature = "uffd"))]
+        let _ = (start, cursor, limit);
+    }
+
     fn clear_side_log_bits(&self) {
         let log_bit = *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC;
         if log_bit.is_on_side() {
@@ -330,7 +351,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             #[cfg(feature = "uffd")]
             page_metadata: RwLock::new(vec![]),
             #[cfg(feature = "uffd")]
-            black_allocations: Mutex::new(vec![]),
+            black_allocation_buffers: Mutex::new(vec![]),
+            #[cfg(feature = "uffd")]
+            black_allocation_tracking_active: AtomicBool::new(false),
             #[cfg(feature = "uffd")]
             compaction_region_limit: AtomicUsize::new(0),
         }
@@ -1073,35 +1096,114 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         })
     }
 
-    /// Begin recording black allocations for the current concurrent-marking epoch.
+    /// Begin recording post-InitialMark bump-allocation buffers for the current concurrent-marking epoch.
     #[cfg(feature = "uffd")]
     pub fn snapshot_black_allocation_cursors(&self) {
-        self.black_allocations.lock().unwrap().clear();
+        self.black_allocation_tracking_active
+            .store(true, Ordering::Release);
+        self.black_allocation_buffers.lock().unwrap().clear();
     }
 
-    /// Record a fully initialized black allocation during concurrent marking.
+    /// Slow-path post-allocation bookkeeping is no longer needed for Compressor black allocations.
+    ///
+    /// We now catch up on all post-InitialMark allocations by walking the retired/current bump
+    /// buffers at FinalMark, which works for both slow-path and JIT fast-path allocations.
     #[cfg(feature = "uffd")]
     pub fn record_black_allocation(&self, object: ObjectReference) {
-        if self.should_allocate_as_live() && self.in_space(object) {
-            self.black_allocations.lock().unwrap().push(object);
+        let _ = object;
+    }
+
+    #[cfg(feature = "uffd")]
+    fn record_retired_bump_alloc_buffer(&self, start: Address, cursor: Address, limit: Address) {
+        if !self.black_allocation_tracking_active.load(Ordering::Acquire) || cursor <= start {
+            return;
+        }
+        self.black_allocation_buffers
+            .lock()
+            .unwrap()
+            .push(BlackAllocationBuffer {
+                start,
+                used_end: cursor,
+                limit,
+            });
+    }
+
+    #[cfg(feature = "uffd")]
+    fn capture_current_black_allocation_buffers(&self) {
+        for mutator in VM::VMActivePlan::mutators() {
+            let allocator = unsafe {
+                mutator.allocator_impl_for_semantic::<BumpAllocator<VM>>(
+                    AllocationSemantics::Default,
+                )
+            };
+            if let Some((start, cursor, limit)) = allocator.current_buffer() {
+                self.record_retired_bump_alloc_buffer(start, cursor, limit);
+            }
         }
     }
 
-    /// Clear the recorded black allocations.
+    /// Clear the recorded black-allocation buffer snapshot.
     #[cfg(feature = "uffd")]
     pub fn clear_black_allocation_snapshot(&self) {
-        self.black_allocations.lock().unwrap().clear();
+        self.black_allocation_tracking_active
+            .store(false, Ordering::Release);
+        self.black_allocation_buffers.lock().unwrap().clear();
     }
 
-    /// Drain black allocations recorded during concurrent marking, marking the
-    /// last word of each object now that the object headers are fully initialized.
+    /// Drain post-InitialMark bump-allocation buffers and reconstruct the objects allocated in them.
+    ///
+    /// Each retired/current bump buffer represents a contiguous prefix of fully initialized objects
+    /// allocated during the concurrent-marking window. Walking these buffers at FinalMark catches up
+    /// both slow-path and JIT fast-path allocations, mirroring ART's pause-time black-allocation
+    /// update without requiring per-object allocation hooks.
     #[cfg(feature = "uffd")]
     pub fn take_black_allocations(&self) -> Vec<ObjectReference> {
-        let mut black_allocations = self.black_allocations.lock().unwrap();
-        let objects = std::mem::take(&mut *black_allocations);
-        for &object in objects.iter() {
-            self.forwarding.mark_last_word_of_object(object);
+        self.capture_current_black_allocation_buffers();
+        self.black_allocation_tracking_active
+            .store(false, Ordering::Release);
+
+        let mut black_buffers = self.black_allocation_buffers.lock().unwrap();
+        let mut buffers = std::mem::take(&mut *black_buffers);
+        drop(black_buffers);
+
+        buffers.sort_by_key(|buffer| buffer.start.as_usize());
+
+        let mut objects = vec![];
+        for buffer in buffers {
+            let mut cursor = buffer.start;
+            while cursor < buffer.used_end {
+                let object = ObjectReference::from_raw_address(cursor).unwrap_or_else(|| {
+                    panic!(
+                        "invalid black-allocation object start {} in retired bump buffer [{}, {}, {})",
+                        cursor, buffer.start, buffer.used_end, buffer.limit
+                    )
+                });
+                debug_assert!(
+                    VM::VMObjectModel::is_object_sane(object),
+                    "invalid object {} in retired bump buffer [{}, {}, {})",
+                    object,
+                    buffer.start,
+                    buffer.used_end,
+                    buffer.limit
+                );
+                forwarding::MARK_SPEC.fetch_or_atomic::<u8>(
+                    object.to_raw_address(),
+                    1,
+                    Ordering::SeqCst,
+                );
+                self.forwarding.mark_last_word_of_object(object);
+                let size = VM::VMObjectModel::get_current_size(object);
+                debug_assert!(size > 0, "zero-sized object {} in retired bump buffer", object);
+                objects.push(object);
+                cursor += size;
+            }
+            debug_assert_eq!(
+                cursor, buffer.used_end,
+                "retired bump buffer walk ended at {} instead of {} for [{}, {}, {})",
+                cursor, buffer.used_end, buffer.start, buffer.used_end, buffer.limit
+            );
         }
+
         objects
     }
 

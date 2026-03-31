@@ -7,13 +7,45 @@ use crate::util::*;
 use crate::vm::slot::Slot;
 use crate::vm::*;
 use crate::*;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-fn reference_perf_trace_enabled() -> bool {
+pub(crate) fn perf_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
+}
+
+fn reference_perf_trace_enabled() -> bool {
+    perf_trace_enabled()
+}
+
+fn perf_timings() -> &'static Mutex<HashMap<&'static str, Instant>> {
+    static TIMINGS: OnceLock<Mutex<HashMap<&'static str, Instant>>> = OnceLock::new();
+    TIMINGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn start_perf_timing(label: &'static str) {
+    if perf_trace_enabled() {
+        perf_timings().lock().unwrap().insert(label, Instant::now());
+    }
+}
+
+pub(crate) fn finish_perf_timing(label: &'static str) -> Option<Duration> {
+    if !perf_trace_enabled() {
+        return None;
+    }
+    perf_timings()
+        .lock()
+        .unwrap()
+        .remove(label)
+        .map(|start| start.elapsed())
+}
+
+pub(crate) fn format_perf_ms(duration: Duration) -> String {
+    format!("{:.3}", duration.as_secs_f64() * 1000.0)
 }
 
 pub struct ScheduleCollection;
@@ -206,65 +238,136 @@ pub struct StopMutators<C: GCWorkContext> {
     skip_vm_specific_roots: bool,
     /// Flush mutators once they are stopped. By default this is false. [`ScanMutatorRoots`] will flush mutators.
     flush_mutator: bool,
+    /// Optional wall-time label for this stop-the-world entry work.
+    timing_label: Option<&'static str>,
+    /// Optional label started immediately before opening the Prepare bucket.
+    prepare_bucket_timing_label: Option<&'static str>,
     phantom: PhantomData<C>,
 }
 
 impl<C: GCWorkContext> StopMutators<C> {
-    pub fn new() -> Self {
+    fn new_internal(
+        skip_mutator_roots: bool,
+        skip_vm_specific_roots: bool,
+        flush_mutator: bool,
+        timing_label: Option<&'static str>,
+        prepare_bucket_timing_label: Option<&'static str>,
+    ) -> Self {
         Self {
-            skip_mutator_roots: false,
-            skip_vm_specific_roots: false,
-            flush_mutator: false,
+            skip_mutator_roots,
+            skip_vm_specific_roots,
+            flush_mutator,
+            timing_label,
+            prepare_bucket_timing_label,
             phantom: PhantomData,
         }
+    }
+
+    pub fn new() -> Self {
+        Self::new_internal(false, false, false, None, None)
+    }
+
+    pub fn new_timed(
+        timing_label: &'static str,
+        prepare_bucket_timing_label: Option<&'static str>,
+    ) -> Self {
+        Self::new_internal(
+            false,
+            false,
+            false,
+            Some(timing_label),
+            prepare_bucket_timing_label,
+        )
     }
 
     /// Create a `StopMutators` work packet that does not create `ScanMutatorRoots` work packets for mutators, and will simply flush mutators.
     /// VM-specific roots are still scanned.
     pub fn new_no_scan_roots() -> Self {
-        Self {
-            skip_mutator_roots: true,
-            skip_vm_specific_roots: false,
-            flush_mutator: true,
-            phantom: PhantomData,
-        }
+        Self::new_internal(true, false, true, None, None)
+    }
+
+    pub fn new_no_scan_roots_timed(
+        timing_label: &'static str,
+        prepare_bucket_timing_label: Option<&'static str>,
+    ) -> Self {
+        Self::new_internal(
+            true,
+            false,
+            true,
+            Some(timing_label),
+            prepare_bucket_timing_label,
+        )
     }
 
     /// Create a `StopMutators` work packet that only stops and flushes mutators.
     /// It does not enqueue mutator-root or VM-root scanning packets.
     #[cfg(feature = "uffd")]
     pub fn new_no_roots() -> Self {
-        Self {
-            skip_mutator_roots: true,
-            skip_vm_specific_roots: true,
-            flush_mutator: true,
-            phantom: PhantomData,
-        }
+        Self::new_internal(true, true, true, None, None)
+    }
+
+    /// Create a timed `StopMutators` work packet that only stops and flushes mutators.
+    /// It does not enqueue mutator-root or VM-root scanning packets.
+    #[cfg(feature = "uffd")]
+    pub fn new_no_roots_timed(timing_label: &'static str) -> Self {
+        Self::new_internal(true, true, true, Some(timing_label), None)
     }
 }
 
 impl<C: GCWorkContext> GCWork<C::VM> for StopMutators<C> {
     fn do_work(&mut self, worker: &mut GCWorker<C::VM>, mmtk: &'static MMTK<C::VM>) {
         trace!("stop_all_mutators start");
+        let total_start = Instant::now();
         mmtk.state.prepare_for_stack_scanning();
+
+        let stop_all_start = Instant::now();
+        let mut stopped_mutators = 0usize;
+        let mut queued_mutator_root_packets = 0usize;
         <C::VM as VMBinding>::VMCollection::stop_all_mutators(worker.tls, |mutator| {
             // TODO: The stack scanning work won't start immediately, as the `Prepare` bucket is not opened yet (the bucket is opened in notify_mutators_paused).
             // Should we push to Unconstrained instead?
 
+            stopped_mutators += 1;
             if self.flush_mutator {
                 mutator.flush();
             }
             if !self.skip_mutator_roots {
+                queued_mutator_root_packets += 1;
                 mmtk.scheduler.work_buckets[WorkBucketStage::Prepare]
                     .add(ScanMutatorRoots::<C>(mutator));
             }
         });
+        let stop_all_elapsed = stop_all_start.elapsed();
         trace!("stop_all_mutators end");
+
+        let notify_start = Instant::now();
         mmtk.get_plan().notify_mutators_paused(&mmtk.scheduler);
+        if let Some(label) = self.prepare_bucket_timing_label {
+            start_perf_timing(label);
+        }
         mmtk.scheduler.notify_mutators_paused(mmtk);
+        let notify_elapsed = notify_start.elapsed();
+
+        let mut queued_vm_root_packets = 0usize;
         if !self.skip_vm_specific_roots {
+            queued_vm_root_packets = 1;
             mmtk.scheduler.work_buckets[WorkBucketStage::Prepare]
                 .add(ScanVMSpecificRoots::<C>::new());
+        }
+
+        if let Some(label) = self.timing_label {
+            let total_elapsed = total_start.elapsed();
+            info!(
+                "{} completed in {} ms (stop_all_mutators={} ms, notify/open_prepare={} ms, stopped_mutators={}, queued_mutator_root_packets={}, queued_vm_root_packets={}, flush_mutator={})",
+                label,
+                format_perf_ms(total_elapsed),
+                format_perf_ms(stop_all_elapsed),
+                format_perf_ms(notify_elapsed),
+                stopped_mutators,
+                queued_mutator_root_packets,
+                queued_vm_root_packets,
+                self.flush_mutator,
+            );
         }
     }
 }

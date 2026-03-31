@@ -471,6 +471,15 @@ pub trait ObjectModel<VM: VMBinding> {
     /// * `object`: The object to be dumped.
     fn dump_object(object: ObjectReference);
 
+    /// Return if an object start is initialized enough for the VM to safely inspect its size/type.
+    ///
+    /// Bindings with fast allocation paths may transiently advance bump cursors before all object
+    /// header fields are initialized. Pause-time black-allocation catch-up can use this hook to
+    /// stop walking a bump buffer at the first not-yet-initialized object.
+    fn is_object_start_initialized(_object: ObjectReference) -> bool {
+        true
+    }
+
     /// Return if an object is valid from the runtime point of view. This is used
     /// to debug MMTk.
     fn is_object_sane(_object: ObjectReference) -> bool {

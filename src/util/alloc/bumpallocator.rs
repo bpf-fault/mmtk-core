@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::util::Address;
 
@@ -12,6 +13,11 @@ use crate::vm::VMBinding;
 /// Size of a bump allocator block. Currently it is set to 32 KB.
 const BLOCK_SIZE: usize = 8 << crate::util::constants::LOG_BYTES_IN_PAGE;
 const BLOCK_MASK: usize = BLOCK_SIZE - 1;
+
+fn bump_buffer_starts() -> &'static Mutex<HashMap<usize, Address>> {
+    static STARTS: OnceLock<Mutex<HashMap<usize, Address>>> = OnceLock::new();
+    STARTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// A bump pointer allocator. It keeps a thread local allocation buffer,
 /// and bumps a cursor to allocate from the buffer.
@@ -61,11 +67,18 @@ impl std::default::Default for BumpPointer {
 }
 
 impl<VM: VMBinding> BumpAllocator<VM> {
+    fn id(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    fn current_buffer_start(&self) -> Option<Address> {
+        bump_buffer_starts().lock().unwrap().get(&self.id()).copied()
+    }
+
     fn retire_current_buffer(&self) {
-        if self.bump_pointer.limit.is_zero() {
+        let Some(start) = self.current_buffer_start() else {
             return;
-        }
-        let start = self.bump_pointer.limit - BLOCK_SIZE;
+        };
         if self.bump_pointer.cursor > start {
             self.space.on_bump_alloc_buffer_retired(
                 start,
@@ -77,10 +90,13 @@ impl<VM: VMBinding> BumpAllocator<VM> {
 
     pub(crate) fn set_limit(&mut self, start: Address, limit: Address) {
         self.retire_current_buffer();
+        bump_buffer_starts().lock().unwrap().insert(self.id(), start);
         self.bump_pointer.reset(start, limit);
     }
 
     pub(crate) fn reset(&mut self) {
+        self.retire_current_buffer();
+        bump_buffer_starts().lock().unwrap().remove(&self.id());
         let zero = unsafe { Address::zero() };
         self.bump_pointer.reset(zero, zero);
     }
@@ -91,12 +107,8 @@ impl<VM: VMBinding> BumpAllocator<VM> {
     }
 
     pub(crate) fn current_buffer(&self) -> Option<(Address, Address, Address)> {
-        if self.bump_pointer.limit.is_zero() {
-            None
-        } else {
-            let start = self.bump_pointer.limit - BLOCK_SIZE;
-            Some((start, self.bump_pointer.cursor, self.bump_pointer.limit))
-        }
+        self.current_buffer_start()
+            .map(|start| (start, self.bump_pointer.cursor, self.bump_pointer.limit))
     }
 }
 
@@ -112,6 +124,10 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
 
     fn get_context(&self) -> &AllocatorContext<VM> {
         &self.context
+    }
+
+    fn on_mutator_destroy(&mut self) {
+        self.reset();
     }
 
     fn does_thread_local_allocation(&self) -> bool {

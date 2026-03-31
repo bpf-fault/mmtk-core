@@ -105,7 +105,6 @@ pub fn compressor_mutator_prepare<VM: VMBinding>(mutator: &mut Mutator<VM>, tls:
     #[cfg(feature = "uffd")]
     {
         let current_pause = mutator.plan.concurrent().unwrap().current_pause().unwrap();
-        debug_assert_ne!(current_pause, Pause::FinalMark);
         if current_pause == Pause::InitialMark {
             mutator
                 .barrier

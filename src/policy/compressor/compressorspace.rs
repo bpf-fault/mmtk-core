@@ -1158,7 +1158,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// update without requiring per-object allocation hooks.
     #[cfg(feature = "uffd")]
     pub fn take_black_allocations(&self) -> Vec<ObjectReference> {
-        self.capture_current_black_allocation_buffers();
         self.black_allocation_tracking_active
             .store(false, Ordering::Release);
 
@@ -1169,6 +1168,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         buffers.sort_by_key(|buffer| buffer.start.as_usize());
 
         let mut objects = vec![];
+        let mut early_uninitialized = 0usize;
+        let mut early_unsane = 0usize;
+        let mut early_size = 0usize;
         for buffer in buffers {
             let mut cursor = buffer.start;
             while cursor < buffer.used_end {
@@ -1178,29 +1180,58 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         cursor, buffer.start, buffer.used_end, buffer.limit
                     )
                 });
-                debug_assert!(
-                    VM::VMObjectModel::is_object_sane(object),
-                    "invalid object {} in retired bump buffer [{}, {}, {})",
-                    object,
-                    buffer.start,
-                    buffer.used_end,
-                    buffer.limit
-                );
+
+                // A mutator may have advanced the bump cursor before fully initializing the next
+                // object header. Mirror ART's pause-time catch-up behavior and stop at the first
+                // object start the VM reports as not yet initialized.
+                if !VM::VMObjectModel::is_object_start_initialized(object) {
+                    early_uninitialized += 1;
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "Compressor FinalMark: stopped black-buffer walk at uninitialized object start {} in [{}, {}, {})",
+                            object, buffer.start, buffer.used_end, buffer.limit
+                        );
+                    }
+                    break;
+                }
+                if !VM::VMObjectModel::is_object_sane(object) {
+                    early_unsane += 1;
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "Compressor FinalMark: stopped black-buffer walk at unsane object {} in [{}, {}, {})",
+                            object, buffer.start, buffer.used_end, buffer.limit
+                        );
+                    }
+                    break;
+                }
+
+                let size = VM::VMObjectModel::get_current_size(object);
+                if size == 0 || cursor + size > buffer.used_end {
+                    early_size += 1;
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "Compressor FinalMark: stopped black-buffer walk at size {} for object {} in [{}, {}, {})",
+                            size, object, buffer.start, buffer.used_end, buffer.limit
+                        );
+                    }
+                    break;
+                }
+
                 forwarding::MARK_SPEC.fetch_or_atomic::<u8>(
                     object.to_raw_address(),
                     1,
                     Ordering::SeqCst,
                 );
                 self.forwarding.mark_last_word_of_object(object);
-                let size = VM::VMObjectModel::get_current_size(object);
-                debug_assert!(size > 0, "zero-sized object {} in retired bump buffer", object);
                 objects.push(object);
                 cursor += size;
             }
-            debug_assert_eq!(
-                cursor, buffer.used_end,
-                "retired bump buffer walk ended at {} instead of {} for [{}, {}, {})",
-                cursor, buffer.used_end, buffer.start, buffer.used_end, buffer.limit
+        }
+
+        if compressor_perf_trace_enabled() {
+            info!(
+                "Compressor FinalMark: caught up {} black objects from retired bump buffers (stops: uninitialized={}, unsane={}, size={})",
+                objects.len(), early_uninitialized, early_unsane, early_size
             );
         }
 

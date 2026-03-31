@@ -64,8 +64,8 @@ fn compressor_perf_trace_enabled() -> bool {
 /// high-level structure more closely:
 ///
 /// 1. `InitialMark` pause seeds concurrent SATB marking.
-/// 2. `FinalMark` pause captures black allocations, computes forwarding, and
-///    sets up the UFFD epoch.
+/// 2. `FinalMark` pause revokes mutator bump buffers, captures black allocations,
+///    computes forwarding, and sets up the UFFD epoch.
 /// 3. The background compactor resolves pages concurrently after mutator resume.
 #[derive(HasSpaces, PlanTraceObject)]
 pub struct Compressor<VM: VMBinding> {
@@ -572,6 +572,8 @@ impl<VM: VMBinding> Compressor<VM> {
         self.set_ref_closure_buckets_enabled(true);
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add(StopMutators::<CompressorWorkContext<VM>>::new());
+        scheduler.work_buckets[WorkBucketStage::Prepare]
+            .add(Prepare::<CompressorWorkContext<VM>>::new(self));
         scheduler.work_buckets[WorkBucketStage::Closure].add(CaptureBlackAllocations::<VM>::new(
             self,
             &self.compressor_space,

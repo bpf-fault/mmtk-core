@@ -13,8 +13,14 @@ use crate::util::{linear_scan::Region, Address, ObjectReference};
 use crate::vm::{ActivePlan, Scanning, VMBinding};
 use crate::MMTK;
 use std::marker::{PhantomData, Send};
+use std::sync::OnceLock;
 #[cfg(feature = "uffd")]
 use std::{collections::HashSet, sync::Arc};
+
+fn compressor_perf_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
+}
 
 /// Generate more packets by calling a method on [`CompressorSpace`].
 pub struct GenerateWork<VM: VMBinding, F: Fn(&'static CompressorSpace<VM>) + Send + 'static> {
@@ -48,12 +54,18 @@ pub struct CaptureBlackAllocations<VM: VMBinding> {
 #[cfg(feature = "uffd")]
 impl<VM: VMBinding> GCWork<VM> for CaptureBlackAllocations<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        info!("Compressor FinalMark: capturing black allocations");
+        let start = std::time::Instant::now();
+        if compressor_perf_trace_enabled() {
+            info!("Compressor FinalMark: capturing black allocations");
+        }
         let objects = self.compressor_space.take_black_allocations();
-        info!(
-            "Compressor FinalMark: captured {} black-allocated objects before forwarding",
-            objects.len()
-        );
+        if compressor_perf_trace_enabled() {
+            info!(
+                "Compressor FinalMark: captured {} black-allocated objects before forwarding in {} ms",
+                objects.len(),
+                start.elapsed().as_millis()
+            );
+        }
         if !objects.is_empty() {
             mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(PlanScanObjects::<
                 MarkingProcessEdges<VM>,
@@ -91,13 +103,16 @@ unsafe impl<VM: VMBinding> Send for UpdateReferences<VM> {}
 
 impl<VM: VMBinding> GCWork<VM> for UpdateReferences<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let start = std::time::Instant::now();
         // The following needs to be done right before the second round of root scanning
         VM::VMScanning::prepare_for_roots_re_scanning();
         mmtk.state.prepare_for_stack_scanning();
         #[cfg(feature = "extreme_assertions")]
         mmtk.slot_logger.reset();
 
+        let mut mutator_count = 0usize;
         for mutator in VM::VMActivePlan::mutators() {
+            mutator_count += 1;
             mmtk.scheduler.work_buckets[WorkBucketStage::SecondRoots].add(ScanMutatorRoots::<
                 CompressorForwardingWorkContext<VM>,
             >(mutator));
@@ -105,6 +120,13 @@ impl<VM: VMBinding> GCWork<VM> for UpdateReferences<VM> {
 
         mmtk.scheduler.work_buckets[WorkBucketStage::SecondRoots]
             .add(ScanVMSpecificRoots::<CompressorForwardingWorkContext<VM>>::new());
+        if compressor_perf_trace_enabled() {
+            info!(
+                "Compressor FinalMark: queued second-root rescanning for {} mutators in {} ms",
+                mutator_count,
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 
@@ -332,22 +354,28 @@ fn spawn_background_compactor<VM: VMBinding>(
         let state_counts = ctx.page_state_counts();
         let faults = ctx.faults_handled();
         let pages_resolved = ctx.pages_resolved();
+        let gc_pages_processed = ctx.gc_pages_processed();
+        let mutator_pages_processed = ctx.mutator_pages_processed();
         ctx.teardown();
         plan.finish_uffd_epoch();
 
-        info!(
-            "UffdConcurrentPhase: finalized_regions={}, total_pages_resolved={}, faults={}, states=[u={}, p={}, pr={}, pm={}, mp={}, pdm={}, m={}]",
-            finalized_regions,
-            pages_resolved,
-            faults,
-            state_counts[0],
-            state_counts[1],
-            state_counts[2],
-            state_counts[3],
-            state_counts[4],
-            state_counts[5],
-            state_counts[6]
-        );
+        if compressor_perf_trace_enabled() {
+            info!(
+                "UffdConcurrentPhase: finalized_regions={}, total_pages_resolved={}, gc_pages_processed={}, mutator_pages_processed={}, faults={}, states=[u={}, p={}, pr={}, pm={}, mp={}, pdm={}, m={}]",
+                finalized_regions,
+                pages_resolved,
+                gc_pages_processed,
+                mutator_pages_processed,
+                faults,
+                state_counts[0],
+                state_counts[1],
+                state_counts[2],
+                state_counts[3],
+                state_counts[4],
+                state_counts[5],
+                state_counts[6]
+            );
+        }
     });
 }
 
@@ -363,30 +391,67 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         use crate::policy::compressor::uffd::UffdContext;
         use std::sync::Arc;
+        let start = std::time::Instant::now();
 
         let num_regions = self.compressor_space.num_regions();
         if num_regions == 0 {
             return;
         }
 
-        let region_size = crate::policy::compressor::forwarding::CompressorRegion::BYTES;
-        if self.compressor_space.region_page_metadata(0).is_none() {
-            self.compressor_space.build_all_page_metadata();
-        }
+        self.compressor_space.build_all_page_metadata();
 
         let mut uffd_ctx = UffdContext::new(self.compressor_space)
             .unwrap_or_else(|e| panic!("UffdConcurrentSetup: uffd creation failed: {}", e));
 
+        let mut total_registered_pages = 0usize;
+        let mut total_source_pages = 0usize;
+        let mut moving_regions = 0usize;
+        let mut static_regions = 0usize;
         for i in 0..num_regions {
             let (start, _cursor) = self.compressor_space.region_info(i);
+            let (shadow_size, register_size) = self
+                .compressor_space
+                .region_page_metadata(i)
+                .map(|meta| {
+                    let source_pages = (meta.source_end - meta.region_start)
+                        .div_ceil(crate::util::constants::BYTES_IN_PAGE);
+                    let compacted_pages = (meta.compacted_end - meta.region_start)
+                        .div_ceil(crate::util::constants::BYTES_IN_PAGE);
+                    total_source_pages += source_pages;
+                    if meta.has_movement {
+                        moving_regions += 1;
+                    } else {
+                        static_regions += 1;
+                    }
+                    (
+                        source_pages * crate::util::constants::BYTES_IN_PAGE,
+                        compacted_pages * crate::util::constants::BYTES_IN_PAGE,
+                    )
+                })
+                .unwrap_or((0, 0));
+            total_registered_pages += register_size / crate::util::constants::BYTES_IN_PAGE;
             uffd_ctx
-                .mremap_and_register(i, start.as_usize(), region_size)
+                .mremap_and_register(i, start.as_usize(), shadow_size, register_size)
                 .unwrap_or_else(|e| {
                     panic!(
                         "UffdConcurrentSetup: mremap/register failed for region {}: {}",
                         i, e
                     )
                 });
+        }
+
+        if compressor_perf_trace_enabled() {
+            info!(
+                "UffdConcurrentSetup: registered {} destination pages across {} regions (source_pages={}, moving_regions={}, static_regions={}, max_region_pages={})",
+                total_registered_pages,
+                num_regions,
+                total_source_pages,
+                moving_regions,
+                static_regions,
+                num_regions
+                    * (crate::policy::compressor::forwarding::CompressorRegion::BYTES
+                        / crate::util::constants::BYTES_IN_PAGE)
+            );
         }
 
         // ART's `CompactionPause()` updates immune / non-moving spaces and roots
@@ -408,6 +473,12 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
         let handler = UffdContext::spawn_handler_thread(uffd_arc.clone());
         spawn_background_compactor(self.plan, self.compressor_space, uffd_arc, handler);
         self.plan.mark_uffd_epoch_ready();
+        if compressor_perf_trace_enabled() {
+            info!(
+                "Compressor FinalMark: UffdConcurrentSetup completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 

@@ -192,6 +192,30 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         true
     }
 
+    /// Align all region cursors up to page boundary.
+    ///
+    /// ART aligns the post-marking black-allocation boundary to page size before
+    /// the compaction pause. This is the per-region analogue for the Compressor:
+    /// any future post-pause allocation from a reused region starts at the next
+    /// page boundary instead of in the middle of a page that may participate in
+    /// the UFFD epoch.
+    pub fn align_all_region_cursors_up_to_page(&self) -> (usize, usize) {
+        let sync = self.sync.write().unwrap();
+        let mut regions_aligned = 0;
+        let mut bytes_advanced = 0;
+        for alloc in sync.all_regions.iter() {
+            let old = alloc.cursor();
+            let new = old.align_up(BYTES_IN_PAGE);
+            if new > old {
+                debug_assert!(new <= alloc.region.end());
+                alloc.set_cursor(new);
+                regions_aligned += 1;
+                bytes_advanced += new - old;
+            }
+        }
+        (regions_aligned, bytes_advanced)
+    }
+
     /// Prevent future allocations from reusing the currently known regions.
     ///
     /// This is used by the concurrent UFFD path so mutators resume allocation in

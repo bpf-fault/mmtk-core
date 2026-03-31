@@ -47,6 +47,14 @@ use enum_map::EnumMap;
 use mmtk_macros::{HasSpaces, PlanTraceObject};
 #[cfg(feature = "uffd")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "uffd")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "uffd")]
+fn compressor_perf_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
+}
 
 /// [`Compressor`] implements a stop-the-world and parallel implementation of
 /// the Compressor, as described in Kermany and Petrank,
@@ -109,19 +117,52 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             if self.concurrent_marking_active.load(Ordering::Acquire)
                 && self.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained()
             {
+                if compressor_perf_trace_enabled() {
+                    info!(
+                        "Compressor collection_required: concurrent marking drained, scheduling FinalMark (used_pages={}, total_pages={}, should_do_full_gc={})",
+                        self.get_used_pages(),
+                        self.get_total_pages(),
+                        self.should_do_full_gc.load(Ordering::Acquire)
+                    );
+                }
                 return true;
             }
 
-            if self.base().collection_required(self, space_full) {
+            let used_pages_now = self.get_used_pages();
+            let total_pages = self.get_total_pages();
+            let base_triggered = self.base().collection_required(self, space_full);
+            if base_triggered {
                 self.should_do_full_gc.store(true, Ordering::Release);
+                if compressor_perf_trace_enabled() {
+                    info!(
+                        "Compressor collection_required: base trigger requested Full fallback (space_full={}, used_pages={}, total_pages={}, reserved_pages={}, compressor_reserved_pages={}, compressor_data_pages={}, compressor_meta_pages_est={}, compressor_regions={}, common_used_pages={}, should_do_full_gc=true, concurrent_marking_active={}, previous_pause={:?})",
+                        space_full,
+                        used_pages_now,
+                        total_pages,
+                        self.get_reserved_pages(),
+                        self.compressor_space.reserved_pages(),
+                        self.compressor_space.data_reserved_pages(),
+                        self.compressor_space
+                            .reserved_pages()
+                            .saturating_sub(self.compressor_space.data_reserved_pages()),
+                        self.compressor_space.num_regions(),
+                        self.common.get_used_pages(),
+                        self.concurrent_marking_active.load(Ordering::Acquire),
+                        self.previous_pause()
+                    );
+                }
                 return true;
             }
 
             if !self.concurrent_marking_active.load(Ordering::Acquire) {
-                let threshold = self.get_total_pages() >> 1;
+                let divisor = std::env::var("MMTK_COMPRESSOR_INITIAL_MARK_DIVISOR")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(2);
+                let threshold = total_pages / divisor;
                 let used_pages_after_last_gc =
                     self.common.base.global_state.get_used_pages_after_last_gc();
-                let used_pages_now = self.get_used_pages();
                 let allocated_since_last_gc =
                     used_pages_now.saturating_sub(used_pages_after_last_gc);
                 if allocated_since_last_gc > threshold {
@@ -130,6 +171,17 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                             .is_empty(),
                         "Concurrent bucket should be empty before InitialMark"
                     );
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "Compressor collection_required: threshold trigger requested InitialMark (allocated_since_last_gc={}, threshold={}, divisor={}, used_pages_after_last_gc={}, used_pages_now={}, total_pages={})",
+                            allocated_since_last_gc,
+                            threshold,
+                            divisor,
+                            used_pages_after_last_gc,
+                            used_pages_now,
+                            total_pages
+                        );
+                    }
                     return true;
                 }
             }
@@ -168,6 +220,24 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             };
             self.current_pause
                 .store(Some(pause), AtomicOrdering::SeqCst);
+            if compressor_perf_trace_enabled() {
+                info!(
+                    "Compressor schedule_collection: choosing {:?} (should_do_full_gc={}, concurrent_marking_active={}, uffd_compaction_active={}, used_pages={}, compressor_reserved_pages={}, compressor_data_pages={}, compressor_meta_pages_est={}, compressor_regions={}, common_used_pages={}, total_pages={})",
+                    pause,
+                    self.should_do_full_gc.load(Ordering::Acquire),
+                    self.concurrent_marking_active.load(Ordering::Acquire),
+                    self.uffd_compaction_active.load(Ordering::Acquire),
+                    self.get_used_pages(),
+                    self.compressor_space.reserved_pages(),
+                    self.compressor_space.data_reserved_pages(),
+                    self.compressor_space
+                        .reserved_pages()
+                        .saturating_sub(self.compressor_space.data_reserved_pages()),
+                    self.compressor_space.num_regions(),
+                    self.common.get_used_pages(),
+                    self.get_total_pages()
+                );
+            }
 
             match pause {
                 Pause::InitialMark => self.schedule_initial_mark(scheduler),
@@ -204,11 +274,15 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                 Pause::FinalMark => {
                     debug_assert!(self.concurrent_marking_in_progress());
                     self.set_concurrent_marking_state(false);
-                    info!("FinalMark: flushing mutator SATB buffers");
+                    if compressor_perf_trace_enabled() {
+                        info!("FinalMark: flushing mutator SATB buffers");
+                    }
                     for mutator in <VM as VMBinding>::VMActivePlan::mutators() {
                         mutator.barrier.flush();
                     }
-                    info!("FinalMark: mutator SATB buffers flushed");
+                    if compressor_perf_trace_enabled() {
+                        info!("FinalMark: mutator SATB buffers flushed");
+                    }
                 }
                 Pause::Full => {
                     self.set_concurrent_marking_state(false);
@@ -285,6 +359,22 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                     } else {
                         // No Compressor regions needed page-fault-driven compaction.
                         self.compressor_space.release();
+                    }
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "FinalMark end_of_gc: uffd_epoch_ready={}, should_do_full_gc={}, used_pages={}, compressor_reserved_pages={}, compressor_data_pages={}, compressor_meta_pages_est={}, compressor_regions={}, common_used_pages={}, total_pages={}",
+                            uffd_epoch_ready,
+                            self.should_do_full_gc.load(Ordering::Acquire),
+                            self.get_used_pages(),
+                            self.compressor_space.reserved_pages(),
+                            self.compressor_space.data_reserved_pages(),
+                            self.compressor_space
+                                .reserved_pages()
+                                .saturating_sub(self.compressor_space.data_reserved_pages()),
+                            self.compressor_space.num_regions(),
+                            self.common.get_used_pages(),
+                            self.get_total_pages()
+                        );
                     }
                 }
                 Pause::Full => {
@@ -490,10 +580,6 @@ impl<VM: VMBinding> Compressor<VM> {
             &self.compressor_space,
             CompressorSpace::<VM>::add_offset_vector_tasks,
         ));
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(
-            &self.compressor_space,
-            CompressorSpace::<VM>::build_all_page_metadata,
-        ));
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
         if std::env::var_os("MMTK_VALIDATE_MUTATOR_ROOTS").is_some() {
             scheduler.work_buckets[WorkBucketStage::Compact]
@@ -538,9 +624,34 @@ impl<VM: VMBinding> Compressor<VM> {
 
     #[cfg(feature = "uffd")]
     pub fn finish_uffd_epoch(&self) {
+        let before_used = self.get_used_pages();
+        let before_compressor = self.compressor_space.reserved_pages();
+        let before_compressor_data = self.compressor_space.data_reserved_pages();
+        let before_compressor_regions = self.compressor_space.num_regions();
+        let before_common = self.common.get_used_pages();
         self.compressor_space.reset_allocator_after_compaction();
         self.compressor_space.release();
         self.set_allocate_as_live(false);
         self.uffd_compaction_active.store(false, Ordering::Release);
+        if compressor_perf_trace_enabled() {
+            info!(
+                "finish_uffd_epoch: used_pages {} -> {}, compressor_reserved_pages {} -> {}, compressor_data_pages {} -> {}, compressor_meta_pages_est {} -> {}, compressor_regions {} -> {}, common_used_pages {} -> {}, total_pages={}",
+                before_used,
+                self.get_used_pages(),
+                before_compressor,
+                self.compressor_space.reserved_pages(),
+                before_compressor_data,
+                self.compressor_space.data_reserved_pages(),
+                before_compressor.saturating_sub(before_compressor_data),
+                self.compressor_space
+                    .reserved_pages()
+                    .saturating_sub(self.compressor_space.data_reserved_pages()),
+                before_compressor_regions,
+                self.compressor_space.num_regions(),
+                before_common,
+                self.common.get_used_pages(),
+                self.get_total_pages()
+            );
+        }
     }
 }

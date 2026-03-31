@@ -8,6 +8,12 @@ use crate::vm::Finalizable;
 use crate::vm::{Collection, VMBinding};
 use crate::MMTK;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
+
+fn reference_perf_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
+}
 
 /// A special processor for Finalizable objects.
 // TODO: we should consider if we want to merge FinalizableProcessor with ReferenceProcessor,
@@ -141,6 +147,7 @@ pub struct Finalization<E: ProcessEdgesWork>(PhantomData<E>);
 
 impl<E: ProcessEdgesWork> GCWork<E::VM> for Finalization<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, mmtk: &'static MMTK<E::VM>) {
+        let start = std::time::Instant::now();
         if !*mmtk.options.no_reference_types {
             // Rescan soft and weak references at the end of the transitive closure from resurrected
             // objects.  New soft and weak references may be discovered during this.
@@ -179,6 +186,12 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for Finalization<E> {
             num_ready_for_finalize_begin,
             num_ready_for_finalize_end
         );
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: FinalRefClosure completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<E: ProcessEdgesWork> Finalization<E> {
@@ -192,6 +205,7 @@ pub struct ForwardFinalization<E: ProcessEdgesWork>(PhantomData<E>);
 
 impl<E: ProcessEdgesWork> GCWork<E::VM> for ForwardFinalization<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, mmtk: &'static MMTK<E::VM>) {
+        let start = std::time::Instant::now();
         trace!("Forward finalization");
         let mut finalizable_processor = mmtk.finalizable_processor.lock().unwrap();
         let mut w = E::new(vec![], false, mmtk, WorkBucketStage::FinalizableForwarding);
@@ -200,6 +214,12 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ForwardFinalization<E> {
 
         finalizable_processor.forward_finalizable(&mut w, is_nursery_gc(mmtk.get_plan()));
         trace!("Finished forwarding finlizable");
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: FinalizableForwarding completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<E: ProcessEdgesWork> ForwardFinalization<E> {

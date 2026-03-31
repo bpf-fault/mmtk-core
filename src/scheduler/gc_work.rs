@@ -9,6 +9,12 @@ use crate::vm::*;
 use crate::*;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use std::sync::OnceLock;
+
+fn reference_perf_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
+}
 
 pub struct ScheduleCollection;
 
@@ -370,6 +376,7 @@ impl<E: ProcessEdgesWork> VMProcessWeakRefs<E> {
 
 impl<E: ProcessEdgesWork> GCWork<E::VM> for VMProcessWeakRefs<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, _mmtk: &'static MMTK<E::VM>) {
+        let start = std::time::Instant::now();
         trace!("VMProcessWeakRefs");
 
         let stage = WorkBucketStage::VMRefClosure;
@@ -388,6 +395,12 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for VMProcessWeakRefs<E> {
             let new_self = Box::new(Self::new());
 
             worker.scheduler().work_buckets[stage].set_sentinel(new_self);
+        }
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: VMRefClosure completed in {} ms",
+                start.elapsed().as_millis()
+            );
         }
     }
 }
@@ -413,6 +426,7 @@ impl<E: ProcessEdgesWork> VMForwardWeakRefs<E> {
 
 impl<E: ProcessEdgesWork> GCWork<E::VM> for VMForwardWeakRefs<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, _mmtk: &'static MMTK<E::VM>) {
+        let start = std::time::Instant::now();
         trace!("VMForwardWeakRefs");
 
         let stage = WorkBucketStage::VMRefForwarding;
@@ -421,7 +435,13 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for VMForwardWeakRefs<E> {
             stage,
             phantom_data: PhantomData,
         };
-        <E::VM as VMBinding>::VMScanning::forward_weak_refs(worker, tracer_factory)
+        <E::VM as VMBinding>::VMScanning::forward_weak_refs(worker, tracer_factory);
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: VMRefForwarding completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 
@@ -438,9 +458,16 @@ pub struct VMPostForwarding<VM: VMBinding> {
 
 impl<VM: VMBinding> GCWork<VM> for VMPostForwarding<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        let start = std::time::Instant::now();
         trace!("VMPostForwarding start");
         <VM as VMBinding>::VMCollection::post_forwarding(worker.tls);
         trace!("VMPostForwarding end");
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: VMPostForwarding completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 

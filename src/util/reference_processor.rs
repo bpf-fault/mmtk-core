@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
 
 use crate::plan::is_nursery_gc;
@@ -11,6 +11,11 @@ use crate::util::ObjectReference;
 use crate::util::VMWorkerThread;
 use crate::vm::ReferenceGlue;
 use crate::vm::VMBinding;
+
+fn reference_perf_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MMTK_TRACE_COMPRESSOR_PERF").is_some())
+}
 
 /// Holds all reference processors for each weak reference Semantics.
 /// Currently this is based on Java's weak reference semantics (soft/weak/phantom).
@@ -257,34 +262,80 @@ impl ReferenceProcessor {
         // and the write barrier scans the objects and attempts to add new weak references.
         // Disallow new candidates to prevent the deadlock.
         self.disallow_new_candidate();
+        let lock_start = std::time::Instant::now();
         let mut sync = self.sync.lock().unwrap();
+        let lock_ms = lock_start.elapsed().as_millis();
 
         // This is the end of a GC. We do some assertions here to make sure our reference tables are correct.
         #[cfg(debug_assertions)]
         {
-            // For references in the table, the reference needs to be valid, and if the referent is not cleared, it should be valid as well
-            sync.references.iter().for_each(|reff| {
-                debug_assert!(reff.is_in_any_space());
-                if let Some(referent) = VM::VMReferenceGlue::get_referent(*reff) {
-                    debug_assert!(
-                        referent.is_in_any_space(),
-                        "Referent {:?} (of reference {:?}) is not in any space",
-                        referent,
-                        reff
-                    );
-                }
-            });
-            // For references that will be enqueue'd, the reference needs to be valid, and the referent needs to be cleared.
-            sync.enqueued_references.iter().for_each(|reff| {
-                debug_assert!(reff.is_in_any_space());
-                let maybe_referent = VM::VMReferenceGlue::get_referent(*reff);
-                debug_assert!(maybe_referent.is_none());
-            });
+            let validate_start = std::time::Instant::now();
+            let validate_ref_tables =
+                std::env::var_os("MMTK_VALIDATE_REF_TABLES_AT_ENQUEUE").is_some();
+            if validate_ref_tables {
+                // For references in the table, the reference needs to be valid, and if the referent is not cleared, it should be valid as well
+                sync.references.iter().for_each(|reff| {
+                    debug_assert!(reff.is_in_any_space());
+                    if let Some(referent) = VM::VMReferenceGlue::get_referent(*reff) {
+                        debug_assert!(
+                            referent.is_in_any_space(),
+                            "Referent {:?} (of reference {:?}) is not in any space",
+                            referent,
+                            reff
+                        );
+                    }
+                });
+                // For references that will be enqueue'd, the reference needs to be valid, and the referent needs to be cleared.
+                sync.enqueued_references.iter().for_each(|reff| {
+                    debug_assert!(reff.is_in_any_space());
+                    let maybe_referent = VM::VMReferenceGlue::get_referent(*reff);
+                    debug_assert!(maybe_referent.is_none());
+                });
+            }
+            let validate_ms = validate_start.elapsed().as_millis();
+            if (validate_ms > 0 || lock_ms > 0) && reference_perf_trace_enabled() {
+                info!(
+                    "ReferenceProcessing: enqueue {:?} lock={} ms validate={} ms validate_enabled={} refs={} enqueued={}",
+                    self.semantics,
+                    lock_ms,
+                    validate_ms,
+                    validate_ref_tables,
+                    sync.references.len(),
+                    sync.enqueued_references.len()
+                );
+            }
         }
 
         if !sync.enqueued_references.is_empty() {
+            let total_start = std::time::Instant::now();
+            let before = sync.enqueued_references.len();
+            let dedup_start = std::time::Instant::now();
+            if before > 1 {
+                let mut seen = HashSet::with_capacity(before);
+                sync.enqueued_references.retain(|reff| seen.insert(*reff));
+            }
+            let after = sync.enqueued_references.len();
+            let dedup_ms = dedup_start.elapsed().as_millis();
+            if before != after && reference_perf_trace_enabled() {
+                info!(
+                    "ReferenceProcessing: deduplicated enqueued {:?} refs from {} to {} before VM enqueue in {} ms",
+                    self.semantics,
+                    before,
+                    after,
+                    dedup_ms
+                );
+            }
             trace!("enqueue: {:?}", sync.enqueued_references);
+            let vm_enqueue_start = std::time::Instant::now();
             VM::VMReferenceGlue::enqueue_references(&sync.enqueued_references, tls);
+            let vm_enqueue_ms = vm_enqueue_start.elapsed().as_millis();
+            let total_ms = total_start.elapsed().as_millis();
+            if reference_perf_trace_enabled() {
+                info!(
+                    "ReferenceProcessing: enqueue {:?} refs={} vm_enqueue={} ms total={} ms",
+                    self.semantics, after, vm_enqueue_ms, total_ms
+                );
+            }
             sync.enqueued_references.clear();
         }
 
@@ -550,6 +601,7 @@ impl<VM: VMBinding> GCWork<VM> for RescanReferences<VM> {
 pub(crate) struct SoftRefProcessing<E: ProcessEdgesWork>(PhantomData<E>);
 impl<E: ProcessEdgesWork> GCWork<E::VM> for SoftRefProcessing<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, mmtk: &'static MMTK<E::VM>) {
+        let start = std::time::Instant::now();
         if !mmtk.state.is_emergency_collection() {
             // Postpone the scanning to the end of the transitive closure from strongly reachable
             // soft references.
@@ -570,6 +622,12 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for SoftRefProcessing<E> {
             // Scan soft references immediately without retaining.
             mmtk.reference_processors.scan_soft_refs(mmtk);
         }
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: SoftRefClosure completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<E: ProcessEdgesWork> SoftRefProcessing<E> {
@@ -582,7 +640,14 @@ impl<E: ProcessEdgesWork> SoftRefProcessing<E> {
 pub(crate) struct WeakRefProcessing<VM: VMBinding>(PhantomData<VM>);
 impl<VM: VMBinding> GCWork<VM> for WeakRefProcessing<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let start = std::time::Instant::now();
         mmtk.reference_processors.scan_weak_refs(mmtk);
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: WeakRefClosure completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<VM: VMBinding> WeakRefProcessing<VM> {
@@ -595,7 +660,14 @@ impl<VM: VMBinding> WeakRefProcessing<VM> {
 pub(crate) struct PhantomRefProcessing<VM: VMBinding>(PhantomData<VM>);
 impl<VM: VMBinding> GCWork<VM> for PhantomRefProcessing<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let start = std::time::Instant::now();
         mmtk.reference_processors.scan_phantom_refs(mmtk);
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: PhantomRefClosure completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<VM: VMBinding> PhantomRefProcessing<VM> {
@@ -608,10 +680,17 @@ impl<VM: VMBinding> PhantomRefProcessing<VM> {
 pub(crate) struct RefForwarding<E: ProcessEdgesWork>(PhantomData<E>);
 impl<E: ProcessEdgesWork> GCWork<E::VM> for RefForwarding<E> {
     fn do_work(&mut self, worker: &mut GCWorker<E::VM>, mmtk: &'static MMTK<E::VM>) {
+        let start = std::time::Instant::now();
         let mut w = E::new(vec![], false, mmtk, WorkBucketStage::RefForwarding);
         w.set_worker(worker);
         mmtk.reference_processors.forward_refs(&mut w, mmtk);
         w.flush();
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: RefForwarding completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<E: ProcessEdgesWork> RefForwarding<E> {
@@ -624,7 +703,14 @@ impl<E: ProcessEdgesWork> RefForwarding<E> {
 pub(crate) struct RefEnqueue<VM: VMBinding>(PhantomData<VM>);
 impl<VM: VMBinding> GCWork<VM> for RefEnqueue<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
+        let start = std::time::Instant::now();
         mmtk.reference_processors.enqueue_refs::<VM>(worker.tls);
+        if reference_perf_trace_enabled() {
+            info!(
+                "ReferenceProcessing: RefEnqueue completed in {} ms",
+                start.elapsed().as_millis()
+            );
+        }
     }
 }
 impl<VM: VMBinding> RefEnqueue<VM> {

@@ -7,7 +7,8 @@ use crate::scheduler::gc_work::{PlanProcessEdges, ProcessEdgesWork, ScanObjects,
 use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 use crate::util::linear_scan::Region;
 use crate::util::ObjectReference;
-use crate::vm::VMBinding;
+use crate::vm::slot::Slot;
+use crate::vm::{Scanning, VMBinding};
 use crate::MMTK;
 use std::collections::HashSet;
 use std::marker::PhantomData;
@@ -46,23 +47,23 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessDirtyBlocks<E> {
             return;
         }
 
-        let dirty_blocks = plan.uffd_wp_tracker.take_current_gc_dirty_blocks();
+        let scan_blocks = plan.uffd_wp_tracker.take_current_gc_scan_blocks();
         if std::env::var_os("MMTK_TRACE_UFFD_WP_RS_COMPARE").is_some()
             || std::env::var_os("MMTK_TRACE_RS_METRICS").is_some()
         {
             eprintln!(
-                "MMTK UFFD WP dirty scan: dirty_blocks={}",
-                dirty_blocks.len()
+                "MMTK UFFD WP dirty scan: blocks_to_scan={}",
+                scan_blocks.len()
             );
         }
-        if dirty_blocks.is_empty() {
+        if scan_blocks.is_empty() {
             return;
         }
 
         let mut seen = HashSet::<ObjectReference>::new();
         let mut objects = vec![];
-        for block_start in dirty_blocks {
-            collect_objects_overlapping_block::<E::VM>(block_start, &mut seen, &mut objects);
+        for block_start in &scan_blocks {
+            collect_objects_overlapping_block::<E::VM>(*block_start, &mut seen, &mut objects);
         }
 
         if std::env::var_os("MMTK_TRACE_UFFD_WP_RS_COMPARE").is_some()
@@ -72,6 +73,37 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessDirtyBlocks<E> {
                 "MMTK UFFD WP dirty scan: scanned_objects={}",
                 objects.len()
             );
+        }
+
+        let mut blocks_with_nursery_edges = HashSet::<usize>::new();
+        for object in &objects {
+            let block = crate::policy::immix::block::Block::containing(*object)
+                .start()
+                .as_usize();
+            if blocks_with_nursery_edges.contains(&block) {
+                continue;
+            }
+            if !<E::VM as VMBinding>::VMScanning::support_slot_enqueuing(worker.tls, *object) {
+                blocks_with_nursery_edges.insert(block);
+                plan.uffd_wp_tracker.record_nursery_edge_block(block);
+                continue;
+            }
+
+            let mut has_nursery_edge = false;
+            <E::VM as VMBinding>::VMScanning::scan_object(worker.tls, *object, &mut |slot: <E::VM as VMBinding>::VMSlot| {
+                if has_nursery_edge {
+                    return;
+                }
+                if let Some(target) = slot.load() {
+                    if plan.is_object_in_nursery(target) {
+                        has_nursery_edge = true;
+                    }
+                }
+            });
+            if has_nursery_edge {
+                blocks_with_nursery_edges.insert(block);
+                plan.uffd_wp_tracker.record_nursery_edge_block(block);
+            }
         }
 
         if plan.uffd_wp_tracker.remembered_set_mode().uses_dirty_block_scanning() {

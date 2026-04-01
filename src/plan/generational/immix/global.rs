@@ -141,13 +141,13 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         let full_heap = !self.gen.is_current_gc_nursery();
-        let capture_current_gc_dirty_blocks = !full_heap
+        let capture_current_gc_scan_blocks = !full_heap
             && self
                 .uffd_wp_tracker
                 .remembered_set_mode()
                 .uses_dirty_block_scanning();
         self.uffd_wp_tracker
-            .begin_collection(capture_current_gc_dirty_blocks);
+            .begin_collection(capture_current_gc_scan_blocks);
         self.gen.prepare(tls);
         if full_heap {
             self.immix_space.prepare(
@@ -181,6 +181,7 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {
+        let nursery_gc = self.is_current_gc_nursery();
         let next_gc_full_heap = CommonGenPlan::should_next_gc_be_full_heap(self);
         self.gen.end_of_gc(tls, next_gc_full_heap);
 
@@ -191,7 +192,7 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
             eprintln!("MMTK GenImmix: end_of_gc before tracker");
         }
         self.uffd_wp_tracker
-            .end_collection_for_immix_space(&self.immix_space);
+            .end_collection_for_immix_space(&self.immix_space, nursery_gc);
         if std::env::var_os("MMTK_TRACE_UFFD_WP_TRACKER").is_some() {
             eprintln!("MMTK GenImmix: end_of_gc after tracker");
         }

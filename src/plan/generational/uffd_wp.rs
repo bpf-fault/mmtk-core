@@ -105,10 +105,10 @@ impl UffdWpTracker {
         }
     }
 
-    pub fn take_current_gc_dirty_blocks(&self) -> Vec<usize> {
+    pub fn take_current_gc_scan_blocks(&self) -> Vec<usize> {
         #[cfg(target_os = "linux")]
         if let Some(inner) = &self.inner {
-            return inner.take_current_gc_dirty_blocks();
+            return inner.take_current_gc_scan_blocks();
         }
 
         vec![]
@@ -121,6 +121,13 @@ impl UffdWpTracker {
         }
 
         false
+    }
+
+    pub fn record_nursery_edge_block(&self, block: usize) {
+        #[cfg(target_os = "linux")]
+        if let Some(inner) = &self.inner {
+            inner.record_nursery_edge_block(block);
+        }
     }
 
     pub fn record_shadow_barrier_object(&self, object: usize) {
@@ -144,10 +151,14 @@ impl UffdWpTracker {
         }
     }
 
-    pub fn end_collection_for_immix_space<VM: VMBinding>(&self, immix_space: &ImmixSpace<VM>) {
+    pub fn end_collection_for_immix_space<VM: VMBinding>(
+        &self,
+        immix_space: &ImmixSpace<VM>,
+        nursery_gc: bool,
+    ) {
         #[cfg(target_os = "linux")]
         if let Some(inner) = &self.inner {
-            inner.end_collection_for_immix_space(immix_space);
+            inner.end_collection_for_immix_space(immix_space, nursery_gc);
         }
     }
 }
@@ -167,8 +178,11 @@ struct LinuxUffdWpTracker {
     uffd: libc::c_int,
     remembered_set_mode: RememberedSetMode,
     registered_blocks: Mutex<HashSet<usize>>,
+    protected_clean_blocks: Mutex<HashSet<usize>>,
+    remembered_blocks: Mutex<HashSet<usize>>,
     dirty_blocks: Arc<Mutex<HashSet<usize>>>,
-    current_gc_dirty_blocks: Mutex<Vec<usize>>,
+    current_gc_scan_blocks: Mutex<Vec<usize>>,
+    current_gc_blocks_with_nursery_edges: Mutex<HashSet<usize>>,
     faults: Arc<AtomicU64>,
     protected_epochs: AtomicU64,
     stop: Arc<AtomicBool>,
@@ -213,8 +227,11 @@ impl LinuxUffdWpTracker {
             uffd,
             remembered_set_mode,
             registered_blocks: Mutex::new(HashSet::new()),
+            protected_clean_blocks: Mutex::new(HashSet::new()),
+            remembered_blocks: Mutex::new(HashSet::new()),
             dirty_blocks: Arc::new(Mutex::new(HashSet::new())),
-            current_gc_dirty_blocks: Mutex::new(vec![]),
+            current_gc_scan_blocks: Mutex::new(vec![]),
+            current_gc_blocks_with_nursery_edges: Mutex::new(HashSet::new()),
             faults: Arc::new(AtomicU64::new(0)),
             protected_epochs: AtomicU64::new(0),
             stop: Arc::new(AtomicBool::new(false)),
@@ -393,12 +410,16 @@ impl LinuxUffdWpTracker {
             let faults = self.faults.swap(0, Ordering::Relaxed);
             let dirty_blocks = self.dirty_blocks.lock().unwrap().len();
             let tracked_blocks = self.registered_blocks.lock().unwrap().len();
+            let protected_clean_blocks = self.protected_clean_blocks.lock().unwrap().len();
+            let remembered_blocks = self.remembered_blocks.lock().unwrap().len();
             let tracked_pages_per_block = Block::BYTES / PAGE_SIZE;
             let msg = format!(
-                "MMTK UFFD WP tracker epoch {} summary: tracked_blocks={}, tracked_pages={}, dirty_blocks={}, write_faults={}",
+                "MMTK UFFD WP tracker epoch {} summary: tracked_blocks={}, tracked_pages={}, protected_clean_blocks={}, remembered_blocks={}, dirty_blocks={}, write_faults={}",
                 epoch,
                 tracked_blocks,
                 tracked_blocks * tracked_pages_per_block,
+                protected_clean_blocks,
+                remembered_blocks,
                 dirty_blocks,
                 faults,
             );
@@ -408,22 +429,35 @@ impl LinuxUffdWpTracker {
             info!("{}", msg);
         }
 
-        let next_current_gc_dirty_blocks = {
+        let next_current_gc_scan_blocks = {
             let mut dirty_blocks = self.dirty_blocks.lock().unwrap();
             if capture_for_current_gc {
-                dirty_blocks.drain().collect()
+                let mut scan_blocks: HashSet<usize> =
+                    self.remembered_blocks.lock().unwrap().iter().copied().collect();
+                scan_blocks.extend(dirty_blocks.drain());
+                scan_blocks.into_iter().collect()
             } else {
                 dirty_blocks.clear();
                 vec![]
             }
         };
-        *self.current_gc_dirty_blocks.lock().unwrap() = next_current_gc_dirty_blocks;
+        *self.current_gc_scan_blocks.lock().unwrap() = next_current_gc_scan_blocks;
+        self.current_gc_blocks_with_nursery_edges
+            .lock()
+            .unwrap()
+            .clear();
         if self.compare_enabled && capture_for_current_gc {
             self.shadow_barrier_objects.lock().unwrap().clear();
             self.shadow_dirty_objects.lock().unwrap().clear();
         }
 
-        let blocks: Vec<usize> = self.registered_blocks.lock().unwrap().iter().copied().collect();
+        let blocks: Vec<usize> = self
+            .protected_clean_blocks
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
         if !self.skip_protect {
             for block in &blocks {
                 if let Err(err) = self.write_protect(*block, Block::BYTES, false) {
@@ -442,21 +476,28 @@ impl LinuxUffdWpTracker {
         }
         if self.trace_faults {
             eprintln!(
-                "MMTK UFFD WP tracker: begin_collection epoch={} done unprotected_blocks={} current_gc_dirty_blocks={} skip_protect={}",
+                "MMTK UFFD WP tracker: begin_collection epoch={} done unprotected_clean_blocks={} current_gc_scan_blocks={} skip_protect={}",
                 epoch + 1,
                 blocks.len(),
-                self.current_gc_dirty_blocks.lock().unwrap().len(),
+                self.current_gc_scan_blocks.lock().unwrap().len(),
                 self.skip_protect
             );
         }
     }
 
-    fn take_current_gc_dirty_blocks(&self) -> Vec<usize> {
-        mem::take(&mut *self.current_gc_dirty_blocks.lock().unwrap())
+    fn take_current_gc_scan_blocks(&self) -> Vec<usize> {
+        mem::take(&mut *self.current_gc_scan_blocks.lock().unwrap())
     }
 
     fn replacement_ready(&self) -> bool {
         self.protected_epochs.load(Ordering::Relaxed) > 0
+    }
+
+    fn record_nursery_edge_block(&self, block: usize) {
+        self.current_gc_blocks_with_nursery_edges
+            .lock()
+            .unwrap()
+            .insert(block);
     }
 
     fn record_shadow_barrier_object(&self, object: usize) {
@@ -495,12 +536,17 @@ impl LinuxUffdWpTracker {
         info!("{}", msg);
     }
 
-    fn end_collection_for_immix_space<VM: VMBinding>(&self, immix_space: &ImmixSpace<VM>) {
+    fn end_collection_for_immix_space<VM: VMBinding>(
+        &self,
+        immix_space: &ImmixSpace<VM>,
+        nursery_gc: bool,
+    ) {
         let next_epoch = self.protected_epochs.load(Ordering::Relaxed) + 1;
         if self.trace_faults {
             eprintln!(
-                "MMTK UFFD WP tracker: end_collection epoch={} start",
-                next_epoch
+                "MMTK UFFD WP tracker: end_collection epoch={} start nursery_gc={}",
+                next_epoch,
+                nursery_gc
             );
         }
         let current_blocks: HashSet<usize> = immix_space
@@ -554,20 +600,48 @@ impl LinuxUffdWpTracker {
                 continue;
             }
             if self.trace_faults {
-                eprintln!("MMTK UFFD WP tracker: registered block={:#x} bytes={}", block, Block::BYTES);
+                eprintln!(
+                    "MMTK UFFD WP tracker: registered block={:#x} bytes={}",
+                    block,
+                    Block::BYTES
+                );
             }
             registered.insert(*block);
         }
-
-        let protected_blocks: Vec<usize> = registered.iter().copied().collect();
-        let protected_count = protected_blocks.len();
         drop(registered);
 
+        let next_remembered_blocks: HashSet<usize> = if nursery_gc
+            && self.remembered_set_mode.uses_dirty_block_scanning()
+        {
+            self.current_gc_blocks_with_nursery_edges
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|block| current_blocks.contains(block))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let next_protected_clean_blocks: HashSet<usize> = current_blocks
+            .difference(&next_remembered_blocks)
+            .copied()
+            .collect();
+
+        let remembered_count = next_remembered_blocks.len();
+        let protected_clean_count = next_protected_clean_blocks.len();
+        *self.remembered_blocks.lock().unwrap() = next_remembered_blocks;
+        *self.protected_clean_blocks.lock().unwrap() = next_protected_clean_blocks.clone();
+        self.current_gc_blocks_with_nursery_edges
+            .lock()
+            .unwrap()
+            .clear();
+
         if !self.skip_protect {
-            for block in protected_blocks {
+            for block in next_protected_clean_blocks {
                 if let Err(err) = self.write_protect(block, Block::BYTES, true) {
                     warn!(
-                        "Failed to enable UFFD write protection for block {:#x}: {}",
+                        "Failed to enable UFFD write protection for clean block {:#x}: {}",
                         block, err
                     );
                     if self.trace_faults {
@@ -578,7 +652,7 @@ impl LinuxUffdWpTracker {
                     }
                 } else if self.trace_faults {
                     eprintln!(
-                        "MMTK UFFD WP tracker: protected block={:#x} bytes={}",
+                        "MMTK UFFD WP tracker: protected clean block={:#x} bytes={}",
                         block,
                         Block::BYTES
                     );
@@ -587,12 +661,13 @@ impl LinuxUffdWpTracker {
         }
 
         self.protected_epochs.fetch_add(1, Ordering::Relaxed);
-        if self.trace_faults {
+        if self.trace_faults || self.metrics_enabled {
             eprintln!(
-                "MMTK UFFD WP tracker: end_collection epoch={} done tracked_blocks={} protected_blocks={} skip_protect={}",
+                "MMTK UFFD WP tracker: end_collection epoch={} done tracked_blocks={} protected_clean_blocks={} remembered_blocks={} skip_protect={}",
                 next_epoch,
                 current_blocks.len(),
-                protected_count,
+                protected_clean_count,
+                remembered_count,
                 self.skip_protect
             );
         }

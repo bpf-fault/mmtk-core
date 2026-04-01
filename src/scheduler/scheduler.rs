@@ -17,6 +17,7 @@ use crate::Plan;
 use crossbeam::deque::Steal;
 use enum_map::{Enum, EnumMap};
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -581,6 +582,25 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             elapsed.as_millis()
         );
 
+        if env::var_os("MMTK_TRACE_RS_METRICS").is_some() {
+            let gc_kind = if let Some(gen) = mmtk.get_plan().generational() {
+                if gen.is_current_gc_nursery() {
+                    "nursery"
+                } else {
+                    "full_heap"
+                }
+            } else {
+                "other"
+            };
+            eprintln!(
+                "MMTK GC summary: kind={} elapsed_ms={} reserved_pages={} total_pages={}",
+                gc_kind,
+                elapsed.as_millis(),
+                mmtk.get_plan().get_reserved_pages(),
+                mmtk.get_plan().get_total_pages(),
+            );
+        }
+
         // USDT tracepoint for the end of GC.
         probe!(mmtk, gc_end);
 
@@ -619,8 +639,17 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         self.debug_assert_all_stw_buckets_closed();
 
         // Set to NotInGC after everything, and right before resuming mutators.
+        if std::env::var_os("MMTK_TRACE_UFFD_WP_TRACKER").is_some() {
+            eprintln!("MMTK Scheduler: before set_gc_status(NotInGC)");
+        }
         mmtk.set_gc_status(GcStatus::NotInGC);
+        if std::env::var_os("MMTK_TRACE_UFFD_WP_TRACKER").is_some() {
+            eprintln!("MMTK Scheduler: before resume_mutators");
+        }
         <VM as VMBinding>::VMCollection::resume_mutators(worker.tls);
+        if std::env::var_os("MMTK_TRACE_UFFD_WP_TRACKER").is_some() {
+            eprintln!("MMTK Scheduler: after resume_mutators");
+        }
 
         concurrent_work_scheduled
     }

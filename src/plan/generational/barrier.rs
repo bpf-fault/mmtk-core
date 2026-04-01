@@ -76,6 +76,12 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>> BarrierSem
         _slot: VM::VMSlot,
         _target: Option<ObjectReference>,
     ) {
+        if self.plan.remembered_set_mode().replaces_software_barrier()
+            && self.plan.uffd_remembered_set_ready()
+            && self.plan.uffd_remembered_set_covers_object(src)
+        {
+            return;
+        }
         // enqueue the object
         self.modbuf.push(src);
         self.modbuf.is_full().then(|| self.flush_modbuf());
@@ -89,6 +95,17 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>> BarrierSem
         };
         // Only enqueue array slices in mature spaces
         if !dst_in_nursery {
+            if self.plan.remembered_set_mode().replaces_software_barrier()
+                && self.plan.uffd_remembered_set_ready()
+            {
+                let covered_by_uffd = match dst.object() {
+                    Some(obj) => self.plan.uffd_remembered_set_covers_object(obj),
+                    None => self.plan.uffd_remembered_set_covers_address(dst.start()),
+                };
+                if covered_by_uffd {
+                    return;
+                }
+            }
             // enqueue
             self.region_modbuf.push(dst);
             self.region_modbuf
@@ -98,6 +115,12 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>> BarrierSem
     }
 
     fn object_probable_write_slow(&mut self, obj: ObjectReference) {
+        if self.plan.remembered_set_mode().replaces_software_barrier()
+            && self.plan.uffd_remembered_set_ready()
+            && self.plan.uffd_remembered_set_covers_object(obj)
+        {
+            return;
+        }
         // enqueue the object
         self.modbuf.push(obj);
         self.modbuf.is_full().then(|| self.flush_modbuf());

@@ -309,6 +309,26 @@ pub trait GenerationalPlan: Plan {
     fn force_full_heap_collection(&self);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RememberedSetMode {
+    /// Use the existing software remembered-set barrier/modbuf path only.
+    Barrier,
+    /// Use the software barrier path and the UFFD dirty-block path together.
+    Shadow,
+    /// Use the UFFD dirty-block path as the authoritative remembered-set source.
+    Replace,
+}
+
+impl RememberedSetMode {
+    pub const fn uses_dirty_block_scanning(self) -> bool {
+        matches!(self, Self::Shadow | Self::Replace)
+    }
+
+    pub const fn replaces_software_barrier(self) -> bool {
+        matches!(self, Self::Replace)
+    }
+}
+
 /// This trait is the extension trait for [`GenerationalPlan`] (see Rust's extension trait pattern).
 /// Generally any method should be put to [`GenerationalPlan`] if possible while keeping [`GenerationalPlan`]
 /// object safe. In this case, generic methods will be put to this extension trait.
@@ -321,6 +341,26 @@ pub trait GenerationalPlanExt<VM: VMBinding>: GenerationalPlan<VM = VM> {
         object: ObjectReference,
         worker: &mut GCWorker<VM>,
     ) -> ObjectReference;
+
+    /// Select how nursery remembered-set scanning is driven for this plan.
+    fn remembered_set_mode(&self) -> RememberedSetMode {
+        RememberedSetMode::Barrier
+    }
+
+    /// Return true once the UFFD remembered-set path has enough state to replace the software barrier.
+    fn uffd_remembered_set_ready(&self) -> bool {
+        false
+    }
+
+    /// Return true if the UFFD remembered-set replacement path covers this source object.
+    fn uffd_remembered_set_covers_object(&self, _object: ObjectReference) -> bool {
+        false
+    }
+
+    /// Return true if the UFFD remembered-set replacement path covers this source address/slice.
+    fn uffd_remembered_set_covers_address(&self, _addr: Address) -> bool {
+        false
+    }
 }
 
 /// Is current GC only collecting objects allocated since last GC? This method can be called

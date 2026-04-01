@@ -30,6 +30,7 @@ pub mod immix;
 
 pub(super) mod gc_work;
 pub(super) mod global;
+pub(crate) mod uffd_wp;
 
 /// # Barrier overhead measurement:
 ///  - Set `FULL_NURSERY_GC` to `true`.

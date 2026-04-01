@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
 use super::global::GenerationalPlanExt;
+use crate::plan::generational::immix::GenImmix;
 
 /// Process edges for a nursery GC. This type is provided if a generational plan does not use
 /// [`crate::scheduler::gc_work::SFTProcessEdges`]. If a plan uses `SFTProcessEdges`,
@@ -112,8 +113,17 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessModBuf<E> {
         // Process and scan modbuf only if the current GC is a nursery GC
         let gen = mmtk.get_plan().generational().unwrap();
         if gen.is_current_gc_nursery() {
+            let genimmix = mmtk.get_plan().downcast_ref::<GenImmix<E::VM>>();
             // Flip the per-object unlogged bits to "unlogged" state.
             for obj in &self.modbuf {
+                if let Some(plan) = genimmix {
+                    if plan.uffd_wp_tracker.remembered_set_mode().uses_dirty_block_scanning()
+                        && plan.uffd_remembered_set_covers_object(*obj)
+                    {
+                        plan.uffd_wp_tracker
+                            .record_shadow_barrier_object(obj.to_raw_address().as_usize());
+                    }
+                }
                 debug_assert!(
                     !gen.is_object_in_nursery(*obj),
                     "{} was logged but is not mature. Dumping process memory maps:\n{}",
@@ -165,9 +175,20 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessRegionModBuf<E> {
             .unwrap()
             .is_current_gc_nursery()
         {
+            let genimmix = mmtk.get_plan().downcast_ref::<GenImmix<E::VM>>();
             // Collect all the entries in all the slices
             let mut slots = vec![];
             for slice in &self.modbuf {
+                if let Some(plan) = genimmix {
+                    if plan.uffd_wp_tracker.remembered_set_mode().uses_dirty_block_scanning() {
+                        if let Some(obj) = slice.object() {
+                            if plan.uffd_remembered_set_covers_object(obj) {
+                                plan.uffd_wp_tracker
+                                    .record_shadow_barrier_object(obj.to_raw_address().as_usize());
+                            }
+                        }
+                    }
+                }
                 for slot in slice.iter_slots() {
                     slots.push(slot);
                 }

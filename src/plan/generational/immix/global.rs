@@ -1,7 +1,11 @@
 use super::gc_work::GenImmixMatureGCWorkContext;
 use super::gc_work::GenImmixNurseryGCWorkContext;
+use super::gc_work::ProcessDirtyBlocks;
+use crate::plan::generational::gc_work::GenNurseryProcessEdges;
 use crate::plan::generational::global::CommonGenPlan;
 use crate::plan::generational::global::GenerationalPlan;
+use crate::plan::generational::global::RememberedSetMode;
+use crate::plan::generational::uffd_wp::UffdWpTracker;
 use crate::plan::global::BasePlan;
 use crate::plan::global::CommonPlan;
 use crate::plan::global::CreateGeneralPlanArgs;
@@ -9,7 +13,7 @@ use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
-use crate::policy::gc_work::TraceKind;
+use crate::policy::gc_work::{TraceKind, DEFAULT_TRACE};
 use crate::policy::immix::defrag::StatsForDefrag;
 use crate::policy::immix::ImmixSpace;
 use crate::policy::immix::ImmixSpaceArgs;
@@ -17,6 +21,7 @@ use crate::policy::immix::{TRACE_KIND_DEFRAG, TRACE_KIND_FAST};
 use crate::policy::space::Space;
 use crate::scheduler::GCWorkScheduler;
 use crate::scheduler::GCWorker;
+use crate::scheduler::WorkBucketStage;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::copy::*;
 use crate::util::heap::gc_trigger::SpaceStats;
@@ -52,6 +57,8 @@ pub struct GenImmix<VM: VMBinding> {
     pub last_gc_was_defrag: AtomicBool,
     /// Whether the last GC was a full heap GC
     pub last_gc_was_full_heap: AtomicBool,
+    /// Experimental Linux-only UFFD write-protect tracker for mature-space write-notify stats.
+    pub uffd_wp_tracker: UffdWpTracker,
 }
 
 /// The plan constraints for the generational immix plan.
@@ -113,6 +120,11 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         if !is_full_heap {
             info!("Nursery GC");
             scheduler.schedule_common_work::<GenImmixNurseryGCWorkContext<VM>>(self);
+            if self.uffd_wp_tracker.remembered_set_mode().uses_dirty_block_scanning() {
+                scheduler.work_buckets[WorkBucketStage::Closure].add(
+                    ProcessDirtyBlocks::<GenNurseryProcessEdges<VM, GenImmix<VM>, DEFAULT_TRACE>>::new(),
+                );
+            }
         } else {
             info!("Full heap GC");
             crate::plan::immix::Immix::schedule_immix_full_heap_collection::<
@@ -129,6 +141,13 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         let full_heap = !self.gen.is_current_gc_nursery();
+        let capture_current_gc_dirty_blocks = !full_heap
+            && self
+                .uffd_wp_tracker
+                .remembered_set_mode()
+                .uses_dirty_block_scanning();
+        self.uffd_wp_tracker
+            .begin_collection(capture_current_gc_dirty_blocks);
         self.gen.prepare(tls);
         if full_heap {
             self.immix_space.prepare(
@@ -167,6 +186,15 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
 
         let did_defrag = self.immix_space.end_of_gc();
         self.last_gc_was_defrag.store(did_defrag, Ordering::Relaxed);
+        self.uffd_wp_tracker.report_shadow_compare();
+        if std::env::var_os("MMTK_TRACE_UFFD_WP_TRACKER").is_some() {
+            eprintln!("MMTK GenImmix: end_of_gc before tracker");
+        }
+        self.uffd_wp_tracker
+            .end_collection_for_immix_space(&self.immix_space);
+        if std::env::var_os("MMTK_TRACE_UFFD_WP_TRACKER").is_some() {
+            eprintln!("MMTK GenImmix: end_of_gc after tracker");
+        }
     }
 
     fn current_gc_may_move_object(&self) -> bool {
@@ -251,6 +279,22 @@ impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM> f
         self.gen
             .trace_object_nursery::<Q, KIND>(queue, object, worker)
     }
+
+    fn remembered_set_mode(&self) -> RememberedSetMode {
+        self.uffd_wp_tracker.remembered_set_mode()
+    }
+
+    fn uffd_remembered_set_ready(&self) -> bool {
+        self.uffd_wp_tracker.replacement_ready()
+    }
+
+    fn uffd_remembered_set_covers_object(&self, object: ObjectReference) -> bool {
+        self.immix_space.in_space(object)
+    }
+
+    fn uffd_remembered_set_covers_address(&self, addr: Address) -> bool {
+        self.immix_space.address_in_space(addr)
+    }
 }
 
 impl<VM: VMBinding> GenImmix<VM> {
@@ -280,6 +324,7 @@ impl<VM: VMBinding> GenImmix<VM> {
             immix_space,
             last_gc_was_defrag: AtomicBool::new(false),
             last_gc_was_full_heap: AtomicBool::new(false),
+            uffd_wp_tracker: UffdWpTracker::new_from_env(),
         };
 
         genimmix.verify_side_metadata_sanity();

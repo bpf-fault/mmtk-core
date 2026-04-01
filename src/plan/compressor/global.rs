@@ -4,12 +4,14 @@ use super::gc_work::CaptureBlackAllocations;
 use super::gc_work::CompressorWorkContext;
 #[cfg(feature = "uffd")]
 use super::gc_work::ConcurrentCompressorGCWorkContext;
+#[cfg(feature = "uffd")]
+use super::gc_work::FinalizeCompactionPrepare;
+#[cfg(feature = "uffd")]
+use super::gc_work::FinalizeInitialMarkPrepare;
 use super::gc_work::LogBucketTiming;
 use super::gc_work::LogBucketTimings;
 use super::gc_work::TimedPrepare;
 use super::gc_work::{ForwardingProcessEdges, GenerateWork, MarkingProcessEdges, UpdateReferences};
-#[cfg(feature = "uffd")]
-use super::gc_work::{ValidateMutatorRoots, ValidateVmSpecificRoots};
 use crate::plan::barriers::BarrierSelector;
 use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
 #[cfg(feature = "uffd")]
@@ -85,6 +87,10 @@ pub struct Compressor<VM: VMBinding> {
     #[cfg(feature = "uffd")]
     should_do_full_gc: AtomicBool,
     #[cfg(feature = "uffd")]
+    compaction_prepare_active: AtomicBool,
+    #[cfg(feature = "uffd")]
+    compaction_prepare_ready: AtomicBool,
+    #[cfg(feature = "uffd")]
     uffd_compaction_active: AtomicBool,
     #[cfg(feature = "uffd")]
     uffd_epoch_ready: AtomicBool,
@@ -117,9 +123,29 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                 return false;
             }
 
-            if self.concurrent_marking_active.load(Ordering::Acquire)
-                && self.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained()
-            {
+            let concurrent_drained =
+                self.common.base.scheduler.work_buckets[WorkBucketStage::Concurrent].is_drained();
+
+            if self.compaction_prepare_ready.load(Ordering::Acquire) {
+                if concurrent_drained {
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "Compressor collection_required: concurrent compaction prepare drained, scheduling Compaction pause (used_pages={}, total_pages={}, should_do_full_gc={})",
+                            self.get_used_pages(),
+                            self.get_total_pages(),
+                            self.should_do_full_gc.load(Ordering::Acquire)
+                        );
+                    }
+                    return true;
+                }
+                return false;
+            }
+
+            if self.compaction_prepare_active.load(Ordering::Acquire) {
+                return false;
+            }
+
+            if self.concurrent_marking_active.load(Ordering::Acquire) && concurrent_drained {
                 if compressor_perf_trace_enabled() {
                     info!(
                         "Compressor collection_required: concurrent marking drained, scheduling FinalMark (used_pages={}, total_pages={}, should_do_full_gc={})",
@@ -214,7 +240,9 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
         #[cfg(feature = "uffd")]
         {
             self.uffd_epoch_ready.store(false, Ordering::Release);
-            let pause = if self.concurrent_marking_in_progress() {
+            let pause = if self.compaction_prepare_ready.load(Ordering::Acquire) {
+                Pause::Compaction
+            } else if self.concurrent_marking_in_progress() {
                 Pause::FinalMark
             } else if self.should_do_full_gc.load(Ordering::Acquire) {
                 Pause::Full
@@ -245,6 +273,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             match pause {
                 Pause::InitialMark => self.schedule_initial_mark(scheduler),
                 Pause::FinalMark => self.schedule_final_mark(scheduler),
+                Pause::Compaction => self.schedule_compaction_pause(scheduler),
                 Pause::Full => self.schedule_full_gc(scheduler),
             }
         }
@@ -287,7 +316,11 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                         info!("FinalMark: mutator SATB buffers flushed");
                     }
                 }
+                Pause::Compaction => {
+                    debug_assert!(!self.concurrent_marking_in_progress());
+                }
                 Pause::Full => {
+                    self.clear_concurrent_compaction_prepare_state();
                     self.set_concurrent_marking_state(false);
                     self.set_ref_closure_buckets_enabled(true);
                     self.compressor_space.clear_black_allocation_snapshot();
@@ -303,7 +336,8 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             Some(Pause::InitialMark) => {
                 self.common.prepare(tls, true);
                 self.compressor_space.prepare();
-                self.compressor_space.snapshot_black_allocation_cursors();
+                self.clear_concurrent_compaction_prepare_state();
+                self.compressor_space.reset_concurrent_mark_activity_epoch();
                 self.compressor_space.set_side_log_bits();
                 self.common
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
@@ -312,6 +346,15 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             Some(Pause::Full) => {
                 self.common.prepare(tls, true);
                 self.compressor_space.prepare();
+            }
+            Some(Pause::Compaction) => {
+                // ART's CompactionPause() refreshes moving-space compaction structures for
+                // black allocations that happened after the marking pause
+                // (UpdateMovingSpaceBlackAllocations()). The prepared prefix is still useful
+                // for reuse, but the actual compaction pause must cover all regions that exist
+                // once mutators are stopped here, including post-FinalMark/inter-pause regions.
+                self.compressor_space
+                    .set_compaction_region_limit(self.compressor_space.num_regions());
             }
             Some(Pause::FinalMark) | None => {}
         }
@@ -333,6 +376,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkClear);
                 self.common.release(tls, true);
             }
+            Some(Pause::Compaction) => {}
             Some(Pause::Full) | None => {
                 self.common.release(tls, true);
                 self.compressor_space.release();
@@ -355,19 +399,56 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             match pause {
                 Pause::InitialMark => {}
                 Pause::FinalMark => {
+                    self.compressor_space.snapshot_black_allocation_cursors();
+                    self.set_allocate_as_live(true);
+                    let plan: &'static Self = unsafe { &*(self as *const Self) };
+                    let scheduled = plan.compressor_space.start_concurrent_compaction_prepare(
+                        std::sync::Arc::new(move || plan.finish_concurrent_compaction_prepare()),
+                    );
+                    if scheduled == 0 {
+                        self.compressor_space.clear_black_allocation_snapshot();
+                        self.clear_concurrent_compaction_prepare_state();
+                        self.compressor_space.clear_compaction_region_limit();
+                        self.set_allocate_as_live(false);
+                    } else {
+                        self.compaction_prepare_active
+                            .store(true, Ordering::Release);
+                    }
+                    if compressor_perf_trace_enabled() {
+                        info!(
+                            "FinalMark end_of_gc: scheduled_compaction_prepare_packets={}, should_do_full_gc={}, frozen_regions={}, used_pages={}, compressor_reserved_pages={}, compressor_data_pages={}, compressor_meta_pages_est={}, compressor_regions={}, common_used_pages={}, total_pages={}",
+                            scheduled,
+                            self.should_do_full_gc.load(Ordering::Acquire),
+                            self.compressor_space.compaction_region_count(),
+                            self.get_used_pages(),
+                            self.compressor_space.reserved_pages(),
+                            self.compressor_space.data_reserved_pages(),
+                            self.compressor_space
+                                .reserved_pages()
+                                .saturating_sub(self.compressor_space.data_reserved_pages()),
+                            self.compressor_space.num_regions(),
+                            self.common.get_used_pages(),
+                            self.get_total_pages()
+                        );
+                    }
+                }
+                Pause::Compaction => {
                     let uffd_epoch_ready = self.uffd_epoch_ready.swap(false, Ordering::AcqRel);
-                    self.compressor_space.clear_black_allocation_snapshot();
+                    self.clear_concurrent_compaction_prepare_state();
                     if uffd_epoch_ready {
                         self.uffd_compaction_active.store(true, Ordering::Release);
                     } else {
                         // No Compressor regions needed page-fault-driven compaction.
                         self.compressor_space.release();
+                        self.compressor_space.clear_compaction_region_limit();
+                        self.set_allocate_as_live(false);
                     }
                     if compressor_perf_trace_enabled() {
                         info!(
-                            "FinalMark end_of_gc: uffd_epoch_ready={}, should_do_full_gc={}, used_pages={}, compressor_reserved_pages={}, compressor_data_pages={}, compressor_meta_pages_est={}, compressor_regions={}, common_used_pages={}, total_pages={}",
+                            "Compaction end_of_gc: uffd_epoch_ready={}, should_do_full_gc={}, frozen_regions={}, used_pages={}, compressor_reserved_pages={}, compressor_data_pages={}, compressor_meta_pages_est={}, compressor_regions={}, common_used_pages={}, total_pages={}",
                             uffd_epoch_ready,
                             self.should_do_full_gc.load(Ordering::Acquire),
+                            self.compressor_space.compaction_region_count(),
                             self.get_used_pages(),
                             self.compressor_space.reserved_pages(),
                             self.compressor_space.data_reserved_pages(),
@@ -383,6 +464,9 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                 Pause::Full => {
                     self.should_do_full_gc.store(false, Ordering::Release);
                     self.compressor_space.clear_black_allocation_snapshot();
+                    self.clear_concurrent_compaction_prepare_state();
+                    self.compressor_space.clear_compaction_region_limit();
+                    self.set_allocate_as_live(false);
                 }
             }
             self.previous_pause
@@ -414,6 +498,10 @@ impl<VM: VMBinding> ConcurrentPlan for Compressor<VM> {
 
     fn current_pause(&self) -> Option<Pause> {
         self.current_pause.load(AtomicOrdering::SeqCst)
+    }
+
+    fn note_concurrent_mark_activity(&self) {
+        self.compressor_space.note_concurrent_mark_activity();
     }
 }
 
@@ -447,6 +535,10 @@ impl<VM: VMBinding> Compressor<VM> {
             #[cfg(feature = "uffd")]
             should_do_full_gc: AtomicBool::new(false),
             #[cfg(feature = "uffd")]
+            compaction_prepare_active: AtomicBool::new(false),
+            #[cfg(feature = "uffd")]
+            compaction_prepare_ready: AtomicBool::new(false),
+            #[cfg(feature = "uffd")]
             uffd_compaction_active: AtomicBool::new(false),
             #[cfg(feature = "uffd")]
             uffd_epoch_ready: AtomicBool::new(false),
@@ -464,19 +556,19 @@ impl<VM: VMBinding> Compressor<VM> {
         const SECOND_ROOTS_LABEL: &str = "Compressor STW: SecondRoots bucket";
         const COMPACT_LABEL: &str = "Compressor STW: Compact bucket";
 
-        scheduler.work_buckets[WorkBucketStage::Unconstrained].add(
-            StopMutators::<CompressorWorkContext<VM>>::new_timed(
-                STOP_LABEL,
-                Some(PREPARE_BUCKET_LABEL),
-            ),
-        );
-        scheduler.work_buckets[WorkBucketStage::Prepare]
-            .add(TimedPrepare::<CompressorWorkContext<VM>>::new(self, PREPARE_GLOBAL_LABEL));
+        scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
+            CompressorWorkContext<VM>,
+        >::new_timed(
+            STOP_LABEL,
+            Some(PREPARE_BUCKET_LABEL),
+        ));
+        scheduler.work_buckets[WorkBucketStage::Prepare].add(TimedPrepare::<
+            CompressorWorkContext<VM>,
+        >::new(
+            self, PREPARE_GLOBAL_LABEL
+        ));
         scheduler.work_buckets[WorkBucketStage::Prepare].set_sentinel(Box::new(
-            LogBucketTimings::<VM>::new(&[
-                PREPARE_BUCKET_LABEL,
-                PREPARE_GLOBAL_LABEL,
-            ]),
+            LogBucketTimings::<VM>::new(&[PREPARE_BUCKET_LABEL, PREPARE_GLOBAL_LABEL]),
         ));
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new_timed(
             &self.compressor_space,
@@ -503,35 +595,8 @@ impl<VM: VMBinding> Compressor<VM> {
     }
 
     fn schedule_reference_work(&'static self, scheduler: &GCWorkScheduler<VM>) {
-        if !*self.base().options.no_reference_types {
-            use crate::util::reference_processor::{
-                PhantomRefProcessing, RefEnqueue, RefForwarding, SoftRefProcessing,
-                WeakRefProcessing,
-            };
-            scheduler.work_buckets[WorkBucketStage::SoftRefClosure]
-                .add(SoftRefProcessing::<MarkingProcessEdges<VM>>::new());
-            scheduler.work_buckets[WorkBucketStage::WeakRefClosure]
-                .add(WeakRefProcessing::<VM>::new());
-            scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
-                .add(PhantomRefProcessing::<VM>::new());
-            scheduler.work_buckets[WorkBucketStage::RefForwarding]
-                .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
-            scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
-        }
-
-        if !*self.base().options.no_finalizer {
-            use crate::util::finalizable_processor::{Finalization, ForwardFinalization};
-            scheduler.work_buckets[WorkBucketStage::FinalRefClosure]
-                .add(Finalization::<MarkingProcessEdges<VM>>::new());
-            scheduler.work_buckets[WorkBucketStage::FinalizableForwarding]
-                .add(ForwardFinalization::<ForwardingProcessEdges<VM>>::new());
-        }
-
-        scheduler.work_buckets[WorkBucketStage::VMRefClosure]
-            .set_sentinel(Box::new(VMProcessWeakRefs::<MarkingProcessEdges<VM>>::new()));
-        scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
-            .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
-        scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
+        self.schedule_liveness_reference_work(scheduler);
+        self.schedule_forwarding_reference_work(scheduler);
 
         #[cfg(feature = "analysis")]
         {
@@ -541,6 +606,48 @@ impl<VM: VMBinding> Compressor<VM> {
         #[cfg(feature = "sanity")]
         scheduler.work_buckets[WorkBucketStage::Final]
             .add(crate::util::sanity::sanity_checker::ScheduleSanityGC::<Self>::new(self));
+    }
+
+    fn schedule_liveness_reference_work(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        if !*self.base().options.no_reference_types {
+            use crate::util::reference_processor::{
+                PhantomRefProcessing, SoftRefProcessing, WeakRefProcessing,
+            };
+            scheduler.work_buckets[WorkBucketStage::SoftRefClosure]
+                .add(SoftRefProcessing::<MarkingProcessEdges<VM>>::new());
+            scheduler.work_buckets[WorkBucketStage::WeakRefClosure]
+                .add(WeakRefProcessing::<VM>::new());
+            scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
+                .add(PhantomRefProcessing::<VM>::new());
+        }
+
+        if !*self.base().options.no_finalizer {
+            use crate::util::finalizable_processor::Finalization;
+            scheduler.work_buckets[WorkBucketStage::FinalRefClosure]
+                .add(Finalization::<MarkingProcessEdges<VM>>::new());
+        }
+
+        scheduler.work_buckets[WorkBucketStage::VMRefClosure]
+            .set_sentinel(Box::new(VMProcessWeakRefs::<MarkingProcessEdges<VM>>::new()));
+    }
+
+    fn schedule_forwarding_reference_work(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        if !*self.base().options.no_reference_types {
+            use crate::util::reference_processor::{RefEnqueue, RefForwarding};
+            scheduler.work_buckets[WorkBucketStage::RefForwarding]
+                .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
+            scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
+        }
+
+        if !*self.base().options.no_finalizer {
+            use crate::util::finalizable_processor::ForwardFinalization;
+            scheduler.work_buckets[WorkBucketStage::FinalizableForwarding]
+                .add(ForwardFinalization::<ForwardingProcessEdges<VM>>::new());
+        }
+
+        scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
+            .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
+        scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
     }
 
     #[cfg(feature = "uffd")]
@@ -556,6 +663,21 @@ impl<VM: VMBinding> Compressor<VM> {
         self.set_allocate_as_live(active);
         self.concurrent_marking_active
             .store(active, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "uffd")]
+    fn clear_concurrent_compaction_prepare_state(&self) {
+        self.compaction_prepare_active
+            .store(false, Ordering::Release);
+        self.compaction_prepare_ready
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(feature = "uffd")]
+    pub fn finish_concurrent_compaction_prepare(&self) {
+        self.compaction_prepare_ready.store(true, Ordering::Release);
+        self.compaction_prepare_active
+            .store(false, Ordering::Release);
     }
 
     #[cfg(feature = "uffd")]
@@ -592,15 +714,20 @@ impl<VM: VMBinding> Compressor<VM> {
         self.set_ref_closure_buckets_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
             ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_MARK>>,
-        >::new_timed(STOP_LABEL, Some(PREPARE_BUCKET_LABEL)));
+        >::new_timed(
+            STOP_LABEL,
+            Some(PREPARE_BUCKET_LABEL),
+        ));
         scheduler.work_buckets[WorkBucketStage::Prepare].add(TimedPrepare::<
             ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,
-        >::new(self, PREPARE_GLOBAL_LABEL));
+        >::new(
+            self, PREPARE_GLOBAL_LABEL
+        ));
         scheduler.work_buckets[WorkBucketStage::Prepare].set_sentinel(Box::new(
-            LogBucketTimings::<VM>::new(&[
-                PREPARE_BUCKET_LABEL,
-                PREPARE_GLOBAL_LABEL,
-            ]),
+            FinalizeInitialMarkPrepare::<VM>::new(
+                &self.compressor_space,
+                &[PREPARE_BUCKET_LABEL, PREPARE_GLOBAL_LABEL],
+            ),
         ));
     }
 
@@ -609,31 +736,59 @@ impl<VM: VMBinding> Compressor<VM> {
         const STOP_LABEL: &str = "Compressor FinalMark: StopMutators";
         const PREPARE_BUCKET_LABEL: &str = "Compressor FinalMark: Prepare bucket";
         const PREPARE_GLOBAL_LABEL: &str = "Compressor FinalMark: Prepare global work";
-        const FORWARDING_LABEL: &str = "Compressor FinalMark: CalculateForwarding bucket";
-        const SECOND_ROOTS_LABEL: &str = "Compressor FinalMark: SecondRoots bucket";
 
         self.set_ref_closure_buckets_enabled(true);
-        scheduler.work_buckets[WorkBucketStage::Unconstrained].add(
-            StopMutators::<CompressorWorkContext<VM>>::new_timed(
-                STOP_LABEL,
-                Some(PREPARE_BUCKET_LABEL),
-            ),
-        );
-        scheduler.work_buckets[WorkBucketStage::Prepare]
-            .add(TimedPrepare::<CompressorWorkContext<VM>>::new(self, PREPARE_GLOBAL_LABEL));
+        scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
+            CompressorWorkContext<VM>,
+        >::new_timed(
+            STOP_LABEL,
+            Some(PREPARE_BUCKET_LABEL),
+        ));
+        scheduler.work_buckets[WorkBucketStage::Prepare].add(TimedPrepare::<
+            CompressorWorkContext<VM>,
+        >::new(
+            self, PREPARE_GLOBAL_LABEL
+        ));
         scheduler.work_buckets[WorkBucketStage::Prepare].set_sentinel(Box::new(
-            LogBucketTimings::<VM>::new(&[
-                PREPARE_BUCKET_LABEL,
-                PREPARE_GLOBAL_LABEL,
-            ]),
+            LogBucketTimings::<VM>::new(&[PREPARE_BUCKET_LABEL, PREPARE_GLOBAL_LABEL]),
         ));
         scheduler.work_buckets[WorkBucketStage::Closure].add(CaptureBlackAllocations::<VM>::new(
             self,
             &self.compressor_space,
         ));
+        scheduler.work_buckets[WorkBucketStage::Release]
+            .add(Release::<CompressorWorkContext<VM>>::new(self));
+        self.schedule_liveness_reference_work(scheduler);
+    }
+
+    #[cfg(feature = "uffd")]
+    fn schedule_compaction_pause(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        const STOP_LABEL: &str = "Compressor Compaction: StopMutators";
+        const PREPARE_BUCKET_LABEL: &str = "Compressor Compaction: Prepare bucket";
+        const PREPARE_GLOBAL_LABEL: &str = "Compressor Compaction: Prepare global work";
+        const FORWARDING_LABEL: &str = "Compressor Compaction: CalculateForwarding bucket";
+        const SECOND_ROOTS_LABEL: &str = "Compressor Compaction: SecondRoots bucket";
+
+        self.set_ref_closure_buckets_enabled(false);
+        scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
+            CompressorWorkContext<VM>,
+        >::new_no_roots_timed(
+            STOP_LABEL
+        ));
+        scheduler.work_buckets[WorkBucketStage::Prepare].add(TimedPrepare::<
+            CompressorWorkContext<VM>,
+        >::new(
+            self, PREPARE_GLOBAL_LABEL
+        ));
+        scheduler.work_buckets[WorkBucketStage::Prepare].set_sentinel(Box::new(
+            FinalizeCompactionPrepare::<VM>::new(
+                &self.compressor_space,
+                &[PREPARE_BUCKET_LABEL, PREPARE_GLOBAL_LABEL],
+            ),
+        ));
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new_timed(
             &self.compressor_space,
-            CompressorSpace::<VM>::add_offset_vector_tasks,
+            CompressorSpace::<VM>::add_offset_vector_tasks_for_final_mark,
             FORWARDING_LABEL,
         ));
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
@@ -642,24 +797,52 @@ impl<VM: VMBinding> Compressor<VM> {
             .add(UpdateReferences::<VM>::new_timed(SECOND_ROOTS_LABEL));
         scheduler.work_buckets[WorkBucketStage::SecondRoots]
             .set_sentinel(Box::new(LogBucketTiming::<VM>::new(SECOND_ROOTS_LABEL)));
-        if std::env::var_os("MMTK_VALIDATE_MUTATOR_ROOTS").is_some() {
-            scheduler.work_buckets[WorkBucketStage::Compact]
-                .add(ValidateMutatorRoots::<VM>::new(&self.compressor_space));
+        let defer_uffd_setup_to_release =
+            std::env::var_os("MMTK_COMPRESSOR_DEFER_UFFD_SETUP_TO_RELEASE").is_some();
+        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
+            &self.compressor_space,
+            CompressorSpace::<VM>::add_region_compaction_summary_tasks,
+        ));
+        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
+            &self.compressor_space,
+            {
+                let los = &self.common.los;
+                move |space| space.add_los_reference_update_tasks(los)
+            },
+        ));
+        if !defer_uffd_setup_to_release {
+            scheduler.work_buckets[WorkBucketStage::Compact].set_sentinel(Box::new(
+                super::gc_work::UffdConcurrentSetup::<VM>::new(self, &self.compressor_space),
+            ));
         }
-        if std::env::var_os("MMTK_VALIDATE_VM_ROOTS").is_some() {
-            scheduler.work_buckets[WorkBucketStage::Compact]
-                .add(ValidateVmSpecificRoots::<VM>::new(&self.compressor_space));
-        }
-        scheduler.work_buckets[WorkBucketStage::Compact].add(
-            super::gc_work::UffdConcurrentSetup::<VM>::new(
-                self,
-                &self.compressor_space,
-                &self.common.los,
-            ),
-        );
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<CompressorWorkContext<VM>>::new(self));
-        self.schedule_reference_work(scheduler);
+        self.schedule_forwarding_reference_work(scheduler);
+        if std::env::var_os("MMTK_VALIDATE_PRE_RESUME_MUTATOR_ROOTS").is_some() {
+            scheduler.work_buckets[WorkBucketStage::Final].add(
+                super::gc_work::ValidateMutatorRoots::<VM>::new(&self.compressor_space),
+            );
+        }
+        if std::env::var_os("MMTK_VALIDATE_PRE_RESUME_VM_ROOTS").is_some() {
+            scheduler.work_buckets[WorkBucketStage::Final].add(
+                super::gc_work::ValidateVmSpecificRoots::<VM>::new(&self.compressor_space),
+            );
+        }
+        if std::env::var_os("MMTK_VALIDATE_PRE_RESUME_MAPPED_HEAP").is_some() {
+            scheduler.work_buckets[WorkBucketStage::Final].add(
+                super::gc_work::ValidateMappedHeapPreResume::<VM>::new(&self.compressor_space),
+            );
+        }
+        if defer_uffd_setup_to_release {
+            if compressor_perf_trace_enabled() {
+                info!(
+                    "Compressor Compaction: deferring UFFD setup to Release sentinel after post-forwarding/reference enqueue work"
+                );
+            }
+            scheduler.work_buckets[WorkBucketStage::Release].set_sentinel(Box::new(
+                super::gc_work::UffdConcurrentSetup::<VM>::new(self, &self.compressor_space),
+            ));
+        }
     }
 
     #[cfg(feature = "uffd")]
@@ -692,6 +875,7 @@ impl<VM: VMBinding> Compressor<VM> {
         let before_common = self.common.get_used_pages();
         self.compressor_space.reset_allocator_after_compaction();
         self.compressor_space.release();
+        self.compressor_space.clear_compaction_region_limit();
         self.set_allocate_as_live(false);
         self.uffd_compaction_active.store(false, Ordering::Release);
         if compressor_perf_trace_enabled() {

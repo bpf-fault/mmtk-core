@@ -225,6 +225,27 @@ pub trait Scanning<VM: VMBinding> {
         Self::scan_object(tls, object, slot_visitor)
     }
 
+    /// Optionally describe a scanned slot for debugging/validation diagnostics.
+    ///
+    /// VM bindings can override this to identify special fields such as
+    /// java.lang.ref.Reference::referent/discovered when reporting stale edges.
+    fn describe_slot(_object: ObjectReference, _slot: VM::VMSlot) -> Option<String> {
+        None
+    }
+
+    /// Return the byte offset of a slot within an object for debugging/validation.
+    fn slot_offset(_object: ObjectReference, _slot: VM::VMSlot) -> Option<usize> {
+        None
+    }
+
+    /// Debug-only hook to load a slot at a given byte offset within an object.
+    fn debug_load_slot_at_offset(
+        _object: ObjectReference,
+        _offset: usize,
+    ) -> Option<Option<ObjectReference>> {
+        None
+    }
+
     /// Delegated scanning of a object, visiting each reference field encountered, and tracing the
     /// objects pointed by each field.
     ///

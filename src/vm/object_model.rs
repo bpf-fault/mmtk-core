@@ -485,6 +485,30 @@ pub trait ObjectModel<VM: VMBinding> {
     fn is_object_sane(_object: ObjectReference) -> bool {
         true
     }
+
+    /// Fix VM-specific object state after a delayed raw-byte copy.
+    ///
+    /// Compacting collectors may copy object bytes into a reserved destination and then
+    /// do extra fixups (e.g. slot rewriting) before the object is exposed to the VM.
+    /// Bindings can override this hook to normalize copied headers or other VM-specific
+    /// state after the bytes have been copied into `to`.
+    fn fixup_copied_object(_from: ObjectReference, _to: ObjectReference) {}
+
+    /// Debug-only hook to read the raw mark/header word from an object.
+    fn debug_mark_word(_object: ObjectReference) -> Option<usize> {
+        None
+    }
+
+    /// Debug-only hook to return a concise VM-specific object description.
+    fn debug_object_description(_object: ObjectReference) -> Option<String> {
+        None
+    }
+
+    /// Debug-only hook to identify a VM-specific role for an object, such as a
+    /// constant-pool resolved-references array or one of its cached elements.
+    fn debug_object_role(_object: ObjectReference) -> Option<String> {
+        None
+    }
 }
 
 pub mod specs {

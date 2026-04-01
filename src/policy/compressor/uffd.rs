@@ -26,9 +26,11 @@ const PAGE_SIZE: usize = 4096;
 // userfaultfd ioctl constants
 const UFFDIO_API: libc::c_ulong = 0xc018aa3f;
 const UFFDIO_REGISTER: libc::c_ulong = 0xc020aa00;
+const UFFDIO_WAKE: libc::c_ulong = 0x8010aa02;
 const UFFDIO_COPY: libc::c_ulong = 0xc028aa03;
 const UFFDIO_UNREGISTER: libc::c_ulong = 0x8010aa01;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
 const MREMAP_DONTUNMAP: libc::c_int = 4;
 
 /// ART-inspired per-page state.
@@ -356,21 +358,41 @@ impl<VM: VMBinding> UffdContext<VM> {
         }
     }
 
-    fn process_page_into_region_buffer(&self, region_idx: usize, page_idx: usize) {
+    fn process_page_into_region_buffer(&self, region_idx: usize, _page_idx: usize) {
         let shadow = &self.shadows[region_idx];
         let mut region_buf = self.region_buffers[region_idx].lock().unwrap();
         if region_buf.is_none() {
-            *region_buf = Some(vec![0u8; shadow.registered_size]);
+            let mut buf = vec![0u8; shadow.registered_size];
+            self.compressor_space.build_region_from_shadow(
+                shadow.region_index,
+                unsafe { Address::from_usize(shadow.shadow_start) },
+                &mut buf,
+            );
+            if std::env::var_os("MMTK_VALIDATE_UFFD_REGION_OBJECTS").is_some() {
+                self.compressor_space
+                    .validate_region_buffer_objects(shadow.region_index, &buf)
+                    .unwrap_or_else(|e| panic!("{}", e));
+            }
+            if std::env::var_os("MMTK_VALIDATE_UFFD_REGION_MARK_WORDS").is_some() {
+                self.compressor_space
+                    .validate_region_buffer_mark_words(
+                        shadow.region_index,
+                        unsafe { Address::from_usize(shadow.shadow_start) },
+                        &buf,
+                    )
+                    .unwrap_or_else(|e| panic!("{}", e));
+            }
+            if std::env::var_os("MMTK_VALIDATE_UFFD_REGION_REFS").is_some() {
+                self.compressor_space
+                    .validate_region_buffer_references(
+                        shadow.region_index,
+                        unsafe { Address::from_usize(shadow.shadow_start) },
+                        &buf,
+                    )
+                    .unwrap_or_else(|e| panic!("{}", e));
+            }
+            *region_buf = Some(buf);
         }
-        let buf = region_buf.as_mut().unwrap();
-        let start = page_idx * PAGE_SIZE;
-        let end = start + PAGE_SIZE;
-        self.compressor_space.build_page_from_shadow(
-            shadow.region_index,
-            page_idx,
-            unsafe { Address::from_usize(shadow.shadow_start) },
-            &mut buf[start..end],
-        );
     }
 
     fn map_pages_from_region_buffer(
@@ -387,11 +409,16 @@ impl<VM: VMBinding> UffdContext<VM> {
         let buf = region_buf.as_ref().ok_or_else(|| {
             io::Error::other(format!("missing region buffer for region {}", region_idx))
         })?;
+        let validate_mapped_pages = std::env::var_os("MMTK_VALIDATE_UFFD_MAPPED_PAGES").is_some();
         let mut copy = UffdioCopy {
             dst: dst as u64,
             src: buf[start..start + len].as_ptr() as u64,
             len: len as u64,
-            mode: 0,
+            mode: if validate_mapped_pages {
+                UFFDIO_COPY_MODE_DONTWAKE
+            } else {
+                0
+            },
             copy: 0,
         };
         let ret = unsafe { libc::ioctl(self.uffd, UFFDIO_COPY, &mut copy as *mut _) };
@@ -408,6 +435,33 @@ impl<VM: VMBinding> UffdContext<VM> {
         } else {
             0
         };
+        if copied_bytes > 0 && validate_mapped_pages {
+            let mapped_slice = unsafe { std::slice::from_raw_parts(dst as *const u8, copied_bytes) };
+            let expected_slice = &buf[start..start + copied_bytes];
+            if mapped_slice != expected_slice {
+                let diff = mapped_slice
+                    .iter()
+                    .zip(expected_slice.iter())
+                    .position(|(actual, expected)| actual != expected)
+                    .unwrap_or(0);
+                return Err(io::Error::other(format!(
+                    "mapped page validation failed for region {} at page {} (+{} bytes): actual=0x{:02x}, expected=0x{:02x}",
+                    region_idx,
+                    start_page_idx,
+                    diff,
+                    mapped_slice[diff],
+                    expected_slice[diff],
+                )));
+            }
+            let mut wake = UffdioRange {
+                start: dst as u64,
+                len: copied_bytes as u64,
+            };
+            let wake_ret = unsafe { libc::ioctl(self.uffd, UFFDIO_WAKE, &mut wake as *mut _) };
+            if wake_ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         let mapped_pages = copied_bytes / PAGE_SIZE;
         self.pages_resolved
             .fetch_add(mapped_pages as u64, Ordering::Relaxed);
@@ -666,6 +720,29 @@ impl<VM: VMBinding> UffdContext<VM> {
                     unsafe { Address::from_usize(shadow.shadow_start) },
                     buf,
                 );
+                if std::env::var_os("MMTK_VALIDATE_UFFD_REGION_OBJECTS").is_some() {
+                    self.compressor_space
+                        .validate_region_buffer_objects(shadow.region_index, buf)
+                        .unwrap_or_else(|e| panic!("{}", e));
+                }
+                if std::env::var_os("MMTK_VALIDATE_UFFD_REGION_MARK_WORDS").is_some() {
+                    self.compressor_space
+                        .validate_region_buffer_mark_words(
+                            shadow.region_index,
+                            unsafe { Address::from_usize(shadow.shadow_start) },
+                            buf,
+                        )
+                        .unwrap_or_else(|e| panic!("{}", e));
+                }
+                if std::env::var_os("MMTK_VALIDATE_UFFD_REGION_REFS").is_some() {
+                    self.compressor_space
+                        .validate_region_buffer_references(
+                            shadow.region_index,
+                            unsafe { Address::from_usize(shadow.shadow_start) },
+                            buf,
+                        )
+                        .unwrap_or_else(|e| panic!("{}", e));
+                }
             }
             self.gc_pages_processed
                 .fetch_add(claimed.len() as u64, Ordering::Relaxed);

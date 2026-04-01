@@ -192,6 +192,27 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         true
     }
 
+    /// Advance a region's cursor to at least `new_end`, if `new_end` exceeds the current cursor.
+    ///
+    /// Used after inter-pause black-allocation catch-up: the bump allocator may have
+    /// advanced past the globally recorded cursor, and we need offset-vector / summary
+    /// computation to cover those objects.  Page accounting is NOT adjusted here because
+    /// the pages were already consumed by the bump allocator.
+    pub fn advance_cursor_to(&self, region_index: usize, new_end: Address) -> (bool, usize) {
+        let sync = self.sync.read().unwrap();
+        if let Some(alloc) = sync.all_regions.get(region_index) {
+            let old = alloc.cursor();
+            if new_end > old {
+                alloc.set_cursor(new_end);
+                (true, new_end - old)
+            } else {
+                (false, 0)
+            }
+        } else {
+            (false, 0)
+        }
+    }
+
     /// Align all region cursors up to page boundary.
     ///
     /// ART aligns the post-marking black-allocation boundary to page size before

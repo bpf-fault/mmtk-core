@@ -160,6 +160,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
+            Pause::Compaction => unreachable!("ConcurrentImmix does not use Pause::Compaction"),
         }
     }
 
@@ -193,6 +194,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
             }
             Pause::FinalMark => (),
+            Pause::Compaction => unreachable!("ConcurrentImmix does not use Pause::Compaction"),
         }
     }
 
@@ -221,6 +223,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     // we will need to clear the unlog bits at an appropriate place.
                 }
             }
+            Pause::Compaction => unreachable!("ConcurrentImmix does not use Pause::Compaction"),
         }
     }
 
@@ -291,6 +294,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 }
                 self.set_concurrent_marking_state(false);
             }
+            Pause::Compaction => unreachable!("ConcurrentImmix does not use Pause::Compaction"),
         }
         info!("{:?} start", pause);
     }

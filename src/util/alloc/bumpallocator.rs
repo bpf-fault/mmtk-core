@@ -72,7 +72,11 @@ impl<VM: VMBinding> BumpAllocator<VM> {
     }
 
     fn current_buffer_start(&self) -> Option<Address> {
-        bump_buffer_starts().lock().unwrap().get(&self.id()).copied()
+        bump_buffer_starts()
+            .lock()
+            .unwrap()
+            .get(&self.id())
+            .copied()
     }
 
     fn retire_current_buffer(&self) {
@@ -90,7 +94,10 @@ impl<VM: VMBinding> BumpAllocator<VM> {
 
     pub(crate) fn set_limit(&mut self, start: Address, limit: Address) {
         self.retire_current_buffer();
-        bump_buffer_starts().lock().unwrap().insert(self.id(), start);
+        bump_buffer_starts()
+            .lock()
+            .unwrap()
+            .insert(self.id(), start);
         self.bump_pointer.reset(start, limit);
     }
 

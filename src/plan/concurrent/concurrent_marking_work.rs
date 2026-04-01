@@ -96,11 +96,15 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     ObjectQueue for ConcurrentTraceObjects<VM, P, KIND>
 {
     fn enqueue(&mut self, object: ObjectReference) {
-        debug_assert!(
-            object.to_raw_address().is_mapped(),
-            "Invalid obj {:?}: address is not mapped",
-            object
-        );
+        if !object.to_raw_address().is_mapped() {
+            panic!(
+                "ConcurrentTraceObjects::enqueue: unmapped object {}",
+                object
+            );
+        }
+        if !VM::VMObjectModel::is_object_sane(object) {
+            panic!("ConcurrentTraceObjects::enqueue: insane object {}", object);
+        }
         self.scan_and_enqueue(object);
     }
 }
@@ -114,6 +118,7 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     GCWork<VM> for ConcurrentTraceObjects<VM, P, KIND>
 {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.plan.note_concurrent_mark_activity();
         self.worker = worker;
         let mut num_objects = 0;
         let mut num_next_objects = 0;

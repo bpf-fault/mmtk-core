@@ -20,8 +20,10 @@ pub enum Pause {
     Full = 1,
     /// The initial pause before concurrent marking.
     InitialMark,
-    /// The pause after concurrent marking.
+    /// The pause after concurrent marking to terminate marking and freeze the snapshot.
     FinalMark,
+    /// The pause after concurrent compaction preparation to hand off to the UFFD epoch.
+    Compaction,
 }
 
 unsafe impl bytemuck::ZeroableInOption for Pause {}

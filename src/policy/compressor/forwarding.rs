@@ -148,7 +148,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+    fn calculate_offset_vector_inner(
+        &self,
+        region: CompressorRegion,
+        cursor: Address,
+        mark_calculated: bool,
+    ) {
         let mut state = Transducer::new(region.start());
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -166,6 +171,20 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 },
             );
         }
+        if mark_calculated {
+            self.calculated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+        self.calculate_offset_vector_inner(region, cursor, true);
+    }
+
+    pub fn calculate_offset_vector_for_prepare(&self, region: CompressorRegion, cursor: Address) {
+        self.calculate_offset_vector_inner(region, cursor, false);
+    }
+
+    pub fn mark_calculated(&self) {
         self.calculated.store(true, Ordering::Relaxed);
     }
 

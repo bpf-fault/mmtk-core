@@ -9,6 +9,7 @@ use crate::scheduler::ProcessEdgesWork;
 use crate::scheduler::WorkBucketStage;
 use crate::util::ObjectReference;
 use crate::util::VMWorkerThread;
+use crate::vm::ObjectModel;
 use crate::vm::ReferenceGlue;
 use crate::vm::VMBinding;
 
@@ -62,9 +63,29 @@ impl ReferenceProcessors {
     /// call back to the VM to enqueue references whose referents are cleared
     /// in this GC.
     pub fn enqueue_refs<VM: VMBinding>(&self, tls: VMWorkerThread) {
+        if reference_perf_trace_enabled() {
+            info!("ReferenceProcessing: enqueue_refs starting soft");
+        }
         self.soft.enqueue::<VM>(tls);
+        if reference_perf_trace_enabled() {
+            info!("ReferenceProcessing: enqueue_refs starting weak");
+        }
         self.weak.enqueue::<VM>(tls);
+        if reference_perf_trace_enabled() {
+            info!("ReferenceProcessing: enqueue_refs starting phantom");
+        }
         self.phantom.enqueue::<VM>(tls);
+    }
+
+    pub fn validate_refs<VM: VMBinding>(
+        &self,
+        is_valid_object: impl Fn(ObjectReference) -> bool + Copy,
+    ) -> [(usize, usize); 3] {
+        [
+            self.soft.validate_table_entries::<VM>(is_valid_object),
+            self.weak.validate_table_entries::<VM>(is_valid_object),
+            self.phantom.validate_table_entries::<VM>(is_valid_object),
+        ]
     }
 
     /// A separate reference forwarding step. Normally when we scan refs, we deal with forwarding.
@@ -253,6 +274,82 @@ impl ReferenceProcessor {
         referent: ObjectReference,
     ) -> ObjectReference {
         e.trace_object(referent)
+    }
+
+    /// Validate the reference tables against a caller-supplied object validity predicate.
+    pub fn validate_table_entries<VM: VMBinding>(
+        &self,
+        is_valid_object: impl Fn(ObjectReference) -> bool,
+    ) -> (usize, usize) {
+        let sync = self.sync.lock().unwrap();
+        let mut checked_references = 0usize;
+        let mut checked_enqueued = 0usize;
+
+        for &reff in &sync.references {
+            if !reff.to_raw_address().is_mapped() {
+                panic!(
+                    "ReferenceProcessing: {:?} references table contains unmapped reference {}",
+                    self.semantics, reff
+                );
+            }
+            if !reff.is_in_any_space() {
+                panic!(
+                    "ReferenceProcessing: {:?} references table contains out-of-space reference {}",
+                    self.semantics, reff
+                );
+            }
+            if !VM::VMObjectModel::is_object_start_initialized(reff) {
+                panic!(
+                    "ReferenceProcessing: {:?} references table contains uninitialized reference {}",
+                    self.semantics, reff
+                );
+            }
+            if !is_valid_object(reff) {
+                panic!(
+                    "ReferenceProcessing: {:?} references table contains stale reference object {}",
+                    self.semantics, reff
+                );
+            }
+            if let Some(referent) = VM::VMReferenceGlue::get_referent(reff) {
+                if referent.to_raw_address().is_mapped() && !is_valid_object(referent) {
+                    panic!(
+                        "ReferenceProcessing: {:?} references table contains stale referent {} in {}",
+                        self.semantics, referent, reff
+                    );
+                }
+            }
+            checked_references += 1;
+        }
+
+        for &reff in &sync.enqueued_references {
+            if !reff.to_raw_address().is_mapped() {
+                panic!(
+                    "ReferenceProcessing: {:?} enqueue table contains unmapped reference {}",
+                    self.semantics, reff
+                );
+            }
+            if !reff.is_in_any_space() {
+                panic!(
+                    "ReferenceProcessing: {:?} enqueue table contains out-of-space reference {}",
+                    self.semantics, reff
+                );
+            }
+            if !VM::VMObjectModel::is_object_start_initialized(reff) {
+                panic!(
+                    "ReferenceProcessing: {:?} enqueue table contains uninitialized reference {}",
+                    self.semantics, reff
+                );
+            }
+            if !is_valid_object(reff) {
+                panic!(
+                    "ReferenceProcessing: {:?} enqueue table contains stale reference object {}",
+                    self.semantics, reff
+                );
+            }
+            checked_enqueued += 1;
+        }
+
+        (checked_references, checked_enqueued)
     }
 
     /// Inform the binding to enqueue the weak references whose referents were cleared in this GC.

@@ -27,6 +27,7 @@ pub(crate) use global::CreateGeneralPlanArgs;
 pub(crate) use global::HasSpaces;
 pub use global::Plan;
 pub(crate) use global::PlanTraceObject;
+pub use compressor::Compressor;
 
 mod mutator_context;
 pub use mutator_context::Mutator;

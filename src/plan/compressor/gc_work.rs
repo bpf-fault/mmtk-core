@@ -11,12 +11,13 @@ use crate::scheduler::ProcessEdgesWork;
 use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 #[cfg(feature = "uffd")]
 use crate::util::{linear_scan::Region, Address, ObjectReference};
+use crate::vm::slot::Slot;
 use crate::vm::{ActivePlan, Scanning, VMBinding};
 use crate::MMTK;
 use std::marker::{PhantomData, Send};
+use std::time::Instant;
 #[cfg(feature = "uffd")]
 use std::{collections::HashSet, sync::Arc};
-use std::time::Instant;
 
 fn compressor_perf_trace_enabled() -> bool {
     perf_trace_enabled()
@@ -108,6 +109,108 @@ impl<VM: VMBinding> GCWork<VM> for LogBucketTimings<VM> {
     }
 }
 
+#[cfg(feature = "uffd")]
+pub struct FinalizeInitialMarkPrepare<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+    timing_labels: &'static [&'static str],
+}
+
+#[cfg(feature = "uffd")]
+pub struct FinalizeCompactionPrepare<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+    timing_labels: &'static [&'static str],
+}
+
+#[cfg(feature = "uffd")]
+impl<VM: VMBinding> FinalizeInitialMarkPrepare<VM> {
+    pub fn new(
+        compressor_space: &'static CompressorSpace<VM>,
+        timing_labels: &'static [&'static str],
+    ) -> Self {
+        Self {
+            compressor_space,
+            timing_labels,
+        }
+    }
+}
+
+#[cfg(feature = "uffd")]
+impl<VM: VMBinding> FinalizeCompactionPrepare<VM> {
+    pub fn new(
+        compressor_space: &'static CompressorSpace<VM>,
+        timing_labels: &'static [&'static str],
+    ) -> Self {
+        Self {
+            compressor_space,
+            timing_labels,
+        }
+    }
+}
+
+#[cfg(feature = "uffd")]
+impl<VM: VMBinding> GCWork<VM> for FinalizeInitialMarkPrepare<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        let start = Instant::now();
+        self.compressor_space
+            .snapshot_concurrent_compaction_prepare_regions();
+        self.compressor_space.snapshot_black_allocation_cursors();
+        self.compressor_space.seal_regions_for_concurrent_uffd();
+        if compressor_perf_trace_enabled() {
+            info!(
+                "Compressor InitialMark: finalized concurrent-prepare snapshot in {} ms (regions={})",
+                format_perf_ms(start.elapsed()),
+                self.compressor_space.num_regions(),
+            );
+        }
+        for &label in self.timing_labels {
+            if let Some(elapsed) = finish_perf_timing(label) {
+                info!("{} completed in {} ms", label, format_perf_ms(elapsed));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "uffd")]
+impl<VM: VMBinding> GCWork<VM> for FinalizeCompactionPrepare<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        let start = Instant::now();
+        let objects = self
+            .compressor_space
+            .finalize_inter_pause_black_allocations_for_compaction();
+        // The inter-pause black-allocation catch-up above marks new objects in
+        // prefix regions, changing the mark set that the compaction layout depends
+        // on.  Any compaction summaries cached during the concurrent-prepare epoch
+        // are now stale because they were built from the FinalMark-era marks only.
+        // Invalidate them so that the Compact bucket's CacheRegionCompactionSummary
+        // tasks rebuild summaries from the current (post-catch-up) mark state.
+        if !objects.is_empty() {
+            self.compressor_space.invalidate_compaction_summary_cache();
+        }
+        // NOTE: We intentionally do NOT schedule inter-pause allocation reference
+        // update tasks here.  Those tasks would forward references in-place in
+        // compactor-space heap objects BEFORE mremap, causing the shadow to contain
+        // already-forwarded references.  The mark-gated fixup in
+        // `build_page_from_shadow()` would then double-forward them if the
+        // compacted address coincides with another marked object's original address.
+        // Instead, page materialization handles all reference forwarding from the
+        // shadow, which always contains the original (pre-forwarding) reference
+        // values.  Non-moving space updates (LOS, immortal, etc.) are handled
+        // separately in UffdConcurrentSetup and are not affected.
+        if compressor_perf_trace_enabled() {
+            info!(
+                "Compressor Compaction: finalized moving-space black allocations in {} ms (objects={})",
+                format_perf_ms(start.elapsed()),
+                objects.len(),
+            );
+        }
+        for &label in self.timing_labels {
+            if let Some(elapsed) = finish_perf_timing(label) {
+                info!("{} completed in {} ms", label, format_perf_ms(elapsed));
+            }
+        }
+    }
+}
+
 pub struct TimedPrepare<C: crate::scheduler::GCWorkContext> {
     pub plan: *const C::PlanType,
     timing_label: &'static str,
@@ -169,6 +272,53 @@ impl<VM: VMBinding> GCWork<VM> for CaptureBlackAllocations<VM> {
             info!("Compressor FinalMark: capturing black allocations");
         }
         let objects = self.compressor_space.take_black_allocations();
+        if compressor_perf_trace_enabled() && !objects.is_empty() {
+            let mut compressor_refs = 0usize;
+            let mut mapped_compressor_refs = 0usize;
+            let mut marked_compressor_refs = 0usize;
+            let mut first_bad_ref = None;
+            for &object in &objects {
+                VM::VMScanning::scan_object(
+                    crate::util::opaque_pointer::VMWorkerThread(
+                        crate::util::opaque_pointer::VMThread::UNINITIALIZED,
+                    ),
+                    object,
+                    &mut |slot: VM::VMSlot| {
+                        let Some(referent) = slot.load() else {
+                            return;
+                        };
+                        if self.compressor_space.in_space(referent) {
+                            compressor_refs += 1;
+                            if referent.to_raw_address().is_mapped() {
+                                mapped_compressor_refs += 1;
+                            } else if first_bad_ref.is_none() {
+                                first_bad_ref = Some((object, referent));
+                            }
+                            if CompressorSpace::<VM>::is_marked(referent) {
+                                marked_compressor_refs += 1;
+                            }
+                        }
+                    },
+                );
+                if first_bad_ref.is_some() {
+                    break;
+                }
+            }
+            info!(
+                "Compressor FinalMark: black-allocation refs total_objects={}, compressor_refs={}, mapped_compressor_refs={}, marked_compressor_refs={}",
+                objects.len(),
+                compressor_refs,
+                mapped_compressor_refs,
+                marked_compressor_refs,
+            );
+            if let Some((object, referent)) = first_bad_ref {
+                panic!(
+                    "Compressor FinalMark: black allocation {} contains unmapped Compressor ref {} before closure",
+                    object,
+                    referent,
+                );
+            }
+        }
         if compressor_perf_trace_enabled() {
             info!(
                 "Compressor FinalMark: captured {} black-allocated objects before forwarding in {} ms",
@@ -264,6 +414,8 @@ impl<VM: VMBinding> UpdateReferences<VM> {
 struct ValidateMutatorRootsFactory<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
     valid_objects: Arc<HashSet<ObjectReference>>,
+    stage: WorkBucketStage,
+    validate_object_contents: bool,
 }
 
 #[cfg(feature = "uffd")]
@@ -272,12 +424,57 @@ impl<VM: VMBinding> Clone for ValidateMutatorRootsFactory<VM> {
         Self {
             compressor_space: self.compressor_space,
             valid_objects: self.valid_objects.clone(),
+            stage: self.stage,
+            validate_object_contents: self.validate_object_contents,
         }
     }
 }
 
 #[cfg(feature = "uffd")]
 impl<VM: VMBinding> ValidateMutatorRootsFactory<VM> {
+    fn new(
+        compressor_space: &'static CompressorSpace<VM>,
+        valid_objects: Arc<HashSet<ObjectReference>>,
+        stage: WorkBucketStage,
+        validate_object_contents: bool,
+    ) -> Self {
+        Self {
+            compressor_space,
+            valid_objects,
+            stage,
+            validate_object_contents,
+        }
+    }
+
+    fn validate_object_contents(&self, object: ObjectReference) {
+        if !self.validate_object_contents || !self.compressor_space.in_space(object) {
+            return;
+        }
+        VM::VMScanning::scan_object(
+            crate::util::opaque_pointer::VMWorkerThread(
+                crate::util::opaque_pointer::VMThread::UNINITIALIZED,
+            ),
+            object,
+            &mut |slot: VM::VMSlot| {
+                let Some(referent) = slot.load() else {
+                    return;
+                };
+                if self.compressor_space.in_space(referent)
+                    && !self.valid_objects.contains(&referent)
+                {
+                    let slot_desc = VM::VMScanning::describe_slot(object, slot)
+                        .unwrap_or_else(|| "slot=<unknown>".to_string());
+                    panic!(
+                        "ValidateMutatorRoots: rooted object {} contains stale Compressor ref {} in {}",
+                        object,
+                        referent,
+                        slot_desc,
+                    );
+                }
+            },
+        );
+    }
+
     fn validate_object(&self, object: ObjectReference) {
         if self.compressor_space.in_space(object) && !self.valid_objects.contains(&object) {
             panic!(
@@ -285,17 +482,18 @@ impl<VM: VMBinding> ValidateMutatorRootsFactory<VM> {
                 object
             );
         }
+        self.validate_object_contents(object);
     }
 }
 
 #[cfg(feature = "uffd")]
 impl<VM: VMBinding> crate::vm::RootsWorkFactory<VM::VMSlot> for ValidateMutatorRootsFactory<VM> {
     fn roots_work_bucket_stage(&self) -> WorkBucketStage {
-        WorkBucketStage::Compact
+        self.stage
     }
 
     fn process_edges_roots_work_bucket_stage(&self) -> WorkBucketStage {
-        WorkBucketStage::Compact
+        self.stage
     }
 
     fn create_process_roots_work(&mut self, slots: Vec<VM::VMSlot>) {
@@ -330,16 +528,23 @@ pub struct ValidateVmSpecificRoots<VM: VMBinding> {
 }
 
 #[cfg(feature = "uffd")]
+pub struct ValidateMappedHeapPreResume<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+}
+
+#[cfg(feature = "uffd")]
 impl<VM: VMBinding> GCWork<VM> for ValidateMutatorRoots<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         VM::VMScanning::prepare_for_roots_re_scanning();
         mmtk.state.prepare_for_stack_scanning();
 
         let valid_objects = Arc::new(self.compressor_space.collect_destination_objects());
-        let factory = ValidateMutatorRootsFactory {
-            compressor_space: self.compressor_space,
-            valid_objects: valid_objects.clone(),
-        };
+        let factory = ValidateMutatorRootsFactory::new(
+            self.compressor_space,
+            valid_objects.clone(),
+            WorkBucketStage::Final,
+            std::env::var_os("MMTK_VALIDATE_PRE_RESUME_MUTATOR_ROOT_OBJECTS").is_some(),
+        );
 
         for mutator in VM::VMActivePlan::mutators() {
             VM::VMScanning::scan_roots_in_mutator_thread(worker.tls, mutator, factory.clone());
@@ -363,10 +568,12 @@ impl<VM: VMBinding> ValidateMutatorRoots<VM> {
 impl<VM: VMBinding> GCWork<VM> for ValidateVmSpecificRoots<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         let valid_objects = Arc::new(self.compressor_space.collect_destination_objects());
-        let factory = ValidateMutatorRootsFactory {
-            compressor_space: self.compressor_space,
-            valid_objects: valid_objects.clone(),
-        };
+        let factory = ValidateMutatorRootsFactory::new(
+            self.compressor_space,
+            valid_objects.clone(),
+            WorkBucketStage::Final,
+            std::env::var_os("MMTK_VALIDATE_PRE_RESUME_VM_ROOT_OBJECTS").is_some(),
+        );
 
         VM::VMScanning::scan_vm_specific_roots(
             crate::util::opaque_pointer::VMWorkerThread(
@@ -384,6 +591,25 @@ impl<VM: VMBinding> GCWork<VM> for ValidateVmSpecificRoots<VM> {
 
 #[cfg(feature = "uffd")]
 impl<VM: VMBinding> ValidateVmSpecificRoots<VM> {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
+        Self { compressor_space }
+    }
+}
+
+#[cfg(feature = "uffd")]
+impl<VM: VMBinding> GCWork<VM> for ValidateMappedHeapPreResume<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.compressor_space
+            .validate_mapped_compacted_objects()
+            .unwrap_or_else(|e| panic!("{}", e));
+        info!(
+            "ValidatePreResumeMappedHeap: validated mapped compacted objects against cached summaries before mutator resume"
+        );
+    }
+}
+
+#[cfg(feature = "uffd")]
+impl<VM: VMBinding> ValidateMappedHeapPreResume<VM> {
     pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
         Self { compressor_space }
     }
@@ -452,7 +678,7 @@ fn spawn_background_compactor<VM: VMBinding>(
 
         let validate_region_bytes = std::env::var_os("MMTK_VALIDATE_UFFD_REGION_BYTES").is_some();
         let mut finalized_regions = 0usize;
-        for region_idx in (0..compressor_space.num_regions()).rev() {
+        for region_idx in (0..compressor_space.compaction_region_count()).rev() {
             // ART's `CompactMovingSpace()` walks pages in reverse order so it can
             // reclaim from-space incrementally.  We do the same at region/page
             // granularity and clean each region as soon as it is fully mapped.
@@ -484,6 +710,22 @@ fn spawn_background_compactor<VM: VMBinding>(
                     region_idx, e
                 )
             });
+        }
+
+        if std::env::var_os("MMTK_VALIDATE_UFFD_MARK_WORDS").is_some() {
+            compressor_space
+                .validate_mapped_mark_words(&ctx.shadows)
+                .unwrap_or_else(|e| panic!("{}", e));
+        }
+
+        if std::env::var_os("MMTK_VALIDATE_UFFD_MAPPED_HEAP").is_some() {
+            compressor_space
+                .validate_mapped_compacted_objects()
+                .unwrap_or_else(|e| panic!("{}", e));
+            info!(
+                "ValidateUffdMappedHeap: validated mapped compacted objects across {} regions before finish_uffd_epoch",
+                compressor_space.compaction_region_count()
+            );
         }
 
         ctx.signal_done();
@@ -526,24 +768,124 @@ fn spawn_background_compactor<VM: VMBinding>(
 pub struct UffdConcurrentSetup<VM: VMBinding> {
     plan: &'static Compressor<VM>,
     compressor_space: &'static CompressorSpace<VM>,
-    los: &'static LargeObjectSpace<VM>,
 }
 
 #[cfg(feature = "uffd")]
 impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
-    fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+    fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
         use crate::policy::compressor::uffd::UffdContext;
         use std::sync::Arc;
         let start = std::time::Instant::now();
 
-        let num_regions = self.compressor_space.num_regions();
+        let num_regions = self.compressor_space.compaction_region_count();
         if num_regions == 0 {
             return;
         }
 
+        if std::env::var_os("MMTK_VALIDATE_COMPACTION_SOURCE_REFS").is_some() {
+            self.compressor_space
+                .validate_source_prefix_references()
+                .unwrap_or_else(|e| panic!("{}", e));
+            info!(
+                "ValidateCompactionSourceRefs: validated marked prefix objects across {} regions before UFFD setup",
+                num_regions
+            );
+        }
+
+        if std::env::var_os("MMTK_VALIDATE_COMPACTION_LAYOUT").is_some() {
+            self.compressor_space
+                .validate_region_compaction_layout_for_prefix(num_regions)
+                .unwrap_or_else(|e| panic!("{}", e));
+            info!(
+                "ValidateCompactionLayout: validated destination layout across {} regions before UFFD setup",
+                num_regions
+            );
+        }
+
+        if std::env::var_os("MMTK_TRACE_COMPRESSOR_REFERENCE_FIELDS").is_some() {
+            let (reference_objects, referent_non_null, discovered_total, discovered_non_null) =
+                self.compressor_space.debug_count_reference_fields_in_prefix();
+            info!(
+                "Compressor reference-field snapshot before UFFD setup: reference_objects={}, referent_non_null={}, discovered_total={}, discovered_non_null={}",
+                reference_objects,
+                referent_non_null,
+                discovered_total,
+                discovered_non_null,
+            );
+        }
+
         let page_metadata_start = std::time::Instant::now();
-        self.compressor_space.build_all_page_metadata();
+        if self
+            .compressor_space
+            .has_cached_region_compaction_summaries_for_prefix(num_regions)
+        {
+            self.compressor_space
+                .materialize_page_metadata_from_cached_summaries_for_prefix(num_regions);
+        } else {
+            self.compressor_space.build_all_page_metadata();
+        }
         let page_metadata_elapsed = page_metadata_start.elapsed();
+
+        let validation_objects = if std::env::var_os("MMTK_VALIDATE_MUTATOR_ROOTS").is_some()
+            || std::env::var_os("MMTK_VALIDATE_VM_ROOTS").is_some()
+            || std::env::var_os("MMTK_VALIDATE_UFFD_SPACE_REFS").is_some()
+            || std::env::var_os("MMTK_VALIDATE_UFFD_REF_TABLES").is_some()
+        {
+            Some(Arc::new(
+                self.compressor_space.collect_destination_objects(),
+            ))
+        } else {
+            None
+        };
+
+        if std::env::var_os("MMTK_VALIDATE_MUTATOR_ROOTS").is_some() {
+            VM::VMScanning::prepare_for_roots_re_scanning();
+            mmtk.state.prepare_for_stack_scanning();
+            let valid_objects = validation_objects.as_ref().unwrap().clone();
+            let factory = ValidateMutatorRootsFactory::new(
+                self.compressor_space,
+                valid_objects.clone(),
+                WorkBucketStage::Compact,
+                false,
+            );
+            let mut mutator_count = 0usize;
+            for mutator in VM::VMActivePlan::mutators() {
+                mutator_count += 1;
+                VM::VMScanning::scan_roots_in_mutator_thread(worker.tls, mutator, factory.clone());
+            }
+            info!(
+                "ValidateMutatorRoots: validated {} mutators against {} destination objects after page-metadata build",
+                mutator_count,
+                valid_objects.len()
+            );
+        }
+
+        if std::env::var_os("MMTK_VALIDATE_VM_ROOTS").is_some() {
+            VM::VMScanning::prepare_for_roots_re_scanning();
+            let valid_objects = validation_objects.as_ref().unwrap().clone();
+            let factory = ValidateMutatorRootsFactory::new(
+                self.compressor_space,
+                valid_objects.clone(),
+                WorkBucketStage::Compact,
+                false,
+            );
+            VM::VMScanning::scan_vm_specific_roots(worker.tls, factory);
+            info!(
+                "ValidateVmSpecificRoots: validated VM roots against {} destination objects after page-metadata build",
+                valid_objects.len()
+            );
+        }
+
+        if std::env::var_os("MMTK_VALIDATE_UFFD_REF_TABLES").is_some() {
+            let valid_objects = validation_objects.as_ref().unwrap();
+            let counts = mmtk.reference_processors.validate_refs::<VM>(|object| {
+                !self.compressor_space.in_space(object) || valid_objects.contains(&object)
+            });
+            info!(
+                "ValidateUffdRefTables: soft=({},{}) weak=({},{}) phantom=({},{})",
+                counts[0].0, counts[0].1, counts[1].0, counts[1].1, counts[2].0, counts[2].1,
+            );
+        }
 
         let uffd_new_start = std::time::Instant::now();
         let mut uffd_ctx = UffdContext::new(self.compressor_space)
@@ -609,10 +951,7 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
         // ART's `CompactionPause()` updates immune / non-moving spaces and roots
         // before mutators resume. Update all MMTk-managed non-moving spaces that can
         // hold references into Compressor, not just LOS.
-        let los_update_start = std::time::Instant::now();
-        self.compressor_space
-            .update_los_references(worker, self.los);
-        let los_update_elapsed = los_update_start.elapsed();
+        let los_update_elapsed = std::time::Duration::ZERO;
 
         let immortal_update_start = std::time::Instant::now();
         self.compressor_space
@@ -633,6 +972,51 @@ impl<VM: VMBinding> GCWork<VM> for UffdConcurrentSetup<VM> {
         };
         #[cfg(not(feature = "vm_space"))]
         let vm_space_update_elapsed = std::time::Duration::ZERO;
+
+        if std::env::var_os("MMTK_VALIDATE_UFFD_SPACE_REFS").is_some() {
+            let valid_objects = validation_objects.as_ref().unwrap();
+            let validate_object = |label: &str, object: ObjectReference| {
+                VM::VMScanning::scan_object(worker.tls, object, &mut |slot: VM::VMSlot| {
+                    let Some(referent) = slot.load() else {
+                        return;
+                    };
+                    if self.compressor_space.in_space(referent)
+                        && !valid_objects.contains(&referent)
+                    {
+                        panic!(
+                            "{} contains stale Compressor ref {} in object {}",
+                            label, referent, object,
+                        );
+                    }
+                });
+            };
+
+            self.plan.common.get_immortal().enumerate_objects(
+                &mut crate::util::object_enum::ClosureObjectEnumerator::<_, VM>::new(
+                    |o: ObjectReference| validate_object("immortal", o),
+                ),
+            );
+            self.plan.common.get_nonmoving().enumerate_objects(
+                &mut crate::util::object_enum::ClosureObjectEnumerator::<_, VM>::new(
+                    |o: ObjectReference| validate_object("nonmoving", o),
+                ),
+            );
+            self.plan.common.get_los().enumerate_to_space_objects(
+                &mut crate::util::object_enum::ClosureObjectEnumerator::<_, VM>::new(
+                    |o: ObjectReference| validate_object("los", o),
+                ),
+            );
+            #[cfg(feature = "vm_space")]
+            self.plan.common.base.vm_space.enumerate_objects(
+                &mut crate::util::object_enum::ClosureObjectEnumerator::<_, VM>::new(
+                    |o: ObjectReference| validate_object("vm_space", o),
+                ),
+            );
+            info!(
+                "ValidateUffdSpaceRefs: validated non-moving space references against {} destination objects",
+                valid_objects.len()
+            );
+        }
 
         let seal_start = std::time::Instant::now();
         self.compressor_space.seal_regions_for_concurrent_uffd();
@@ -667,12 +1051,10 @@ impl<VM: VMBinding> UffdConcurrentSetup<VM> {
     pub fn new(
         plan: &'static Compressor<VM>,
         compressor_space: &'static CompressorSpace<VM>,
-        los: &'static LargeObjectSpace<VM>,
     ) -> Self {
         Self {
             plan,
             compressor_space,
-            los,
         }
     }
 }

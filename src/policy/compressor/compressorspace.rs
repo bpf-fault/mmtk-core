@@ -238,7 +238,129 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             });
     }
 
+    /// Concurrent mode: is fault-driven concurrent install enabled?
+    pub fn concurrent_install(&self) -> bool {
+        crate::util::compact_faults::is_compact_faults_active()
+            && *self.common.options.compact_concurrent
+    }
+
+    /// Pause-side flip for the concurrent window: per region, set page
+    /// states ([start, predicted_to) pending), move pages to the arena,
+    /// and preset the allocation cursor to the page-aligned post-compact
+    /// position so window-time allocation never shares a page with staged
+    /// installs.  Returns the number of regions to stage.
+    pub fn flip_all_and_preset(&self) -> usize {
+        use crate::util::compact_faults::BYTES_IN_PAGE;
+        let cf = crate::util::compact_faults::compact_faults().unwrap();
+        let region_bytes = forwarding::CompressorRegion::BYTES;
+        self.pr.with_regions(&mut |regions| {
+            for r in regions {
+                let start = r.region.start();
+                let cursor = r.cursor();
+                // Exact post-compact cursor, computed with the same
+                // arithmetic the staging pass uses (forwarded start of the
+                // last object plus its copied size).  The region is not yet
+                // flipped, so object headers are readable at their real
+                // addresses.
+                let mut predicted_to = start;
+                if cursor > start {
+                    self.forwarding.scan_marked_objects(
+                        start,
+                        start + region_bytes,
+                        &mut |obj: ObjectReference| {
+                            let new_object = self.forward(obj, false);
+                            predicted_to = new_object.to_object_start::<VM>()
+                                + VM::VMObjectModel::get_size_when_copied(obj);
+                        },
+                    );
+                }
+                debug_assert!(
+                    predicted_to >= start && predicted_to <= cursor,
+                    "predicted_to {} outside region {}..{}",
+                    predicted_to,
+                    start,
+                    cursor
+                );
+                let aligned_to = predicted_to.align_up(BYTES_IN_PAGE);
+                cf.reset_region_state(start, region_bytes);
+                if aligned_to > start {
+                    cf.set_pending(start, aligned_to - start);
+                }
+                cf.flip(start, region_bytes);
+                self.pr.reset_cursor(r, aligned_to);
+            }
+            regions.len()
+        })
+    }
+
+    /// Concurrent-window staging of one region: slide-compact in the arena,
+    /// mark pages staged, install them, clear any leftover pending state,
+    /// and finish (uffd unregister).  Runs in the Concurrent bucket while
+    /// mutators execute; the cursor was preset in the pause.
+    pub fn stage_region(&self, worker: &mut GCWorker<VM>, index: usize) {
+        use crate::util::compact_faults::BYTES_IN_PAGE;
+        let cf = crate::util::compact_faults::compact_faults().unwrap();
+        let region_bytes = forwarding::CompressorRegion::BYTES;
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            let start = r.region.start();
+            let end = r.cursor(); // preset, page-aligned post-compact cursor
+            let delta = cf.alias_delta();
+            let shift = |o: ObjectReference| -> ObjectReference {
+                unsafe {
+                    ObjectReference::from_raw_address_unchecked(Address::from_usize(
+                        (o.to_raw_address().as_usize() as isize + delta) as usize,
+                    ))
+                }
+            };
+            #[cfg(feature = "vo_bit")]
+            crate::util::metadata::vo_bit::bzero_vo_bit(start, region_bytes);
+            let mut to = start;
+            // Scan the whole region's mark bitmap: `end` is the preset
+            // cursor (post-compact), but marked objects live anywhere in
+            // the pre-compact region.
+            self.forwarding
+                .scan_marked_objects(start, start + region_bytes, &mut |obj: ObjectReference| {
+                    let alias_obj = shift(obj);
+                    let copied_size = VM::VMObjectModel::get_size_when_copied(alias_obj);
+                    let new_object = self.forward(obj, false);
+                    let alias_new = shift(new_object);
+                    VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
+                    #[cfg(feature = "vo_bit")]
+                    vo_bit::set_vo_bit(new_object);
+                    to = new_object.to_object_start::<VM>() + copied_size;
+                    self.update_references(worker, alias_new);
+                });
+            let staged_end = to.align_up(BYTES_IN_PAGE);
+            assert!(
+                staged_end <= end || end == start,
+                "stage_region: staged_end {} exceeds preset cursor {} (region {})",
+                staged_end,
+                end,
+                start
+            );
+            // The cursor stays at its conservative pause-time preset for
+            // this cycle; the next GC's flip re-reads it.  (Resetting it
+            // back to `to` here would race with window-time allocation.)
+            if staged_end > start {
+                cf.stage(start, staged_end - start);
+                cf.install(start, staged_end - start);
+            }
+            // Clear any pending pages we predicted but did not stage, so
+            // no mutator spins forever on them.
+            if staged_end < start + region_bytes {
+                cf.reset_region_state(staged_end, start + region_bytes - staged_end);
+            }
+            cf.finish_region(start, region_bytes);
+        });
+    }
+
     pub fn release(&self) {
+        if self.concurrent_install() {
+            // The concurrent window still needs the forwarding metadata;
+            // released by the window-close packet instead.
+            return;
+        }
         self.forwarding.release();
     }
 
@@ -351,6 +473,20 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 self.forward(o, false)
             });
         }
+    }
+
+    /// Close the concurrent window: release forwarding metadata.
+    pub fn close_window(&self) {
+        let cf = crate::util::compact_faults::compact_faults().unwrap();
+        self.forwarding.release();
+        cf.close_window();
+    }
+
+    /// Stage tasks for the concurrent window (Concurrent bucket).
+    pub fn add_stage_tasks(&'static self) {
+        let packets: Vec<Box<dyn GCWork<VM>>> =
+            self.generate_tasks(&mut |_, i| Box::new(StageRegion::<VM>::new(self, i)));
+        self.scheduler.work_buckets[WorkBucketStage::Concurrent].bulk_add(packets);
     }
 
     pub fn add_compact_tasks(&'static self) {
@@ -475,6 +611,31 @@ impl<VM: VMBinding> CalculateOffsetVector<VM> {
             compressor_space,
             region,
             cursor,
+        }
+    }
+}
+
+/// Stage + install one region during the concurrent window.
+pub struct StageRegion<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+    index: usize,
+}
+
+impl<VM: VMBinding> GCWork<VM> for StageRegion<VM> {
+    fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.compressor_space.stage_region(worker, self.index);
+        let cf = crate::util::compact_faults::compact_faults().unwrap();
+        if cf.region_done() {
+            self.compressor_space.close_window();
+        }
+    }
+}
+
+impl<VM: VMBinding> StageRegion<VM> {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>, index: usize) -> Self {
+        Self {
+            compressor_space,
+            index,
         }
     }
 }

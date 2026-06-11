@@ -85,6 +85,14 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
         // The main issue there is that we need to ForwardingProcessEdges
         // in FinalizableForwarding.
 
+        // A concurrent install window from the previous GC must fully close
+        // before a new collection may touch the forwarding metadata.
+        if let Some(cf) = crate::util::compact_faults::compact_faults() {
+            while cf.window_active() {
+                std::thread::yield_now();
+            }
+        }
+
         // Stop & scan mutators (mutator scanning can happen before STW)
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
             .add(StopMutators::<CompressorWorkContext<VM>>::new());
@@ -101,10 +109,28 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
         // scan roots to update their references
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
 
-        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
-            &self.compressor_space,
-            CompressorSpace::<VM>::add_compact_tasks,
-        ));
+        if self.compressor_space.concurrent_install() {
+            // B.1: flip all regions and preset cursors in the pause; stage
+            // packets go to the Concurrent bucket and run after mutators
+            // resume (the bucket opens right before resume_mutators).
+            scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
+                &self.compressor_space,
+                |space: &'static CompressorSpace<VM>| {
+                    let regions = space.flip_all_and_preset();
+                    if regions > 0 {
+                        crate::util::compact_faults::compact_faults()
+                            .unwrap()
+                            .open_window(regions);
+                        space.add_stage_tasks();
+                    }
+                },
+            ));
+        } else {
+            scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
+                &self.compressor_space,
+                CompressorSpace::<VM>::add_compact_tasks,
+            ));
+        }
 
         scheduler.work_buckets[WorkBucketStage::Compact].set_sentinel(Box::new(
             AfterCompact::<VM>::new(&self.compressor_space, &self.common.los),

@@ -28,6 +28,13 @@ pub(crate) const BYTES_IN_PAGE: usize = 1 << LOG_BYTES_IN_PAGE;
 
 const STATE_ZERO_FILL: u64 = 0;
 const STATE_STAGED: u64 = 1;
+const STATE_PENDING: u64 = 2;
+
+/// Is a concurrent compaction window currently open?
+static WINDOW_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Regions not yet staged+installed in the current window.
+static WINDOW_REMAINING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 static TRACKER: OnceLock<CompactFaults> = OnceLock::new();
 
@@ -57,6 +64,7 @@ pub(crate) fn init_compact_faults(
         .set(CompactFaults::new(backend, start, span))
         .ok()
         .expect("compact faults initialized twice");
+    sigbus::install_handler();
 }
 
 pub(crate) struct CompactFaults {
@@ -172,6 +180,70 @@ impl CompactFaults {
         }
     }
 
+    /// Mark pages as pending: live data will land there but the GC has not
+    /// staged it yet.  Faults bounce to the SIGBUS handler (wait-mode).
+    pub fn set_pending(&self, start: Address, bytes: usize) {
+        let first = (start - self.space_base) >> LOG_BYTES_IN_PAGE;
+        let n = bytes >> LOG_BYTES_IN_PAGE;
+        for i in first..first + n {
+            unsafe {
+                std::ptr::write_volatile(self.state.add(i), STATE_PENDING);
+            }
+        }
+    }
+
+    fn page_state(&self, addr: Address) -> u64 {
+        let idx = (addr - self.space_base) >> LOG_BYTES_IN_PAGE;
+        unsafe { std::ptr::read_volatile(self.state.add(idx)) }
+    }
+
+    pub fn in_span(&self, addr: Address) -> bool {
+        addr >= self.space_base && addr < self.space_base + self.span
+    }
+
+    pub fn open_window(&self, regions: usize) {
+        WINDOW_REMAINING.store(regions, std::sync::atomic::Ordering::SeqCst);
+        WINDOW_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Returns true if this was the last region of the window.
+    pub fn region_done(&self) -> bool {
+        WINDOW_REMAINING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1
+    }
+
+    pub fn close_window(&self) {
+        WINDOW_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn window_active(&self) -> bool {
+        WINDOW_OPEN.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Handle a SIGBUS on `page` during the concurrent window (wait-mode):
+    /// spin until the GC stages the page, then (uffd) install it.  Returns
+    /// true if the fault was ours.  Runs in signal context: no locks.
+    fn handle_window_fault(&self, page: Address) -> bool {
+        if !self.window_active() || !self.in_span(page) {
+            return false;
+        }
+        loop {
+            match self.page_state(page) {
+                STATE_STAGED => break,
+                STATE_PENDING => std::hint::spin_loop(),
+                // Zero-fill: bpf handles in-kernel (we never get here);
+                // uffd must install a zero page.
+                _ => break,
+            }
+        }
+        if self.backend == CompactFaultsBackend::Uffd {
+            match self.page_state(page) {
+                STATE_STAGED => uffd_copy(self.uffd, page, self.alias_of(page), BYTES_IN_PAGE),
+                _ => uffd_zeropage(self.uffd, page, BYTES_IN_PAGE),
+            }
+        }
+        true
+    }
+
     /// Install staged pages now (B.0 STW mode): bpf touches each page (the
     /// in-kernel handler copies from the arena); uffd UFFDIO_COPYs.
     pub fn install(&self, start: Address, bytes: usize) {
@@ -232,6 +304,7 @@ const UFFDIO_API: u64 = 0xc018_aa3f;
 const UFFDIO_REGISTER: u64 = 0xc020_aa00;
 const UFFDIO_UNREGISTER: u64 = 0x8010_aa01;
 const UFFDIO_COPY: u64 = 0xc028_aa03;
+const UFFDIO_ZEROPAGE: u64 = 0xc020_aa04;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
 const UFFD_FEATURE_SIGBUS: u64 = 1 << 7;
 
@@ -289,6 +362,29 @@ fn uffd_register_missing(fd: i32, start: Address, bytes: usize) {
     };
     let r = unsafe { libc::ioctl(fd, UFFDIO_REGISTER, &mut reg) };
     assert_eq!(r, 0, "UFFDIO_REGISTER({}, {}) failed", start, bytes);
+}
+
+#[repr(C)]
+struct UffdioZeropage {
+    range: UffdioRange,
+    mode: u64,
+    zeropage: i64,
+}
+
+fn uffd_zeropage(fd: i32, dst: Address, bytes: usize) {
+    let mut zp = UffdioZeropage {
+        range: UffdioRange {
+            start: dst.as_usize() as u64,
+            len: bytes as u64,
+        },
+        mode: 0,
+        zeropage: 0,
+    };
+    let r = unsafe { libc::ioctl(fd, UFFDIO_ZEROPAGE, &mut zp) };
+    if r != 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        assert_eq!(errno, libc::EEXIST, "UFFDIO_ZEROPAGE({}) failed: {}", dst, errno);
+    }
 }
 
 fn uffd_copy(fd: i32, dst: Address, src: Address, bytes: usize) {
@@ -355,6 +451,61 @@ mod bpf_shim {
 
         pub fn state(&self) -> *mut u64 {
             unsafe { (self.state)() }
+        }
+    }
+}
+
+
+/* ---------------- chained SIGBUS handler (concurrent window) -------- */
+
+mod sigbus {
+    use super::*;
+    use std::mem::MaybeUninit;
+
+    // Written once at install time, read-only afterwards.
+    #[allow(static_mut_refs)]
+    static mut OLD_ACTION_RAW: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
+
+    pub(super) fn install_handler() {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as usize;
+            sa.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut sa.sa_mask);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            let r = libc::sigaction(libc::SIGBUS, &sa, &mut old);
+            assert_eq!(r, 0, "sigaction(SIGBUS) failed");
+            #[allow(static_mut_refs)]
+            OLD_ACTION_RAW.write(old);
+        }
+    }
+
+    extern "C" fn handler(
+        sig: libc::c_int,
+        info: *mut libc::siginfo_t,
+        ctx: *mut libc::c_void,
+    ) {
+        unsafe {
+            let addr = Address::from_usize((*info).si_addr() as usize);
+            let page = addr.align_down(BYTES_IN_PAGE);
+            if let Some(t) = compact_faults() {
+                if t.handle_window_fault(page) {
+                    return;
+                }
+            }
+            #[allow(static_mut_refs)]
+            let old = OLD_ACTION_RAW.assume_init_ref();
+            if old.sa_flags & libc::SA_SIGINFO != 0 {
+                let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                    std::mem::transmute(old.sa_sigaction);
+                f(sig, info, ctx);
+            } else if old.sa_sigaction == libc::SIG_DFL {
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+                libc::raise(libc::SIGBUS);
+            } else if old.sa_sigaction != libc::SIG_IGN {
+                let f: extern "C" fn(libc::c_int) = std::mem::transmute(old.sa_sigaction);
+                f(sig);
+            }
         }
     }
 }

@@ -912,6 +912,10 @@ options! {
     /// Fault-driven compaction for the Compressor plan: None (STW copy,
     /// default) | Bpf | Uffd.
     compact_faults:         CompactFaults           [always_valid] = CompactFaults::None,
+    /// With compact_faults: install compacted pages concurrently with
+    /// mutators (B.1). Requires no_reference_types=true and no_finalizer=true
+    /// (pause-tail reference work dereferences unstaged pages otherwise).
+    compact_concurrent:     bool                    [always_valid] = false,
     /// Number of GC worker threads.
     threads:                usize                   [|v: &usize| *v > 0] = num_cpus::get(),
     /// Enable an optimization that only scans the part of the stack that has changed since the last GC (not supported)

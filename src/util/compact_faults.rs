@@ -196,6 +196,21 @@ impl CompactFaults {
         }
     }
 
+    /// Region finished installing (B.0): restore stock fault semantics.
+    /// uffd must unregister — with UFFD_FEATURE_SIGBUS, touching an
+    /// uninstalled (beyond-cursor) page would SIGBUS instead of zero-fill.
+    /// bpf needs nothing: state-0 pages zero-fill in the handler.
+    pub fn finish_region(&self, start: Address, bytes: usize) {
+        if self.backend == CompactFaultsBackend::Uffd {
+            let mut range = UffdioRange {
+                start: start.as_usize() as u64,
+                len: bytes as u64,
+            };
+            let r = unsafe { libc::ioctl(self.uffd, UFFDIO_UNREGISTER, &mut range) };
+            assert_eq!(r, 0, "UFFDIO_UNREGISTER({}, {}) failed", start, bytes);
+        }
+    }
+
     /// Reset state for a region (next cycle) — pages return to zero-fill.
     pub fn reset_region_state(&self, start: Address, bytes: usize) {
         let first = (start - self.space_base) >> LOG_BYTES_IN_PAGE;
@@ -215,6 +230,7 @@ const MREMAP_DONTUNMAP: libc::c_int = 4;
 const UFFD_API: u64 = 0xAA;
 const UFFDIO_API: u64 = 0xc018_aa3f;
 const UFFDIO_REGISTER: u64 = 0xc020_aa00;
+const UFFDIO_UNREGISTER: u64 = 0x8010_aa01;
 const UFFDIO_COPY: u64 = 0xc028_aa03;
 const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
 const UFFD_FEATURE_SIGBUS: u64 = 1 << 7;

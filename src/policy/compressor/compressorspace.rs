@@ -434,6 +434,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     cf.stage(start, staged_end - start);
                     cf.install(start, staged_end - start);
                 }
+                cf.finish_region(start, region_bytes);
             }
             self.pr.reset_cursor(r, to);
         });

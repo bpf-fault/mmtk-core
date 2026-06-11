@@ -147,6 +147,18 @@ impl DirtyTracker {
         reg.insert(start);
     }
 
+    /// Register every 4 MiB-aligned chunk overlapping the range (chunk
+    /// starts are stable keys across GCs, unlike LOS object ranges).
+    pub(crate) fn ensure_registered_range(&self, start: Address, bytes: usize) {
+        const CHUNK: usize = 4 << 20;
+        let mut a = start.align_down(CHUNK);
+        let end = (start + bytes).align_up(CHUNK);
+        while a < end {
+            self.ensure_registered(a, CHUNK);
+            a = a + CHUNK;
+        }
+    }
+
     /// Write-protect a range. The range must have been registered.
     pub(crate) fn protect(&self, start: Address, bytes: usize) {
         match self.backend {

@@ -219,12 +219,14 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ScanVMDirtyPages<E> {
         tracker.drain_dirty(|page| {
             pages += 1;
             // An object allocated before this page may span into it; its
-            // dirtied fields are on this page.  Immix objects are bounded by
-            // MAX_IMMIX_OBJECT_SIZE (only the immix mature space is
-            // dirty-tracked).
+            // dirtied fields are on this page.  The search bound must cover
+            // the largest tracked object: immix objects are small, but LOS
+            // objects (also WP-tracked) can be huge.  The backwards VO-bit
+            // scan terminates at the first preceding object, so the common
+            // case is cheap regardless of the bound.
             if let Some(obj) = vo_bit::find_object_from_internal_pointer::<E::VM>(
                 page,
-                crate::policy::immix::MAX_IMMIX_OBJECT_SIZE,
+                256 << 20,
             ) {
                 if obj.to_raw_address() < page {
                     objects.push(obj);

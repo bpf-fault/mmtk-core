@@ -40,6 +40,19 @@ pub enum DirtyTracking {
     Segv,
 }
 
+/// Select how the Compressor plan installs compacted pages (Class B
+/// fault-driven compaction).
+#[derive(Copy, Clone, EnumString, Debug, PartialEq, Eq)]
+pub enum CompactFaults {
+    /// Normal STW copying (default).
+    None,
+    /// Flip regions aside with mremap and install pages via bpf_fault
+    /// missing-fault handling (in-kernel copy from the arena).
+    Bpf,
+    /// Flip regions aside and install via userfaultfd UFFDIO_COPY.
+    Uffd,
+}
+
 /// Select a GC plan for MMTk.
 #[derive(Copy, Clone, EnumString, Debug, PartialEq, Eq)]
 pub enum PlanSelector {
@@ -896,6 +909,9 @@ options! {
     /// barrier (Barrier, default) or VM page-protection dirty tracking
     /// (Bpf | Uffd | Segv), which disables the compiled barrier entirely.
     dirty_tracking:         DirtyTracking           [always_valid] = DirtyTracking::Barrier,
+    /// Fault-driven compaction for the Compressor plan: None (STW copy,
+    /// default) | Bpf | Uffd.
+    compact_faults:         CompactFaults           [always_valid] = CompactFaults::None,
     /// Number of GC worker threads.
     threads:                usize                   [|v: &usize| *v > 0] = num_cpus::get(),
     /// Enable an optimization that only scans the part of the stack that has changed since the last GC (not supported)

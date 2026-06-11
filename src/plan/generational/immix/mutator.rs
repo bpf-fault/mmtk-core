@@ -44,9 +44,14 @@ pub fn create_genimmix_mutator<VM: VMBinding>(
     };
 
     let builder = MutatorBuilder::new(mutator_tls, mmtk, config);
-    builder
-        .barrier(Box::new(ObjectBarrier::new(
-            GenObjectBarrierSemantics::new(mmtk, genimmix),
-        )))
-        .build()
+    let barrier: Box<dyn crate::plan::barriers::Barrier<VM>> =
+        if crate::util::dirty_track::is_dirty_tracking_active() {
+            // Page-protection dirty tracking replaces the compiled barrier.
+            Box::new(crate::plan::barriers::NoBarrier)
+        } else {
+            Box::new(ObjectBarrier::new(GenObjectBarrierSemantics::new(
+                mmtk, genimmix,
+            )))
+        };
+    builder.barrier(barrier).build()
 }

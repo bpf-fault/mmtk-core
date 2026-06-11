@@ -181,3 +181,71 @@ impl<E: ProcessEdgesWork> GCWork<E::VM> for ProcessRegionModBuf<E> {
         }
     }
 }
+
+/// Scan the pages recorded by VM dirty tracking (page-protection write
+/// barrier) for old->young references.  This replaces [`ProcessModBuf`] when
+/// the `dirty_tracking` option selects a page-protection backend: the dirty
+/// pages are the remembered set.  Objects are located on dirty pages via the
+/// VO bit, including the object (if any) that spans the page start.
+#[cfg(feature = "vo_bit")]
+pub struct ScanVMDirtyPages<E: ProcessEdgesWork> {
+    phantom: PhantomData<E>,
+}
+
+#[cfg(feature = "vo_bit")]
+impl<E: ProcessEdgesWork> ScanVMDirtyPages<E> {
+    pub fn new() -> Self {
+        Self {
+            phantom: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "vo_bit")]
+impl<E: ProcessEdgesWork> GCWork<E::VM> for ScanVMDirtyPages<E> {
+    fn do_work(&mut self, worker: &mut GCWorker<E::VM>, mmtk: &'static MMTK<E::VM>) {
+        use crate::util::dirty_track::{dirty_tracker, BYTES_IN_PAGE};
+        use crate::util::metadata::vo_bit;
+
+        debug_assert!(mmtk
+            .get_plan()
+            .generational()
+            .unwrap()
+            .is_current_gc_nursery());
+
+        let tracker = dirty_tracker().unwrap();
+        let mut objects: Vec<ObjectReference> = vec![];
+        let mut pages = 0usize;
+        tracker.drain_dirty(|page| {
+            pages += 1;
+            // An object allocated before this page may span into it; its
+            // dirtied fields are on this page.  Immix objects are bounded by
+            // MAX_IMMIX_OBJECT_SIZE (only the immix mature space is
+            // dirty-tracked).
+            if let Some(obj) = vo_bit::find_object_from_internal_pointer::<E::VM>(
+                page,
+                crate::policy::immix::MAX_IMMIX_OBJECT_SIZE,
+            ) {
+                if obj.to_raw_address() < page {
+                    objects.push(obj);
+                }
+            }
+            // All objects starting within the page.
+            vo_bit::VO_BIT_SIDE_METADATA_SPEC.scan_non_zero_values::<u8>(
+                page,
+                page + BYTES_IN_PAGE,
+                &mut |addr| {
+                    objects.push(vo_bit::get_object_ref_for_vo_addr(addr));
+                },
+            );
+        });
+        probe!(mmtk, scan_vm_dirty_pages, pages, objects.len());
+        if !objects.is_empty() {
+            GCWork::do_work(
+                &mut ScanObjects::<E>::new(objects, false, WorkBucketStage::Closure),
+                worker,
+                mmtk,
+            )
+        }
+    }
+}

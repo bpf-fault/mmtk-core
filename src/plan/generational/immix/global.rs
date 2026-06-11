@@ -52,6 +52,10 @@ pub struct GenImmix<VM: VMBinding> {
     pub last_gc_was_defrag: AtomicBool,
     /// Whether the last GC was a full heap GC
     pub last_gc_was_full_heap: AtomicBool,
+    /// Conservative remembered set for spaces without page dirty tracking
+    /// (LOS/immortal/nonmoving): filled in `prepare()` while the LOS
+    /// treadmill is still quiescent, consumed by `ScanDirtyStash` in Closure.
+    pub(super) dirty_stash: std::sync::Mutex<Vec<ObjectReference>>,
 }
 
 /// The plan constraints for the generational immix plan.
@@ -113,6 +117,23 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         if !is_full_heap {
             info!("Nursery GC");
             scheduler.schedule_common_work::<GenImmixNurseryGCWorkContext<VM>>(self);
+            if crate::util::dirty_track::is_dirty_tracking_active() {
+                use crate::plan::generational::gc_work::GenNurseryProcessEdges;
+                use crate::policy::gc_work::DEFAULT_TRACE;
+                use crate::scheduler::WorkBucketStage;
+                type E<VM> = GenNurseryProcessEdges<VM, GenImmix<VM>, DEFAULT_TRACE>;
+                #[cfg(feature = "vo_bit")]
+                scheduler.work_buckets[WorkBucketStage::Closure].add(
+                    crate::plan::generational::gc_work::ScanVMDirtyPages::<E<VM>>::new(),
+                );
+                #[cfg(not(feature = "vo_bit"))]
+                panic!("dirty tracking requires the vo_bit feature");
+                // Spaces without page dirty tracking are conservatively
+                // re-scanned every nursery GC via the stash filled in
+                // `prepare()`.
+                scheduler.work_buckets[WorkBucketStage::Closure]
+                    .add(super::gc_work::ScanDirtyStash::<VM>::new());
+            }
         } else {
             info!("Full heap GC");
             crate::plan::immix::Immix::schedule_immix_full_heap_collection::<
@@ -129,6 +150,26 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         let full_heap = !self.gen.is_current_gc_nursery();
+        // Drop page protection on the whole mature space so GC-time writes
+        // (promotion into recycled blocks, defrag) never fault.  Mutators are
+        // already suspended; the dirty set is drained later in Closure.
+        if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
+            self.for_each_mature_chunk(|start, bytes| tracker.unprotect(start, bytes));
+            // Build the conservative remembered set for spaces without page
+            // dirty tracking.  This must happen before `gen.prepare()` flips
+            // the LOS treadmill (enumeration is invalid afterwards).
+            if !full_heap {
+                use crate::util::object_enum::ClosureObjectEnumerator;
+                let mut stash = self.dirty_stash.lock().unwrap();
+                debug_assert!(stash.is_empty());
+                let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    stash.push(obj);
+                });
+                self.gen.common.los.enumerate_objects(&mut enumerator);
+                self.gen.common.immortal.enumerate_objects(&mut enumerator);
+                self.gen.common.nonmoving.enumerate_objects(&mut enumerator);
+            }
+        }
         self.gen.prepare(tls);
         if full_heap {
             self.immix_space.prepare(
@@ -167,6 +208,18 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
 
         let did_defrag = self.immix_space.end_of_gc();
         self.last_gc_was_defrag.store(did_defrag, Ordering::Relaxed);
+
+        // Re-arm the page-protection write barrier before mutators resume:
+        // every mature page is clean now (the nursery is empty, so no
+        // old->young refs exist).  Newly mapped chunks are registered first.
+        // Dirty bits set by faults during the GC itself are stale; discard.
+        if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
+            tracker.drain_dirty(|_| {});
+            self.for_each_mature_chunk(|start, bytes| {
+                tracker.ensure_registered(start, bytes);
+                tracker.protect(start, bytes);
+            });
+        }
     }
 
     fn current_gc_may_move_object(&self) -> bool {
@@ -255,6 +308,15 @@ impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM> f
 
 impl<VM: VMBinding> GenImmix<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        {
+            let backend = *args.options.dirty_tracking;
+            let vm_layout = crate::util::heap::layout::vm_layout::vm_layout();
+            crate::util::dirty_track::init_dirty_tracker(
+                backend,
+                vm_layout.heap_start,
+                vm_layout.heap_end,
+            );
+        }
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &GENIMMIX_CONSTRAINTS,
@@ -280,10 +342,21 @@ impl<VM: VMBinding> GenImmix<VM> {
             immix_space,
             last_gc_was_defrag: AtomicBool::new(false),
             last_gc_was_full_heap: AtomicBool::new(false),
+            dirty_stash: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn requires_full_heap_collection(&self) -> bool {
         self.gen.requires_full_heap_collection(self)
+    }
+
+    /// Visit every mapped chunk of the mature immix space as
+    /// `(start, bytes)`, for page-protection dirty tracking.
+    fn for_each_mature_chunk<F: FnMut(Address, usize)>(&self, mut f: F) {
+        use crate::util::heap::chunk_map::Chunk;
+        use crate::util::linear_scan::Region;
+        for chunk in self.immix_space.chunk_map.all_chunks() {
+            f(chunk.start(), Chunk::BYTES);
+        }
     }
 }

@@ -383,7 +383,15 @@ fn uffd_zeropage(fd: i32, dst: Address, bytes: usize) {
     let r = unsafe { libc::ioctl(fd, UFFDIO_ZEROPAGE, &mut zp) };
     if r != 0 {
         let errno = unsafe { *libc::__errno_location() };
-        assert_eq!(errno, libc::EEXIST, "UFFDIO_ZEROPAGE({}) failed: {}", dst, errno);
+        // EEXIST: raced install.  ENOENT: the GC installed everything and
+        // unregistered the region before our handler ran — the retried
+        // access proceeds normally.
+        assert!(
+            errno == libc::EEXIST || errno == libc::ENOENT,
+            "UFFDIO_ZEROPAGE({}) failed: {}",
+            dst,
+            errno
+        );
     }
 }
 
@@ -398,8 +406,15 @@ fn uffd_copy(fd: i32, dst: Address, src: Address, bytes: usize) {
     let r = unsafe { libc::ioctl(fd, UFFDIO_COPY, &mut copy) };
     if r != 0 {
         let errno = unsafe { *libc::__errno_location() };
-        // EEXIST: page already present (e.g. raced install) — fine.
-        assert_eq!(errno, libc::EEXIST, "UFFDIO_COPY({}) failed: {}", dst, errno);
+        // EEXIST: page already present (raced install).  ENOENT: the GC
+        // installed everything and unregistered the region before our
+        // handler ran.
+        assert!(
+            errno == libc::EEXIST || errno == libc::ENOENT,
+            "UFFDIO_COPY({}) failed: {}",
+            dst,
+            errno
+        );
     }
 }
 

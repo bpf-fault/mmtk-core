@@ -26,6 +26,9 @@ use std::sync::OnceLock;
 pub(crate) const LOG_BYTES_IN_PAGE: usize = 12;
 pub(crate) const BYTES_IN_PAGE: usize = 1 << LOG_BYTES_IN_PAGE;
 
+/// Compressor region granularity (registration tracking unit).
+const REGION_BYTES: usize = 1 << 20;
+
 const STATE_ZERO_FILL: u64 = 0;
 const STATE_STAGED: u64 = 1;
 const STATE_PENDING: u64 = 2;
@@ -72,6 +75,10 @@ pub(crate) struct CompactFaults {
     space_base: Address,
     span: usize,
     arena_base: Address,
+    /// Range starts already registered with bpf_fault (registration
+    /// persists across cycles; uffd re-registers every cycle because
+    /// finish_region unregisters).
+    registered: std::sync::Mutex<std::collections::HashSet<Address>>,
     /// bpf: pointer into the shim's mmaped page_state map.
     /// uffd: our own state array.
     state: *mut u64,
@@ -95,23 +102,33 @@ impl CompactFaults {
                     space_base,
                     span,
                     arena_base: arena,
+                    registered: std::sync::Mutex::new(std::collections::HashSet::new()),
                     state,
                     uffd: -1,
                     shim: Some(shim),
                 }
             }
             CompactFaultsBackend::Uffd => {
-                let arena = unsafe {
+                // 2 MiB phase-aligned with the heap so mremap moves whole
+                // PMD tables (see the bpf shim for details).
+                const PMD: usize = 2 << 20;
+                let raw = unsafe {
                     libc::mmap(
                         std::ptr::null_mut(),
-                        span,
+                        span + PMD,
                         libc::PROT_NONE,
                         libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                         -1,
                         0,
                     )
                 };
-                assert!(arena != libc::MAP_FAILED, "uffd arena mmap failed");
+                assert!(raw != libc::MAP_FAILED, "uffd arena mmap failed");
+                let mut aligned = ((raw as usize + PMD - 1) & !(PMD - 1))
+                    | (space_base.as_usize() & (PMD - 1));
+                if aligned < raw as usize {
+                    aligned += PMD;
+                }
+                let arena = aligned as *mut libc::c_void;
                 let pages = span >> LOG_BYTES_IN_PAGE;
                 let state = unsafe {
                     libc::calloc(pages, std::mem::size_of::<u64>()) as *mut u64
@@ -123,6 +140,7 @@ impl CompactFaults {
                     space_base,
                     span,
                     arena_base: Address::from_mut_ptr(arena),
+                    registered: std::sync::Mutex::new(std::collections::HashSet::new()),
                     state,
                     uffd,
                     shim: None,
@@ -147,8 +165,33 @@ impl CompactFaults {
         debug_assert!(start >= self.space_base && start + bytes <= self.space_base + self.span);
         match self.backend {
             CompactFaultsBackend::Bpf => {
-                let r = self.shim.as_ref().unwrap().flip(start, bytes);
+                let shim = self.shim.as_ref().unwrap();
+                // Note: the flip's mremap cost is dominated by PTE-level
+                // page-table moves — registration both splits heap VMAs at
+                // region granularity (defeating 2MiB PMD-table moves
+                // permanently) and arms the VMAs (uffd-style marker
+                // preservation forces per-PTE moves).  Unregister-first was
+                // measured and does not help (fragmentation persists).
+                // Kernel fixes are required and are highlighted in the
+                // paper notes; see docs/class-b-design.md in gc-bpf-fault.
+                let r = shim.flip(start, bytes, false);
                 assert_eq!(r, 0, "gcb0_flip({}, {}) failed", start, bytes);
+                let mut reg = self.registered.lock().unwrap();
+                let mut subs: Vec<(Address, usize)> = vec![];
+                let mut a = start;
+                while a < start + bytes {
+                    if reg.insert(a) {
+                        match subs.last_mut() {
+                            Some(l) if l.0 + l.1 == a => l.1 += REGION_BYTES,
+                            _ => subs.push((a, REGION_BYTES)),
+                        }
+                    }
+                    a = a + REGION_BYTES;
+                }
+                for &(s2, b2) in &subs {
+                    let r = shim.register(s2, b2);
+                    assert_eq!(r, 0, "gcb0_register({}, {}) failed", s2, b2);
+                }
             }
             CompactFaultsBackend::Uffd => {
                 let dst = self.alias_of(start);
@@ -273,6 +316,23 @@ impl CompactFaults {
     /// uninstalled (beyond-cursor) page would SIGBUS instead of zero-fill.
     /// bpf needs nothing: state-0 pages zero-fill in the handler.
     pub fn finish_region(&self, start: Address, bytes: usize) {
+        // BISECT: arena munmap disabled (suspected interaction with
+        // inherited fault contexts on the moved-to VMAs).
+        if false {
+            match self.backend {
+                CompactFaultsBackend::Bpf => {
+                    let r = self.shim.as_ref().unwrap().unmap_arena(start, bytes);
+                    debug_assert_eq!(r, 0);
+                }
+                CompactFaultsBackend::Uffd => {
+                    let slot = self.alias_of(start);
+                    unsafe {
+                        libc::munmap(slot.to_mut_ptr::<libc::c_void>(), bytes);
+                    }
+                }
+                CompactFaultsBackend::None => unreachable!(),
+            }
+        }
         if self.backend == CompactFaultsBackend::Uffd {
             let mut range = UffdioRange {
                 start: start.as_usize() as u64,
@@ -425,12 +485,16 @@ mod bpf_shim {
     use std::ffi::CString;
 
     type InitFn = unsafe extern "C" fn(u64, u64) -> u64;
-    type FlipFn = unsafe extern "C" fn(u64, u64) -> i32;
+    type FlipFn = unsafe extern "C" fn(u64, u64, i32) -> i32;
+    type RangeFn = unsafe extern "C" fn(u64, u64) -> i32;
     type StateFn = unsafe extern "C" fn() -> *mut u64;
 
     pub(super) struct Shim {
         init: InitFn,
         flip: FlipFn,
+        unmap_arena: RangeFn,
+        register: RangeFn,
+        unregister: RangeFn,
         state: StateFn,
     }
 
@@ -451,6 +515,9 @@ mod bpf_shim {
                 Self {
                     init: std::mem::transmute(sym("gcb0_init")),
                     flip: std::mem::transmute(sym("gcb0_flip")),
+                    unmap_arena: std::mem::transmute(sym("gcb0_unmap_arena")),
+                    register: std::mem::transmute(sym("gcb0_register")),
+                    unregister: std::mem::transmute(sym("gcb0_unregister")),
                     state: std::mem::transmute(sym("gcb0_state")),
                 }
             }
@@ -460,8 +527,20 @@ mod bpf_shim {
             unsafe { Address::from_usize((self.init)(base.as_usize() as u64, span as u64) as usize) }
         }
 
-        pub fn flip(&self, start: Address, bytes: usize) -> i32 {
-            unsafe { (self.flip)(start.as_usize() as u64, bytes as u64) }
+        pub fn flip(&self, start: Address, bytes: usize, do_register: bool) -> i32 {
+            unsafe { (self.flip)(start.as_usize() as u64, bytes as u64, do_register as i32) }
+        }
+
+        pub fn unmap_arena(&self, start: Address, bytes: usize) -> i32 {
+            unsafe { (self.unmap_arena)(start.as_usize() as u64, bytes as u64) }
+        }
+
+        pub fn register(&self, start: Address, bytes: usize) -> i32 {
+            unsafe { (self.register)(start.as_usize() as u64, bytes as u64) }
+        }
+
+        pub fn unregister(&self, start: Address, bytes: usize) -> i32 {
+            unsafe { (self.unregister)(start.as_usize() as u64, bytes as u64) }
         }
 
         pub fn state(&self) -> *mut u64 {

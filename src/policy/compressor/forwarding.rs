@@ -55,6 +55,10 @@ impl Transducer {
             in_object: false,
         }
     }
+    pub fn live_end(&self) -> Address {
+        self.to
+    }
+
     pub fn visit_mark_bit(&mut self, address: Address) {
         if self.in_object {
             // The size of an object is the distance between the end and
@@ -148,7 +152,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+    /// Returns the final transducer position: the exact post-compact end
+    /// of live data in the region.
+    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) -> Address {
         let mut state = Transducer::new(region.start());
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -167,6 +173,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             );
         }
         self.calculated.store(true, Ordering::Relaxed);
+        state.live_end()
     }
 
     pub fn release(&self) {

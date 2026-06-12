@@ -43,6 +43,10 @@ pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
 ///   running multiple single-threaded Compressors at once.
 pub struct CompressorSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
+    /// Post-compact live end per region (region start -> address), recorded
+    /// by the offset-vector calculation; consumed by the concurrent-window
+    /// flip for exact cursor presets.
+    live_end: std::sync::Mutex<std::collections::HashMap<Address, Address>>,
     pr: RegionPageResource<VM, forwarding::CompressorRegion>,
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
@@ -219,6 +223,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
         CompressorSpace {
+            live_end: std::sync::Mutex::new(std::collections::HashMap::new()),
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
             } else {
@@ -254,26 +259,21 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let cf = crate::util::compact_faults::compact_faults().unwrap();
         let region_bytes = forwarding::CompressorRegion::BYTES;
         self.pr.with_regions(&mut |regions| {
-            for r in regions {
+            // Coalesce contiguous regions into single mremap+register calls:
+            // per-region flips churn VMAs (split per region) and dominate
+            // the pause.
+            let mut runs: Vec<(Address, usize)> = Vec::new();
+            for r in regions.iter() {
                 let start = r.region.start();
                 let cursor = r.cursor();
-                // Exact post-compact cursor, computed with the same
-                // arithmetic the staging pass uses (forwarded start of the
-                // last object plus its copied size).  The region is not yet
-                // flipped, so object headers are readable at their real
-                // addresses.
-                let mut predicted_to = start;
-                if cursor > start {
-                    self.forwarding.scan_marked_objects(
-                        start,
-                        start + region_bytes,
-                        &mut |obj: ObjectReference| {
-                            let new_object = self.forward(obj, false);
-                            predicted_to = new_object.to_object_start::<VM>()
-                                + VM::VMObjectModel::get_size_when_copied(obj);
-                        },
-                    );
-                }
+                // Exact post-compact cursor, recorded by the offset-vector
+                // calculation (the transducer's final position).
+                let predicted_to = *self
+                    .live_end
+                    .lock()
+                    .unwrap()
+                    .get(&start)
+                    .unwrap_or(&start);
                 debug_assert!(
                     predicted_to >= start && predicted_to <= cursor,
                     "predicted_to {} outside region {}..{}",
@@ -286,8 +286,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 if aligned_to > start {
                     cf.set_pending(start, aligned_to - start);
                 }
-                cf.flip(start, region_bytes);
+                match runs.last_mut() {
+                    Some(last) if last.0 + last.1 == start => last.1 += region_bytes,
+                    _ => runs.push((start, region_bytes)),
+                }
                 self.pr.reset_cursor(r, aligned_to);
+            }
+            for &(start, bytes) in &runs {
+                cf.flip(start, bytes);
             }
             regions.len()
         })
@@ -439,7 +445,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         region: forwarding::CompressorRegion,
         cursor: Address,
     ) {
-        self.forwarding.calculate_offset_vector(region, cursor);
+        let live_end = self.forwarding.calculate_offset_vector(region, cursor);
+        self.live_end
+            .lock()
+            .unwrap()
+            .insert(region.start(), live_end);
     }
 
     pub fn forward(&self, object: ObjectReference, _vo_bit_valid: bool) -> ObjectReference {

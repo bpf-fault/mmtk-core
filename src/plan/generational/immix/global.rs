@@ -157,6 +157,14 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         // (promotion into recycled blocks, defrag) never fault.  Mutators are
         // already suspended; the dirty set is drained later in Closure.
         if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
+            // Unprotect the whole mature space so GC-time writes (promotion
+            // into recycled blocks, forwarding) never fault.  Measured
+            // alternatives are not cheaper: leaving pages protected trades
+            // this O(mature) unprotect for an equally-large O(promoted)
+            // GC-time fault bill (recycled immix blocks land in protected
+            // chunks).  The per-GC O(mature-space) re-arming cost is
+            // fundamental to page-granularity barriers and dominates at high
+            // GC frequency (tight heaps) — see the heap-size sweep.
             self.for_each_mature_chunk(|start, bytes| tracker.unprotect(start, bytes));
             for (start, bytes) in self.los_protected.lock().unwrap().drain(..) {
                 tracker.unprotect(start, bytes);

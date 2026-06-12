@@ -33,11 +33,34 @@ const STATE_ZERO_FILL: u64 = 0;
 const STATE_STAGED: u64 = 1;
 const STATE_PENDING: u64 = 2;
 
+// Per-region staging coordination (steal-mode): exactly one stager per
+// region; a faulting mutator either stages the region itself or waits for
+// the in-progress stager (bounded by one region, not the whole sweep).
+const REGION_UNSTAGED: u8 = 0;
+const REGION_STAGING: u8 = 1;
+const REGION_DONE: u8 = 2;
+
+/// Plan-registered handler that stages (slide-compacts + installs) one
+/// region.  Lets the VM-agnostic SIGBUS handler drive the VM-specific
+/// Compressor staging when a mutator faults a not-yet-staged region.
+pub trait StealHandler: Send + Sync {
+    fn stage(&self, region_index: usize);
+}
+
+static STEAL: OnceLock<Box<dyn StealHandler>> = OnceLock::new();
+
+/// Register the steal handler (idempotent; first registration wins).
+pub fn register_steal_handler(h: Box<dyn StealHandler>) {
+    let _ = STEAL.set(h);
+}
+
 /// Is a concurrent compaction window currently open?
 static WINDOW_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Regions not yet staged+installed in the current window.
 static WINDOW_REMAINING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static WINDOW_FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WINDOW_SPIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static TRACKER: OnceLock<CompactFaults> = OnceLock::new();
 
@@ -78,10 +101,16 @@ pub(crate) struct CompactFaults {
     /// Range starts already registered with bpf_fault (registration
     /// persists across cycles; uffd re-registers every cycle because
     /// finish_region unregisters).
-    registered: std::sync::Mutex<std::collections::HashSet<Address>>,
+    registered: Vec<std::sync::atomic::AtomicBool>,
     /// bpf: pointer into the shim's mmaped page_state map.
     /// uffd: our own state array.
     state: *mut u64,
+    /// Per-region staging state (steal-mode coordination), one per
+    /// REGION_BYTES of the span (addressed by (addr-base)/REGION_BYTES).
+    region_state: Vec<std::sync::atomic::AtomicU8>,
+    /// Per-region page-aligned post-compact cursor, set at flip time so the
+    /// steal path can stage a region without taking the regions lock.
+    region_cursor: Vec<std::sync::atomic::AtomicUsize>,
     uffd: i32,
     shim: Option<bpf_shim::Shim>,
 }
@@ -102,8 +131,16 @@ impl CompactFaults {
                     space_base,
                     span,
                     arena_base: arena,
-                    registered: std::sync::Mutex::new(std::collections::HashSet::new()),
+                    registered: (0..span / REGION_BYTES)
+                        .map(|_| std::sync::atomic::AtomicBool::new(false))
+                        .collect(),
                     state,
+                    region_state: (0..span / REGION_BYTES)
+                        .map(|_| std::sync::atomic::AtomicU8::new(REGION_DONE))
+                        .collect(),
+                    region_cursor: (0..span / REGION_BYTES)
+                        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                        .collect(),
                     uffd: -1,
                     shim: Some(shim),
                 }
@@ -140,14 +177,74 @@ impl CompactFaults {
                     space_base,
                     span,
                     arena_base: Address::from_mut_ptr(arena),
-                    registered: std::sync::Mutex::new(std::collections::HashSet::new()),
+                    registered: (0..span / REGION_BYTES)
+                        .map(|_| std::sync::atomic::AtomicBool::new(false))
+                        .collect(),
                     state,
+                    region_state: (0..span / REGION_BYTES)
+                        .map(|_| std::sync::atomic::AtomicU8::new(REGION_DONE))
+                        .collect(),
+                    region_cursor: (0..span / REGION_BYTES)
+                        .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                        .collect(),
                     uffd,
                     shim: None,
                 }
             }
             CompactFaultsBackend::None => unreachable!(),
         }
+    }
+
+    pub fn region_index(&self, addr: Address) -> usize {
+        (addr - self.space_base) / REGION_BYTES
+    }
+
+    pub fn region_count(&self) -> usize {
+        self.region_state.len()
+    }
+
+    /// Try to become the stager for a region (CAS Unstaged -> Staging).
+    /// Returns true if won.
+    pub fn claim_region(&self, idx: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.region_state[idx]
+            .compare_exchange(REGION_UNSTAGED, REGION_STAGING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn mark_region_done(&self, idx: usize) {
+        self.region_state[idx].store(REGION_DONE, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn region_is_done(&self, idx: usize) -> bool {
+        self.region_state[idx].load(std::sync::atomic::Ordering::Acquire) == REGION_DONE
+    }
+
+    /// Window open: mark all regions DONE (non-live = skipped); flip then
+    /// marks live ones claimable via `mark_region_live`.
+    pub fn reset_region_staging(&self) {
+        for r in &self.region_state {
+            r.store(REGION_DONE, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Flip time: record a live region (claimable, with its preset cursor).
+    pub fn mark_region_live(&self, start: Address, cursor: Address) {
+        let idx = self.region_index(start);
+        self.region_cursor[idx].store(cursor.as_usize(), std::sync::atomic::Ordering::Relaxed);
+        self.region_state[idx].store(REGION_UNSTAGED, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// (start, preset_cursor) of a region by address-index.
+    pub fn region_bounds(&self, idx: usize) -> (Address, Address) {
+        let start = self.space_base + idx * REGION_BYTES;
+        let cursor =
+            unsafe { Address::from_usize(self.region_cursor[idx].load(std::sync::atomic::Ordering::Relaxed)) };
+        (start, cursor)
+    }
+
+    pub fn region_bytes(&self) -> usize {
+        REGION_BYTES
     }
 
     /// Offset to add to a heap address to get its arena alias.
@@ -177,11 +274,11 @@ impl CompactFaults {
                 // finish_region.
                 let r = shim.flip(start, bytes, false);
                 assert_eq!(r, 0, "gcb0_flip({}, {}) failed", start, bytes);
-                let mut reg = self.registered.lock().unwrap();
                 let mut subs: Vec<(Address, usize)> = vec![];
                 let mut a = start;
                 while a < start + bytes {
-                    if reg.insert(a) {
+                    let idx = self.region_index(a);
+                    if !self.registered[idx].swap(true, std::sync::atomic::Ordering::Relaxed) {
                         match subs.last_mut() {
                             Some(l) if l.0 + l.1 == a => l.1 += REGION_BYTES,
                             _ => subs.push((a, REGION_BYTES)),
@@ -256,6 +353,16 @@ impl CompactFaults {
     }
 
     pub fn close_window(&self) {
+        let faults = WINDOW_FAULTS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let spins = WINDOW_SPIN.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("MMTK_WINDOW_STATS").is_ok() {
+            eprintln!(
+                "window: mutator_faults={} total_spins={} (~{} spins/stalled-fault)",
+                faults,
+                spins,
+                if faults > 0 { spins / faults } else { 0 }
+            );
+        }
         WINDOW_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -263,22 +370,44 @@ impl CompactFaults {
         WINDOW_OPEN.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Handle a SIGBUS on `page` during the concurrent window (wait-mode):
-    /// spin until the GC stages the page, then (uffd) install it.  Returns
-    /// true if the fault was ours.  Runs in signal context: no locks.
+    pub fn stall_report(&self) -> (u64, u64) {
+        (
+            WINDOW_FAULTS.load(std::sync::atomic::Ordering::Relaxed),
+            WINDOW_SPIN.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Handle a SIGBUS on `page` during the concurrent window (steal-mode):
+    /// if the page's region is not yet staged, stage it ourselves (ART-style
+    /// self-service) instead of waiting for the address-ordered sweep to
+    /// reach it; then (uffd) install the page.  Returns true if the fault
+    /// was ours.  Runs in signal context.
     fn handle_window_fault(&self, page: Address) -> bool {
         if !self.window_active() || !self.in_span(page) {
             return false;
         }
-        loop {
-            match self.page_state(page) {
-                STATE_STAGED => break,
-                STATE_PENDING => std::hint::spin_loop(),
-                // Zero-fill: bpf handles in-kernel (we never get here);
-                // uffd must install a zero page.
-                _ => break,
+        WINDOW_FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.page_state(page) == STATE_PENDING {
+            let idx = self.region_index(page);
+            // Drive the region's staging: claims+stages it ourselves, or
+            // no-ops if another thread (GC worker or mutator) already claimed
+            // it — in which case we wait below, bounded by ONE region's
+            // staging time, not the whole sweep.
+            if let Some(steal) = STEAL.get() {
+                steal.stage(idx);
+            }
+            let mut spins: u64 = 0;
+            while self.page_state(page) == STATE_PENDING {
+                spins += 1;
+                unsafe { libc::sched_yield(); }
+            }
+            if spins > 0 {
+                WINDOW_SPIN.fetch_add(spins, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        // Now STAGED (installed in-kernel on retry for bpf) or ZERO_FILL.
+        // For bpf the stage's install already materialized the page; for
+        // uffd we install here (idempotent: EEXIST tolerated).
         if self.backend == CompactFaultsBackend::Uffd {
             match self.page_state(page) {
                 STATE_STAGED => uffd_copy(self.uffd, page, self.alias_of(page), BYTES_IN_PAGE),
@@ -329,7 +458,8 @@ impl CompactFaults {
             CompactFaultsBackend::Bpf => {
                 let r = self.shim.as_ref().unwrap().unregister(start, bytes);
                 assert_eq!(r, 0, "gcb0_unregister({}, {}) failed", start, bytes);
-                self.registered.lock().unwrap().remove(&start);
+                self.registered[self.region_index(start)]
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             CompactFaultsBackend::Uffd => {}
             CompactFaultsBackend::None => unreachable!(),

@@ -258,6 +258,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         use crate::util::compact_faults::BYTES_IN_PAGE;
         let cf = crate::util::compact_faults::compact_faults().unwrap();
         let region_bytes = forwarding::CompressorRegion::BYTES;
+        // Mark all regions non-claimable (DONE); each live region is marked
+        // claimable (UNSTAGED) below.  This is the steal-mode coordination.
+        cf.reset_region_staging();
         self.pr.with_regions(&mut |regions| {
             // Coalesce contiguous regions into single mremap+register calls:
             // per-region flips churn VMAs (split per region) and dominate
@@ -286,6 +289,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 if aligned_to > start {
                     cf.set_pending(start, aligned_to - start);
                 }
+                // Mark this region claimable (steal-mode) with its cursor.
+                cf.mark_region_live(start, aligned_to);
                 match runs.last_mut() {
                     Some(last) if last.0 + last.1 == start => last.1 += region_bytes,
                     _ => runs.push((start, region_bytes)),
@@ -303,62 +308,76 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// mark pages staged, install them, clear any leftover pending state,
     /// and finish (uffd unregister).  Runs in the Concurrent bucket while
     /// mutators execute; the cursor was preset in the pause.
-    pub fn stage_region(&self, worker: &mut GCWorker<VM>, index: usize) {
+    /// Stage one region (address-indexed) during the concurrent window:
+    /// claim it (CAS, so exactly one of {GC sweeper, faulting mutator}
+    /// stages each region), slide-compact in the arena, install, then mark
+    /// it done and decrement the window counter (closing the window on the
+    /// last region).  Lock-free: bounds come from the flip-time precomputed
+    /// `region_cursor`, so this is safe to call from a mutator SIGBUS
+    /// handler.  No-op if the region is already claimed/done.
+    pub fn stage_region_idx(&self, tls: crate::util::VMWorkerThread, aidx: usize) {
         use crate::util::compact_faults::BYTES_IN_PAGE;
         let cf = crate::util::compact_faults::compact_faults().unwrap();
-        let region_bytes = forwarding::CompressorRegion::BYTES;
-        self.pr.with_regions(&mut |regions| {
-            let r = &regions[index];
-            let start = r.region.start();
-            let end = r.cursor(); // preset, page-aligned post-compact cursor
-            let delta = cf.alias_delta();
-            let shift = |o: ObjectReference| -> ObjectReference {
-                unsafe {
-                    ObjectReference::from_raw_address_unchecked(Address::from_usize(
-                        (o.to_raw_address().as_usize() as isize + delta) as usize,
-                    ))
-                }
-            };
-            #[cfg(feature = "vo_bit")]
-            crate::util::metadata::vo_bit::bzero_vo_bit(start, region_bytes);
-            let mut to = start;
-            // Scan the whole region's mark bitmap: `end` is the preset
-            // cursor (post-compact), but marked objects live anywhere in
-            // the pre-compact region.
-            self.forwarding
-                .scan_marked_objects(start, start + region_bytes, &mut |obj: ObjectReference| {
-                    let alias_obj = shift(obj);
-                    let copied_size = VM::VMObjectModel::get_size_when_copied(alias_obj);
-                    let new_object = self.forward(obj, false);
-                    let alias_new = shift(new_object);
-                    VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
-                    #[cfg(feature = "vo_bit")]
-                    vo_bit::set_vo_bit(new_object);
-                    to = new_object.to_object_start::<VM>() + copied_size;
-                    self.update_references(worker, alias_new);
-                });
-            let staged_end = to.align_up(BYTES_IN_PAGE);
-            assert!(
-                staged_end <= end || end == start,
-                "stage_region: staged_end {} exceeds preset cursor {} (region {})",
-                staged_end,
-                end,
-                start
-            );
-            // The cursor stays at its conservative pause-time preset for
-            // this cycle; the next GC's flip re-reads it.  (Resetting it
-            // back to `to` here would race with window-time allocation.)
-            if staged_end > start {
-                cf.stage(start, staged_end - start);
-                cf.install(start, staged_end - start);
+        if !cf.claim_region(aidx) {
+            return; // another thread is staging or has staged this region
+        }
+        let region_bytes = cf.region_bytes();
+        let (start, end) = cf.region_bounds(aidx);
+        let delta = cf.alias_delta();
+        let shift = |o: ObjectReference| -> ObjectReference {
+            unsafe {
+                ObjectReference::from_raw_address_unchecked(Address::from_usize(
+                    (o.to_raw_address().as_usize() as isize + delta) as usize,
+                ))
             }
-            // Clear any pending pages we predicted but did not stage, so
-            // no mutator spins forever on them.
-            if staged_end < start + region_bytes {
-                cf.reset_region_state(staged_end, start + region_bytes - staged_end);
-            }
-            cf.finish_region(start, region_bytes);
-        });
+        };
+        #[cfg(feature = "vo_bit")]
+        crate::util::metadata::vo_bit::bzero_vo_bit(start, region_bytes);
+        let mut to = start;
+        self.forwarding
+            .scan_marked_objects(start, start + region_bytes, &mut |obj: ObjectReference| {
+                let alias_obj = shift(obj);
+                let copied_size = VM::VMObjectModel::get_size_when_copied(alias_obj);
+                let new_object = self.forward(obj, false);
+                let alias_new = shift(new_object);
+                VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
+                #[cfg(feature = "vo_bit")]
+                vo_bit::set_vo_bit(new_object);
+                to = new_object.to_object_start::<VM>() + copied_size;
+                self.update_references(tls, alias_new);
+            });
+        let staged_end = to.align_up(BYTES_IN_PAGE);
+        assert!(
+            staged_end <= end || end == start,
+            "stage_region: staged_end {} exceeds preset cursor {} (region {})",
+            staged_end,
+            end,
+            start
+        );
+        if staged_end > start {
+            cf.stage(start, staged_end - start);
+            cf.install(start, staged_end - start);
+        }
+        // Clear any pending pages we predicted but did not stage, so no
+        // mutator waits forever on them.
+        if staged_end < start + region_bytes {
+            cf.reset_region_state(staged_end, start + region_bytes - staged_end);
+        }
+        cf.finish_region(start, region_bytes);
+        cf.mark_region_done(aidx);
+        if cf.region_done() {
+            self.close_window();
+        }
+    }
+
+    /// Sweep all regions, staging each unclaimed one.  Several of these run
+    /// in parallel on GC workers during the window; faulting mutators steal
+    /// individual regions.  The claim CAS coordinates them.
+    pub fn stage_sweep(&self, tls: crate::util::VMWorkerThread) {
+        let cf = crate::util::compact_faults::compact_faults().unwrap();
+        for aidx in 0..cf.region_count() {
+            self.stage_region_idx(tls, aidx);
+        }
     }
 
     pub fn release(&self) {
@@ -471,15 +490,15 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         ObjectReference::from_raw_address(self.forwarding.forward(object.to_raw_address())).unwrap()
     }
 
-    fn update_references(&self, worker: &mut GCWorker<VM>, object: ObjectReference) {
-        if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
-            VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
+    fn update_references(&self, tls: crate::util::VMWorkerThread, object: ObjectReference) {
+        if VM::VMScanning::support_slot_enqueuing(tls, object) {
+            VM::VMScanning::scan_object(tls, object, &mut |s: VM::VMSlot| {
                 if let Some(o) = s.load() {
                     s.store(self.forward(o, false));
                 }
             });
         } else {
-            VM::VMScanning::scan_object_and_trace_edges(worker.tls, object, &mut |o| {
+            VM::VMScanning::scan_object_and_trace_edges(tls, object, &mut |o| {
                 self.forward(o, false)
             });
         }
@@ -494,8 +513,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     /// Stage tasks for the concurrent window (Concurrent bucket).
     pub fn add_stage_tasks(&'static self) {
+        // Several parallel sweepers; each claims unclaimed regions (the CAS
+        // coordinates them and any faulting mutators that steal regions).
+        let n = self.scheduler.num_workers();
         let packets: Vec<Box<dyn GCWork<VM>>> =
-            self.generate_tasks(&mut |_, i| Box::new(StageRegion::<VM>::new(self, i)));
+            (0..n).map(|_| Box::new(StageSweep::<VM>::new(self)) as Box<dyn GCWork<VM>>).collect();
         self.scheduler.work_buckets[WorkBucketStage::Concurrent].bulk_add(packets);
     }
 
@@ -571,7 +593,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                             Address::from_usize((to.as_usize() as isize + delta) as usize)
                         }
                     );
-                    self.update_references(worker, alias_new);
+                    self.update_references(worker.tls, alias_new);
                 });
             if let Some(cf) = cf {
                 use crate::util::compact_faults::BYTES_IN_PAGE;
@@ -591,7 +613,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         // Update references from the LOS to Compressor too.
         los.enumerate_to_space_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
             &mut |o: ObjectReference| {
-                self.update_references(worker, o);
+                self.update_references(worker.tls, o);
             },
         ));
     }
@@ -625,28 +647,41 @@ impl<VM: VMBinding> CalculateOffsetVector<VM> {
     }
 }
 
-/// Stage + install one region during the concurrent window.
-pub struct StageRegion<VM: VMBinding> {
+/// A parallel sweeper for the concurrent window: stages every region it can
+/// claim (window close + per-region done accounting live in
+/// `stage_region_idx`).
+pub struct StageSweep<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
-    index: usize,
 }
 
-impl<VM: VMBinding> GCWork<VM> for StageRegion<VM> {
+impl<VM: VMBinding> GCWork<VM> for StageSweep<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.compressor_space.stage_region(worker, self.index);
-        let cf = crate::util::compact_faults::compact_faults().unwrap();
-        if cf.region_done() {
-            self.compressor_space.close_window();
-        }
+        self.compressor_space.stage_sweep(worker.tls);
     }
 }
 
-impl<VM: VMBinding> StageRegion<VM> {
-    pub fn new(compressor_space: &'static CompressorSpace<VM>, index: usize) -> Self {
-        Self {
-            compressor_space,
-            index,
-        }
+impl<VM: VMBinding> StageSweep<VM> {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
+        Self { compressor_space }
+    }
+}
+
+/// Steal handler: lets a faulting mutator stage the region it faulted on.
+struct CompressorSteal<VM: VMBinding>(&'static CompressorSpace<VM>);
+
+impl<VM: VMBinding> crate::util::compact_faults::StealHandler for CompressorSteal<VM> {
+    fn stage(&self, region_index: usize) {
+        // HotSpot's scan_object ignores the worker tls, so a mutator may
+        // stage with an uninitialized one.
+        let tls = crate::util::VMWorkerThread(crate::util::VMThread::UNINITIALIZED);
+        self.0.stage_region_idx(tls, region_index);
+    }
+}
+
+impl<VM: VMBinding> CompressorSpace<VM> {
+    /// Register this space's steal handler (idempotent).
+    pub fn register_steal(&'static self) {
+        crate::util::compact_faults::register_steal_handler(Box::new(CompressorSteal(self)));
     }
 }
 

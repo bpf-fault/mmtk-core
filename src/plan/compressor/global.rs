@@ -116,6 +116,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
                 &self.compressor_space,
                 |space: &'static CompressorSpace<VM>| {
+                    space.register_steal();
                     let regions = space.flip_all_and_preset();
                     if regions > 0 {
                         crate::util::compact_faults::compact_faults()

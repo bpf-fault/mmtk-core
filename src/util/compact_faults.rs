@@ -316,22 +316,22 @@ impl CompactFaults {
     /// uninstalled (beyond-cursor) page would SIGBUS instead of zero-fill.
     /// bpf needs nothing: state-0 pages zero-fill in the handler.
     pub fn finish_region(&self, start: Address, bytes: usize) {
-        // BISECT: arena munmap disabled (suspected interaction with
-        // inherited fault contexts on the moved-to VMAs).
-        if false {
-            match self.backend {
-                CompactFaultsBackend::Bpf => {
-                    let r = self.shim.as_ref().unwrap().unmap_arena(start, bytes);
-                    debug_assert_eq!(r, 0);
-                }
-                CompactFaultsBackend::Uffd => {
-                    let slot = self.alias_of(start);
-                    unsafe {
-                        libc::munmap(slot.to_mut_ptr::<libc::c_void>(), bytes);
-                    }
-                }
-                CompactFaultsBackend::None => unreachable!(),
-            }
+        // Release the arena slot's pages NOW, concurrently with mutators:
+        // otherwise the next pause's mremap(MREMAP_FIXED) pays the whole
+        // teardown (rmap removal, memcg uncharge, freeing) synchronously —
+        // measured at ~60ms for a ~540MB live heap, dwarfing the actual
+        // page-table moves (~4ms).  MADV_DONTNEED keeps the VMA (munmap of
+        // these VMAs caused crashes — under investigation).
+        {
+            let slot = self.alias_of(start);
+            let r = unsafe {
+                libc::madvise(
+                    slot.to_mut_ptr::<libc::c_void>(),
+                    bytes,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            debug_assert_eq!(r, 0);
         }
         if self.backend == CompactFaultsBackend::Uffd {
             let mut range = UffdioRange {

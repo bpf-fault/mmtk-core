@@ -316,12 +316,30 @@ impl CompactFaults {
     /// uninstalled (beyond-cursor) page would SIGBUS instead of zero-fill.
     /// bpf needs nothing: state-0 pages zero-fill in the handler.
     pub fn finish_region(&self, start: Address, bytes: usize) {
-        // Release the arena slot's pages NOW, concurrently with mutators:
-        // otherwise the next pause's mremap(MREMAP_FIXED) pays the whole
-        // teardown (rmap removal, memcg uncharge, freeing) synchronously —
-        // measured at ~60ms for a ~540MB live heap, dwarfing the actual
-        // page-table moves (~4ms).  MADV_DONTNEED keeps the VMA (munmap of
-        // these VMAs caused crashes — under investigation).
+        // The region is fully installed.  Unregister it FIRST: while the
+        // region stays armed, any later fault on it (kernel reclaim of an
+        // installed page, then re-access; or a stray access) re-enters the
+        // missing handler, which reads the about-to-be-released arena slot
+        // and delivers SIGBUS.  After unregister the heap range is a normal
+        // anonymous mapping; installed pages stay present, the next flip
+        // re-registers.  (Minimal repro: micro/test_flip_unmap.c — armed
+        // region + released arena = SIGBUS; unregister-first = PASS.)
+        match self.backend {
+            CompactFaultsBackend::Bpf => {
+                let r = self.shim.as_ref().unwrap().unregister(start, bytes);
+                assert_eq!(r, 0, "gcb0_unregister({}, {}) failed", start, bytes);
+                self.registered.lock().unwrap().remove(&start);
+            }
+            CompactFaultsBackend::Uffd => {}
+            CompactFaultsBackend::None => unreachable!(),
+        }
+        // Now release the arena slot's pages, concurrently with mutators, so
+        // the next pause's mremap(MREMAP_FIXED) does not pay the teardown
+        // (rmap removal, memcg uncharge, freeing — ~60ms for a ~540MB live
+        // heap, vs ~4ms of actual page-table moves).  MADV_DONTNEED, not
+        // munmap: munmapping the slot concurrently races a use of the same
+        // arena address by HotSpot's resume-time DerivedPointerTable update
+        // (a UAF crash); DONTNEED keeps the VMA, freeing only the pages.
         {
             let slot = self.alias_of(start);
             let r = unsafe {

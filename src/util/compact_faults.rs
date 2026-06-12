@@ -166,14 +166,15 @@ impl CompactFaults {
         match self.backend {
             CompactFaultsBackend::Bpf => {
                 let shim = self.shim.as_ref().unwrap();
-                // Note: the flip's mremap cost is dominated by PTE-level
-                // page-table moves — registration both splits heap VMAs at
-                // region granularity (defeating 2MiB PMD-table moves
-                // permanently) and arms the VMAs (uffd-style marker
-                // preservation forces per-PTE moves).  Unregister-first was
-                // measured and does not help (fragmentation persists).
-                // Kernel fixes are required and are highlighted in the
-                // paper notes; see docs/class-b-design.md in gc-bpf-fault.
+                // The flip is fast (~1.3ms mremap + ~0.13ms register for a
+                // ~540MB live heap, measured): bpf_fault registration does
+                // NOT fragment the VMA (it stays a single VMA, so 2MiB PMD
+                // moves apply), and a full-range MADV_DONTNEED'd arena slot
+                // has empty page tables (pmd_none holds), so move_normal_pmd
+                // succeeds.  No kernel change needed — the earlier ~60ms was
+                // mremap(MREMAP_FIXED) tearing down the previous cycle's
+                // arena pages synchronously, now released concurrently in
+                // finish_region.
                 let r = shim.flip(start, bytes, false);
                 assert_eq!(r, 0, "gcb0_flip({}, {}) failed", start, bytes);
                 let mut reg = self.registered.lock().unwrap();

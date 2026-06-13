@@ -100,6 +100,10 @@ define_side_metadata_specs!(
     COMPRESSOR_MARK = (global: false, log_num_of_bits: 0, log_bytes_in_region: LOG_BYTES_IN_WORD as usize),
     // Block offset vectors by Compressor
     COMPRESSOR_OFFSET_VECTOR = (global: false, log_num_of_bits: LOG_BITS_IN_ADDRESS, log_bytes_in_region: crate::policy::compressor::forwarding::Block::LOG_BYTES),
+    // Reference bitmap by Compressor (Class B v2 in-kernel fixup): 1 bit per
+    // word marking which heap words are reference slots, for the eBPF
+    // missing-fault handler to forward without object-layout knowledge.
+    COMPRESSOR_REFBITS = (global: false, log_num_of_bits: 0, log_bytes_in_region: LOG_BYTES_IN_WORD as usize),
 );
 
 #[cfg(test)]

@@ -142,6 +142,27 @@ pub trait Slot: Copy + Send + Debug + PartialEq + Eq + Hash {
     fn prefetch_store(&self) {
         // no-op by default
     }
+
+    /// The in-memory address of this slot, if it is a plain word-sized slot
+    /// holding a raw (untagged, uncompressed) reference.  Returns `None` for
+    /// slots that do not have a simple linear address (e.g. compressed or
+    /// tagged references).  Used by the Compressor's Class B v2 reference
+    /// bitmap, which records reference-slot word addresses for the in-kernel
+    /// fixup handler.
+    fn slot_address(&self) -> Option<Address> {
+        None
+    }
+
+    /// Reconstruct a slot from its in-memory address.  Inverse of
+    /// [`Self::slot_address`].  Returns `None` if this slot type cannot be
+    /// rebuilt from an address alone.  Used by the Class B v2 deferred-forward
+    /// path to reload a reference slot at its staging-arena alias address.
+    fn from_address(_addr: Address) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// A simple slot implementation that represents a word-sized slot which holds the raw address of
@@ -183,6 +204,14 @@ impl Slot for SimpleSlot {
 
     fn store(&self, object: ObjectReference) {
         unsafe { (*self.slot_addr).store(object.to_raw_address(), atomic::Ordering::Relaxed) }
+    }
+
+    fn slot_address(&self) -> Option<Address> {
+        Some(unsafe { Address::from_mut_ptr(self.slot_addr) })
+    }
+
+    fn from_address(addr: Address) -> Option<Self> {
+        Some(SimpleSlot::from_address(addr))
     }
 }
 

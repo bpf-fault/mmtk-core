@@ -79,6 +79,18 @@ pub fn defer_forward() -> bool {
     DEFER_FORWARD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// R1: full in-kernel compaction.  The eBPF handler builds each to-space page
+/// from UN-SLID from-space (no userspace slide-compact); the GC only flips and
+/// emits metadata (live-word bitmap, per-page first-source index, reference
+/// bitmap at OLD positions, forward table).  MMTK_COMPACT_INKERNEL.
+static INKERNEL_COMPACT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether full in-kernel compaction (R1) is active.
+pub fn inkernel_compact() -> bool {
+    INKERNEL_COMPACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Compressed-oops base/shift, set by the VM binding so the in-kernel (bpf)
 /// fixup handler can decode/encode narrow references.
 static COOPS_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -110,6 +122,12 @@ pub(crate) fn init_compact_faults(
     }
     if std::env::var_os("MMTK_COMPACT_DEFER_FORWARD").is_some() {
         DEFER_FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_COMPACT_INKERNEL").is_some() {
+        // In-kernel compaction implies deferred forwarding (the handler does
+        // both the compaction copy and the reference forwarding).
+        DEFER_FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
+        INKERNEL_COMPACT.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let span = end - start;
     assert!(
@@ -157,6 +175,10 @@ pub(crate) struct CompactFaults {
     /// there for free); the in-kernel handler does a single direct lookup
     /// instead of an offset-vector transducer scan + side-metadata reads.
     fwdtable: *mut u32,
+    /// R1 metadata (in the bpf arena): live-word bitmap (1 bit/8-byte word, old
+    /// positions) and the per-to-space-page first-source word index.
+    livebits: *mut u8,
+    first_src: *mut u32,
 }
 
 unsafe impl Sync for CompactFaults {}
@@ -209,6 +231,8 @@ impl CompactFaults {
                 // directly).  The anonymous mmaps above are unused for Bpf.
                 let fwdtable = shim.fwdtable_base();
                 let refbitmap = shim.refbits_base();
+                let livebits = shim.livebits_base();
+                let first_src = shim.first_src_base();
                 assert!(
                     !fwdtable.is_null() && !refbitmap.is_null(),
                     "gcb0 arena bases failed"
@@ -232,6 +256,8 @@ impl CompactFaults {
                     shim: Some(shim),
                     refbitmap,
                     fwdtable,
+                    livebits,
+                    first_src,
                 }
             }
             CompactFaultsBackend::Uffd => {
@@ -280,6 +306,8 @@ impl CompactFaults {
                     shim: None,
                     refbitmap,
                     fwdtable,
+                    livebits: std::ptr::null_mut(),
+                    first_src: std::ptr::null_mut(),
                 }
             }
             CompactFaultsBackend::None => unreachable!(),
@@ -414,6 +442,53 @@ impl CompactFaults {
         Address::from_mut_ptr(self.fwdtable)
     }
 
+    /// (compacted words, probe_read failures) from the bpf R1 handler.
+    pub fn r1_stats(&self) -> (u64, u64) {
+        self.shim.as_ref().map(|s| s.r1_stats()).unwrap_or((0, 0))
+    }
+    pub fn r1_dbg(&self) {
+        if let Some(s) = self.shim.as_ref() { s.dbg_print(); }
+    }
+
+    /// R1: mark `old_addr` (a live object word, 8-byte aligned) live in the
+    /// live-word bitmap.
+    #[inline]
+    pub fn set_live_word(&self, old_addr: Address) {
+        let w = (old_addr.as_usize().wrapping_sub(self.space_base.as_usize())) >> 3;
+        if w >= self.span >> 3 {
+            return;
+        }
+        unsafe {
+            *self.livebits.add(w >> 3) |= 1u8 << (w & 7);
+        }
+    }
+
+    /// R1: record the from-space word index that maps to to-space `page`.
+    #[inline]
+    pub fn set_first_src(&self, page: usize, old_word: u32) {
+        if page < self.span >> LOG_BYTES_IN_PAGE {
+            unsafe {
+                *self.first_src.add(page) = old_word;
+            }
+        }
+    }
+
+    /// R1: for an object at old `old_start` forwarding to `new_start` and
+    /// `nwords` long, set `first_src` for every to-space page boundary its new
+    /// range crosses (the object is contiguous, so the source word for a new
+    /// word is `old_word0 + (new_word - new_word0)`).
+    #[inline]
+    pub fn record_first_src(&self, old_start: Address, new_start: Address, nwords: usize) {
+        const WPP: usize = BYTES_IN_PAGE / 8; // 512 to-space words / page
+        let new_w0 = (new_start.as_usize() - self.space_base.as_usize()) >> 3;
+        let old_w0 = (old_start.as_usize() - self.space_base.as_usize()) >> 3;
+        let mut pw = new_w0.div_ceil(WPP) * WPP;
+        while pw < new_w0 + nwords {
+            self.set_first_src(pw / WPP, (old_w0 + (pw - new_w0)) as u32);
+            pw += WPP;
+        }
+    }
+
     /// Flip a region: move its pages to the arena and register the emptied
     /// range for missing faults.
     pub fn flip(&self, start: Address, bytes: usize) {
@@ -509,6 +584,7 @@ impl CompactFaults {
                     COOPS_BASE.load(std::sync::atomic::Ordering::Relaxed),
                     COOPS_SHIFT.load(std::sync::atomic::Ordering::Relaxed),
                     defer_forward(),
+                    inkernel_compact(),
                 );
             }
         }
@@ -829,9 +905,10 @@ mod bpf_shim {
     type FlipFn = unsafe extern "C" fn(u64, u64, i32) -> i32;
     type RangeFn = unsafe extern "C" fn(u64, u64) -> i32;
     type StateFn = unsafe extern "C" fn() -> *mut u64;
-    type SetFwdFn = unsafe extern "C" fn(u64, u32, u32);
+    type SetFwdFn = unsafe extern "C" fn(u64, u32, u32, u32);
     type CountFn = unsafe extern "C" fn() -> u64;
     type BaseFn = unsafe extern "C" fn() -> u64;
+    type VoidFn = unsafe extern "C" fn();
 
     pub(super) struct Shim {
         init: InitFn,
@@ -844,6 +921,11 @@ mod bpf_shim {
         refs_forwarded: CountFn,
         fwdtable_base: BaseFn,
         refbits_base: BaseFn,
+        livebits_base: BaseFn,
+        first_src_base: BaseFn,
+        compact_words: CountFn,
+        prefail: CountFn,
+        dbg_print: VoidFn,
     }
 
     impl Shim {
@@ -871,16 +953,36 @@ mod bpf_shim {
                     refs_forwarded: std::mem::transmute(sym("gcb0_refs_forwarded")),
                     fwdtable_base: std::mem::transmute(sym("gcb0_fwdtable_base")),
                     refbits_base: std::mem::transmute(sym("gcb0_refbits_base")),
+                    livebits_base: std::mem::transmute(sym("gcb0_livebits_base")),
+                    first_src_base: std::mem::transmute(sym("gcb0_first_src_base")),
+                    compact_words: std::mem::transmute(sym("gcb0_compact_words")),
+                    prefail: std::mem::transmute(sym("gcb0_prefail")),
+                    dbg_print: std::mem::transmute(sym("gcb0_dbg_print")),
                 }
             }
         }
 
-        pub fn set_forward(&self, coops_base: usize, coops_shift: u32, defer: bool) {
-            unsafe { (self.set_forward)(coops_base as u64, coops_shift, defer as u32) }
+        pub fn set_forward(
+            &self,
+            coops_base: usize,
+            coops_shift: u32,
+            defer: bool,
+            inkernel: bool,
+        ) {
+            unsafe {
+                (self.set_forward)(coops_base as u64, coops_shift, defer as u32, inkernel as u32)
+            }
         }
 
         pub fn refs_forwarded(&self) -> u64 {
             unsafe { (self.refs_forwarded)() }
+        }
+
+        pub fn r1_stats(&self) -> (u64, u64) {
+            unsafe { ((self.compact_words)(), (self.prefail)()) }
+        }
+        pub fn dbg_print(&self) {
+            unsafe { (self.dbg_print)() }
         }
 
         /// Userspace base of the forward-table arena (the GC writes here).
@@ -891,6 +993,16 @@ mod bpf_shim {
         /// Userspace base of the reference bitmap (in the arena).
         pub fn refbits_base(&self) -> *mut u8 {
             unsafe { (self.refbits_base)() as *mut u8 }
+        }
+
+        /// Userspace base of the live-word bitmap (R1, in the arena).
+        pub fn livebits_base(&self) -> *mut u8 {
+            unsafe { (self.livebits_base)() as *mut u8 }
+        }
+
+        /// Userspace base of the per-page first-source index (R1, in the arena).
+        pub fn first_src_base(&self) -> *mut u32 {
+            unsafe { (self.first_src_base)() as *mut u32 }
         }
 
         pub fn init(&self, base: Address, span: usize) -> Address {

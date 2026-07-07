@@ -186,6 +186,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             None
         };
         let r1 = crate::util::compact_faults::inkernel_compact();
+        if r1 {
+            // Live bits are only ever OR'd in; clear this region's slice
+            // before re-recording, or stale bits from the previous cycle
+            // make the in-kernel build emit dead words.
+            if let Some(cf) = cf {
+                cf.clear_live_words(region.start(), region.end() - region.start());
+            }
+        }
         let mut obj_ostart = Address::ZERO;
         let mut obj_nstart = Address::ZERO;
         for block in RegionIterator::<Block>::new(first_block, last_block) {

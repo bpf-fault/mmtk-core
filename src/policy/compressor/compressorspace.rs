@@ -369,10 +369,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         );
         if staged_end > start {
             cf.stage(start, staged_end - start);
-            // R1 builds pages lazily in the fault handler; no eager install.
-            if !r1 {
-                cf.install(start, staged_end - start);
-            }
+            // R1 included: install (touch) each staged page now, driving the
+            // in-kernel build from un-slid from-space.  Install must complete
+            // before finish_region below — unregister routes later faults past
+            // the handler (kernel zero-fill), and the arena MADV_DONTNEED
+            // frees the from-space source the build reads.
+            cf.install(start, staged_end - start);
         }
         // Clear any pending pages we predicted but did not stage, so no
         // mutator waits forever on them.

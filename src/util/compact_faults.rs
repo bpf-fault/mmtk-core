@@ -463,6 +463,22 @@ impl CompactFaults {
         }
     }
 
+    /// R1: clear the live-word bitmap over old range [start, start+bytes).
+    /// Live bits are re-recorded every cycle in `calculate_offset_vector`;
+    /// without this, stale bits from the previous cycle make the in-kernel
+    /// build emit dead words.  `start`/`bytes` are region-granular (1 MiB),
+    /// so parallel per-region clears touch disjoint byte ranges.
+    pub fn clear_live_words(&self, start: Address, bytes: usize) {
+        if self.livebits.is_null() {
+            return;
+        }
+        let w0 = (start - self.space_base) >> 3;
+        let w1 = (start + bytes - self.space_base) >> 3;
+        unsafe {
+            std::ptr::write_bytes(self.livebits.add(w0 >> 3), 0, (w1 - w0) >> 3);
+        }
+    }
+
     /// R1: record the from-space word index that maps to to-space `page`.
     #[inline]
     pub fn set_first_src(&self, page: usize, old_word: u32) {

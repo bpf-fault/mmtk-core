@@ -200,6 +200,19 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 // Bulk set log bits so SATB barrier will be triggered on the existing objects.
                 self.common
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
+                // Page-COW SATB: write-protect the immix space so first
+                // writes snapshot their page in-kernel.  (LOS/immortal/
+                // nonmoving are not armed; FinalMark rescans them.)
+                if let Some(t) = crate::util::satb_pages::satb_pages() {
+                    use crate::util::heap::chunk_map::Chunk;
+                    use crate::util::linear_scan::Region;
+                    t.reset_cursor();
+                    t.clear_young();
+                    t.allow_drainer();
+                    for chunk in self.immix_space.chunk_map.all_chunks() {
+                        t.arm(chunk.start(), Chunk::BYTES);
+                    }
+                }
             }
             Pause::FinalMark => (),
         }
@@ -210,6 +223,11 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         match pause {
             Pause::InitialMark => (),
             Pause::Full | Pause::FinalMark => {
+                if pause == Pause::FinalMark {
+                    if let Some(t) = crate::util::satb_pages::satb_pages() {
+                        t.disarm_all();
+                    }
+                }
                 self.immix_space.release(
                     true,
                     // Bulk clear log bits so SATB barrier will not be triggered.
@@ -311,6 +329,13 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
 
 impl<VM: VMBinding> ConcurrentImmix<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        {
+            use crate::util::heap::layout::vm_layout::vm_layout;
+            crate::util::satb_pages::init_satb_pages(
+                vm_layout().heap_start,
+                vm_layout().heap_end,
+            );
+        }
         if *args.options.concurrent_immix_disable_concurrent_marking {
             warn!("Option 'concurrent_immix_disable_concurrent_marking' is set to true. Concurrent marking is disabled for ConcurrentImmix. This will make ConcurrentImmix behave exactly like full heap Immix.");
         }
@@ -377,10 +402,20 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
         scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<
             ConcurrentImmixGCWorkContext<UnsupportedProcessEdges<VM>>,
         >::new(self));
+        if crate::util::satb_pages::satb_pages_active() {
+            // Runs in the pause; spawns the drainer THREAD (see
+            // SatbDrainStart for why it must not be a re-enqueueing packet).
+            scheduler.work_buckets[WorkBucketStage::Unconstrained]
+                .add(super::gc_work::SatbDrainStart::<VM>::new());
+        }
     }
 
     fn schedule_concurrent_marking_final_pause(&'static self, scheduler: &GCWorkScheduler<VM>) {
         self.set_ref_closure_buckets_enabled(true);
+        if crate::util::satb_pages::satb_pages_active() {
+            scheduler.work_buckets[WorkBucketStage::Closure]
+                .add(super::gc_work::SatbFinalDrain::<VM>::new());
+        }
 
         // Skip root scanning in the final mark
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<

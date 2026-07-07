@@ -297,6 +297,12 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                         crate::policy::immix::block::Block::BYTES,
                     );
                 }
+                // Page-COW SATB: blocks acquired during marking are young
+                // (allocate-black); conservative snapshot candidates that
+                // point here are garbage and must not be traced.
+                if let Some(t) = crate::util::satb_pages::satb_pages() {
+                    t.mark_young_block(block.start());
+                }
                 // Set the hole-searching cursor to the start of this block.
                 self.line = Some(block.start_line());
                 true
@@ -327,6 +333,12 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                         block.start(),
                         crate::policy::immix::block::Block::BYTES,
                     );
+                }
+                // Page-COW SATB: blocks acquired during marking are young
+                // (allocate-black); conservative snapshot candidates that
+                // point here are garbage and must not be traced.
+                if let Some(t) = crate::util::satb_pages::satb_pages() {
+                    t.mark_young_block(block.start());
                 }
                 // Bulk clear stale line mark state
                 Line::MARK_TABLE

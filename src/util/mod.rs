@@ -21,6 +21,8 @@ pub mod conversions;
 pub mod copy;
 /// VM page-protection dirty tracking (write-barrier replacement).
 pub mod dirty_track;
+/// Page-COW SATB barrier for concurrent marking (MMTK_SATB_PAGES).
+pub mod satb_pages;
 /// Fault-driven Compressor compaction (Class B).
 pub mod compact_faults;
 /// Heap implementation, including page resource, mmapper, etc.

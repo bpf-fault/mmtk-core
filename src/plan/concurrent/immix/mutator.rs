@@ -40,7 +40,9 @@ pub fn concurrent_immix_mutator_release<VM: VMBinding>(
     immix_allocator.reset();
 
     // Deactivate SATB
-    if current_pause == Pause::Full || current_pause == Pause::FinalMark {
+    if (current_pause == Pause::Full || current_pause == Pause::FinalMark)
+        && !crate::util::satb_pages::satb_pages_active()
+    {
         debug!("Deactivate SATB barrier active for {:?}", mutator as *mut _);
         mutator
             .barrier
@@ -68,7 +70,9 @@ pub fn concurent_immix_mutator_prepare<VM: VMBinding>(
     immix_allocator.reset();
 
     // Activate SATB
-    if current_pause == Pause::InitialMark {
+    if current_pause == Pause::InitialMark
+        && !crate::util::satb_pages::satb_pages_active()
+    {
         debug!("Activate SATB barrier active for {:?}", mutator as *mut _);
         mutator
             .barrier
@@ -113,18 +117,26 @@ pub fn create_concurrent_immix_mutator<VM: VMBinding>(
 
     let builder = MutatorBuilder::new(mutator_tls, mmtk, config);
     let mut mutator = builder
-        .barrier(Box::new(SATBBarrier::new(BarrierSemanticsType::<VM>::new(
-            mmtk,
-            mutator_tls,
-        ))))
+        .barrier(if crate::util::satb_pages::satb_pages_active() {
+            // Page-COW SATB: no compiled barrier at all; snapshots are
+            // taken in-kernel at WP-fault time.
+            Box::new(crate::plan::barriers::NoBarrier)
+        } else {
+            Box::new(SATBBarrier::new(BarrierSemanticsType::<VM>::new(
+                mmtk,
+                mutator_tls,
+            )))
+        })
         .build();
 
     // Set barrier active, based on whether concurrent marking is in progress
-    mutator
-        .barrier
-        .downcast_mut::<BarrierType<VM>>()
-        .unwrap()
-        .set_weak_ref_barrier_enabled(immix.is_concurrent_marking_active());
+    if !crate::util::satb_pages::satb_pages_active() {
+        mutator
+            .barrier
+            .downcast_mut::<BarrierType<VM>>()
+            .unwrap()
+            .set_weak_ref_barrier_enabled(immix.is_concurrent_marking_active());
+    }
 
     mutator
 }

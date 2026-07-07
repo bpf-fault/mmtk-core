@@ -50,6 +50,11 @@ pub struct ZHeap {
     base: Address,
     span: usize,
     threshold: u8,
+    /// Sweep every Nth GC: clear_refs write-protects every PTE in the
+    /// process (soft-dirty tracking), so each sweep makes the hot set
+    /// refault once per page -- measured at ~20% throughput when
+    /// sweeping every GC.  N divides that cost.
+    every: u64,
     streak: Vec<AtomicU8>,
     compressed: Vec<AtomicU64>,
     registered: Mutex<HashSet<usize>>,
@@ -59,6 +64,11 @@ pub struct ZHeap {
     gcs: AtomicU64,
     pages_compressed: AtomicU64,
     pages_resident_saved: AtomicU64,
+    /// LOS object extents are immutable while live: cache them so the
+    /// end-of-gc enumeration never dereferences object headers (reading
+    /// the header faulted back exactly one compressed page per cold LOS
+    /// object per sweep -- the measured 16k-page thrash oscillation).
+    pub los_extents: Mutex<std::collections::HashMap<usize, usize>>,
 }
 
 unsafe impl Sync for ZHeap {}
@@ -80,6 +90,10 @@ pub fn init_zheap(start: Address, end: Address) {
         return;
     };
     let threshold: u8 = k.parse().unwrap_or(2);
+    let every: u64 = std::env::var("MMTK_ZHEAP_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     let span = end - start;
     unsafe {
         let path = std::ffi::CString::new(
@@ -90,18 +104,31 @@ pub fn init_zheap(start: Address, end: Address) {
         let h = libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
         assert!(!h.is_null(), "zheap: dlopen shim failed");
         let init: unsafe extern "C" fn(u64, u64, u64) -> i32 = sym("gcz_init");
-        // store sized at half the span: cold set beyond that stops compressing
+        // modest store: the point is net RSS reduction, not coverage
+        let store: usize = std::env::var("MMTK_ZHEAP_STORE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256)
+            << 20;
         assert_eq!(
-            init(start.as_usize() as u64, span as u64, (span / 2) as u64),
+            init(start.as_usize() as u64, span as u64, store as u64),
             0,
             "gcz_init failed"
         );
+        // selectivity: commit only pages compressing to <= this many bytes
+        let max_size: u64 = std::env::var("MMTK_ZHEAP_MAXSZ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+        let set_max: unsafe extern "C" fn(u64) = sym("gcz_set_max_size");
+        set_max(max_size);
     }
     let npages = span >> 12;
     let _ = ZHEAP.set(ZHeap {
         base: start,
         span,
         threshold,
+        every,
         streak: (0..npages).map(|_| AtomicU8::new(0)).collect(),
         compressed: (0..npages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
         registered: Mutex::new(HashSet::new()),
@@ -117,6 +144,7 @@ pub fn init_zheap(start: Address, end: Address) {
         gcs: AtomicU64::new(0),
         pages_compressed: AtomicU64::new(0),
         pages_resident_saved: AtomicU64::new(0),
+        los_extents: Mutex::new(std::collections::HashMap::new()),
     });
     ACTIVE.store(true, Ordering::Relaxed);
     eprintln!("[zheap] active: threshold={} span={}MB", threshold, span >> 20);
@@ -138,6 +166,9 @@ impl ZHeap {
     /// cold ones, then reset soft-dirty for the next window.
     pub fn sweep(&self, chunks: &[(Address, usize)]) {
         let gc = self.gcs.fetch_add(1, Ordering::Relaxed) + 1;
+        if gc % self.every != 0 {
+            return;
+        }
         let mut pm = self.pagemap.lock().unwrap();
         let mut newly = 0u64;
         let mut decompressed = 0u64;

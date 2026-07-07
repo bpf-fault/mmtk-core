@@ -241,6 +241,38 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         if let Some(z) = crate::util::zheap::zheap() {
             let mut chunks: Vec<(Address, usize)> = Vec::new();
             self.for_each_mature_chunk(|start, bytes| chunks.push((start, bytes)));
+            // LOS live-object page runs too: big long-lived arrays (the
+            // classic cold cache) live in the LOS, not the immix space.
+            {
+                use crate::util::object_enum::ClosureObjectEnumerator;
+                const PAGE: usize = crate::util::zheap::BYTES_IN_PAGE;
+                let mut runs: Vec<(Address, usize)> = Vec::new();
+                // Extent cache: get_current_size dereferences the header,
+                // which would fault back one compressed page per cold LOS
+                // object per sweep.  Extents are immutable while live.
+                let mut cache = z.los_extents.lock().unwrap();
+                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    let start = obj.to_object_start::<VM>();
+                    let size = *cache
+                        .entry(start.as_usize())
+                        .or_insert_with(|| VM::VMObjectModel::get_current_size(obj));
+                    let s = start.align_down(PAGE);
+                    let e = (start + size).align_up(PAGE);
+                    runs.push((s, e - s));
+                });
+                self.gen.common.los.enumerate_objects(&mut en);
+                drop(cache);
+                runs.sort_unstable_by_key(|r| r.0);
+                for (s, b) in runs {
+                    match chunks.last_mut() {
+                        Some(l) if s <= l.0 + l.1 && s >= l.0 => {
+                            let e = std::cmp::max(l.0 + l.1, s + b);
+                            l.1 = e - l.0;
+                        }
+                        _ => chunks.push((s, b)),
+                    }
+                }
+            }
             z.sweep(&chunks);
         }
         if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {

@@ -381,13 +381,25 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             start
         );
         if staged_end > start {
-            cf.stage(start, staged_end - start);
-            // R1 included: install (touch) each staged page now, driving the
-            // in-kernel build from un-slid from-space.  Install must complete
-            // before finish_region below — unregister routes later faults past
-            // the handler (kernel zero-fill), and the arena MADV_DONTNEED
-            // frees the from-space source the build reads.
-            cf.install(start, staged_end - start);
+            if crate::util::compact_faults::install_mremap_enabled() {
+                // Move the staged arena pages back over the heap prefix in
+                // one mremap (the inverse of the flip).  Pages stayed
+                // PENDING throughout staging, so none was handler-
+                // materialized (and possibly mutated) before the move;
+                // clearing the state afterwards releases SIGBUS waiters,
+                // whose retried access hits the now-present pages.
+                cf.install_move(start, staged_end - start);
+                cf.reset_region_state(start, staged_end - start);
+            } else {
+                cf.stage(start, staged_end - start);
+                // R1 included: install (touch) each staged page now, driving
+                // the in-kernel build from un-slid from-space.  Install must
+                // complete before finish_region below — unregister routes
+                // later faults past the handler (kernel zero-fill), and the
+                // arena MADV_DONTNEED frees the from-space source the build
+                // reads.
+                cf.install(start, staged_end - start);
+            }
         }
         // Clear any pending pages we predicted but did not stage, so no
         // mutator waits forever on them.

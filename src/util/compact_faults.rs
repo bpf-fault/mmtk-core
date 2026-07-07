@@ -86,6 +86,22 @@ static FORCE_REFBITS: std::sync::atomic::AtomicBool =
 pub fn record_refbits() -> bool {
     defer_forward() || FORCE_REFBITS.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// MMTK_INSTALL_MREMAP: install a staged region by mremap'ing the arena
+/// slot back over the heap range (the inverse of the flip; one syscall per
+/// region) instead of fault-touching every page.  Micro: install 43ms ->
+/// 0.02ms per 64MiB, no VMA fragmentation, works while armed.  Only valid
+/// when references were forwarded at stage time (B.1): with defer, the
+/// arena holds UN-forwarded references.
+static INSTALL_MREMAP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the mremap install path is active (B.1 semantics only).
+pub fn install_mremap_enabled() -> bool {
+    INSTALL_MREMAP.load(std::sync::atomic::Ordering::Relaxed)
+        && !defer_forward()
+        && !inkernel_compact()
+}
 /// Class B v2: defer reference forwarding from staging to install time,
 /// driven by the reference bitmap (MMTK_COMPACT_DEFER_FORWARD).
 static DEFER_FORWARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -144,6 +160,9 @@ pub(crate) fn init_compact_faults(
     }
     if std::env::var_os("MMTK_FORCE_REFBITS").is_some() {
         FORCE_REFBITS.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_INSTALL_MREMAP").is_some() {
+        INSTALL_MREMAP.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var_os("MMTK_COMPACT_INKERNEL").is_some() {
         // In-kernel compaction implies deferred forwarding (the handler does
@@ -724,6 +743,51 @@ impl CompactFaults {
             }
             CompactFaultsBackend::None => unreachable!(),
         }
+    }
+
+    /// Install a staged prefix by MOVING the arena pages back over the heap
+    /// range: one mremap per region instead of one fault per page (~2000x
+    /// cheaper install, micro-validated; works while the range is armed, no
+    /// VMA fragmentation).  The pages must hold FINAL contents (references
+    /// forwarded at stage time — B.1 semantics), and the range must still be
+    /// PENDING so no page was handler-materialized (and possibly mutated)
+    /// before the move replaces it; the caller clears the state afterwards
+    /// to release SIGBUS waiters, whose retry then hits present pages.
+    pub fn install_move(&self, start: Address, bytes: usize) {
+        let src = self.alias_of(start);
+        let r = unsafe {
+            libc::mremap(
+                src.to_mut_ptr::<libc::c_void>(),
+                bytes,
+                bytes,
+                libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                start.to_mut_ptr::<libc::c_void>(),
+            )
+        };
+        assert!(
+            r as usize == start.as_usize(),
+            "install_move mremap({} -> {}, {}) failed",
+            src,
+            start,
+            bytes
+        );
+        // The move leaves a hole at the arena slot.  Restore an empty
+        // mapping there: HotSpot transiently dereferences arena addresses
+        // around mutator resume (the DerivedPointerTable finding — a hole
+        // would SEGV where MADV_DONTNEED semantics were safe), and the
+        // next flip wants a destination VMA.  Fresh anonymous mappings
+        // merge back with the neighbouring arena VMAs.
+        let m = unsafe {
+            libc::mmap(
+                src.to_mut_ptr::<libc::c_void>(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert!(m != libc::MAP_FAILED, "install_move arena re-mmap failed");
     }
 
     /// Install one staged page via uffd.  When deferring forwarding (Class B

@@ -334,10 +334,17 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         };
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::bzero_vo_bit(start, region_bytes);
-        // Class B v2: clear last cycle's reference bits for this region before
-        // re-recording them.
-        cf.clear_ref_bits(start, region_bytes);
         let r1 = crate::util::compact_faults::inkernel_compact();
+        let defer = crate::util::compact_faults::defer_forward();
+        // The reference bitmap is only consumed by deferred forwarding
+        // (B v2 / R1).  In B.1 (staging-time forwarding) recording it is
+        // pure overhead — a per-reference-slot arena write on the hot path
+        // (~42M slots/GC on h2, measured 6x total slowdown) — so skip both
+        // the clear and the recording.
+        if defer {
+            // Clear last cycle's reference bits before re-recording them.
+            cf.clear_ref_bits(start, region_bytes);
+        }
         let mut to = start;
         self.forwarding
             .scan_marked_objects(start, start + region_bytes, &mut |obj: ObjectReference| {
@@ -356,7 +363,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 } else {
                     let alias_new = shift(new_object);
                     VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
-                    self.update_references_staged(tls, alias_new, cf, delta);
+                    if defer {
+                        self.update_references_staged(tls, alias_new, cf, delta);
+                    } else {
+                        self.update_references(tls, alias_new);
+                    }
                 }
             });
         let staged_end = to.align_up(BYTES_IN_PAGE);

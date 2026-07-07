@@ -70,6 +70,11 @@ static WINDOW_SPIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// Class B v2 reference bits set this cycle (telemetry/verification).
 pub(crate) static REFBITS_POPULATED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Count REFBITS_POPULATED only under MMTK_REFBITS_DEBUG: the counter is a
+/// globally contended atomic on the per-reference-slot hot path (~42M
+/// slots/GC on h2) and costs whole seconds per GC when always on.
+static REFBITS_DEBUG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Class B v2: defer reference forwarding from staging to install time,
 /// driven by the reference bitmap (MMTK_COMPACT_DEFER_FORWARD).
 static DEFER_FORWARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -122,6 +127,9 @@ pub(crate) fn init_compact_faults(
     }
     if std::env::var_os("MMTK_COMPACT_DEFER_FORWARD").is_some() {
         DEFER_FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_REFBITS_DEBUG").is_some() {
+        REFBITS_DEBUG.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var_os("MMTK_COMPACT_INKERNEL").is_some() {
         // In-kernel compaction implies deferred forwarding (the handler does
@@ -388,7 +396,9 @@ impl CompactFaults {
             let p = self.refbitmap.add(byte);
             *p |= 1u8 << bit;
         }
-        REFBITS_POPULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if REFBITS_DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
+            REFBITS_POPULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Read the reference bit for a to-space slot address (4-byte granularity).

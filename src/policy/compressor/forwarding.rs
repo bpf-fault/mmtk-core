@@ -186,10 +186,16 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             None
         };
         let r1 = crate::util::compact_faults::inkernel_compact();
-        if r1 {
+        let fill_table = crate::util::compact_faults::fill_fwd_table();
+        // The in-kernel transducer forward consumes the live bitmap + the
+        // per-block new-base table (ov2); R1 additionally needs first_src.
+        let emit_live = r1
+            || (crate::util::compact_faults::fwd_transducer()
+                && cf.map_or(false, |c| c.has_livebits()));
+        if emit_live {
             // Live bits are only ever OR'd in; clear this region's slice
             // before re-recording, or stale bits from the previous cycle
-            // make the in-kernel build emit dead words.
+            // make the in-kernel build/forward see dead words.
             if let Some(cf) = cf {
                 cf.clear_live_words(region.start(), region.end() - region.start());
             }
@@ -197,11 +203,15 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         let mut obj_ostart = Address::ZERO;
         let mut obj_nstart = Address::ZERO;
         for block in RegionIterator::<Block>::new(first_block, last_block) {
-            OFFSET_VECTOR_SPEC.store_atomic::<usize>(
-                block.start(),
-                state.encode(block.start()),
-                Ordering::Relaxed,
-            );
+            let encoded = state.encode(block.start());
+            OFFSET_VECTOR_SPEC.store_atomic::<usize>(block.start(), encoded, Ordering::Relaxed);
+            if emit_live {
+                if let Some(cf) = cf {
+                    // Post-compaction address of this block's first live
+                    // word (the encode value minus the in_object flag bit).
+                    cf.set_ov2(block.start(), encoded & !1);
+                }
+            }
             MARK_SPEC.scan_non_zero_values::<u8>(
                 block.start(),
                 block.end(),
@@ -215,10 +225,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     }
                     state.visit_mark_bit(addr);
                     if starting {
-                        if let Some(cf) = cf {
-                            cf.set_fwd(addr, state.to);
+                        if fill_table {
+                            if let Some(cf) = cf {
+                                cf.set_fwd(addr, state.to);
+                            }
                         }
-                    } else if r1 {
+                    } else if emit_live {
                         // end bit: object occupies old [obj_ostart, addr],
                         // i.e. words [obj_ostart..=addr]; new start obj_nstart.
                         if let Some(cf) = cf {
@@ -227,10 +239,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                                 cf.set_live_word(w);
                                 w += BYTES_IN_WORD;
                             }
-                            // first_src for to-space page boundaries the object's
-                            // new range crosses.
-                            let nwords = (addr - obj_ostart) / BYTES_IN_WORD + 1;
-                            cf.record_first_src(obj_ostart, obj_nstart, nwords);
+                            if r1 {
+                                // first_src for to-space page boundaries the
+                                // object's new range crosses.
+                                let nwords = (addr - obj_ostart) / BYTES_IN_WORD + 1;
+                                cf.record_first_src(obj_ostart, obj_nstart, nwords);
+                            }
                         }
                     }
                 },

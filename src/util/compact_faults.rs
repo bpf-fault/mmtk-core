@@ -96,6 +96,28 @@ pub fn record_refbits() -> bool {
 static INSTALL_MREMAP: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// MMTK_FWD_TRANSDUCER: in-kernel forwarding via per-block new-base (ov2) +
+/// live-bit popcount instead of the flat forward table (cache-resident
+/// working set; see gc_b0_ops.bpf.c forward_narrow).
+static FWD_TRANSDUCER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the in-kernel transducer forward is enabled (bpf backend).
+pub fn fwd_transducer() -> bool {
+    FWD_TRANSDUCER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// MMTK_FWD_CHECK: cross-check the transducer against the flat table.
+static FWD_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the flat forward table must still be filled: it is the forward
+/// source when the transducer is off, and the cross-check oracle when
+/// MMTK_FWD_CHECK is set.  With the transducer on and no check, skip the
+/// fill (it was ~6.3s/run of STW CalculateForwarding work on h2).
+pub fn fill_fwd_table() -> bool {
+    !fwd_transducer() || FWD_CHECK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the mremap install path is active (B.1 semantics only).
 pub fn install_mremap_enabled() -> bool {
     INSTALL_MREMAP.load(std::sync::atomic::Ordering::Relaxed)
@@ -164,6 +186,12 @@ pub(crate) fn init_compact_faults(
     if std::env::var_os("MMTK_INSTALL_MREMAP").is_some() {
         INSTALL_MREMAP.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    if std::env::var_os("MMTK_FWD_TRANSDUCER").is_some() {
+        FWD_TRANSDUCER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_FWD_CHECK").is_some() {
+        FWD_CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if std::env::var_os("MMTK_COMPACT_INKERNEL").is_some() {
         // In-kernel compaction implies deferred forwarding (the handler does
         // both the compaction copy and the reference forwarding).
@@ -220,6 +248,9 @@ pub(crate) struct CompactFaults {
     /// positions) and the per-to-space-page first-source word index.
     livebits: *mut u8,
     first_src: *mut u32,
+    /// Per-512B-block post-compaction base address (in the arena), consumed
+    /// by the in-kernel transducer forward together with the live bitmap.
+    ov2: *mut u64,
 }
 
 unsafe impl Sync for CompactFaults {}
@@ -274,6 +305,18 @@ impl CompactFaults {
                 let refbitmap = shim.refbits_base();
                 let livebits = shim.livebits_base();
                 let first_src = shim.first_src_base();
+                let ov2 = shim.ov2_base();
+                if FWD_TRANSDUCER.load(std::sync::atomic::Ordering::Relaxed) {
+                    shim.set_fwd_transducer(
+                        true,
+                        std::env::var_os("MMTK_FWD_CHECK").is_some(),
+                    );
+                }
+                if std::env::var_os("MMTK_R1_DEBUG").is_some()
+                    || std::env::var_os("MMTK_REFBITS_DEBUG").is_some()
+                {
+                    shim.set_count_refs(true);
+                }
                 assert!(
                     !fwdtable.is_null() && !refbitmap.is_null(),
                     "gcb0 arena bases failed"
@@ -299,6 +342,7 @@ impl CompactFaults {
                     fwdtable,
                     livebits,
                     first_src,
+                    ov2,
                 }
             }
             CompactFaultsBackend::Uffd => {
@@ -349,6 +393,7 @@ impl CompactFaults {
                     fwdtable,
                     livebits: std::ptr::null_mut(),
                     first_src: std::ptr::null_mut(),
+                    ov2: std::ptr::null_mut(),
                 }
             }
             CompactFaultsBackend::None => unreachable!(),
@@ -503,6 +548,27 @@ impl CompactFaults {
         }
         unsafe {
             *self.livebits.add(w >> 3) |= 1u8 << (w & 7);
+        }
+    }
+
+    /// Whether the arena live bitmap exists (bpf backend).
+    #[inline]
+    pub fn has_livebits(&self) -> bool {
+        !self.livebits.is_null()
+    }
+
+    /// Record the post-compaction base address of the 512B block starting at
+    /// `block_start` (consumed by the in-kernel transducer forward).
+    #[inline]
+    pub fn set_ov2(&self, block_start: Address, new_base: usize) {
+        if self.ov2.is_null() {
+            return;
+        }
+        let b = (block_start - self.space_base) >> 9;
+        if b < self.span >> 9 {
+            unsafe {
+                *self.ov2.add(b) = new_base as u64;
+            }
         }
     }
 
@@ -1010,6 +1076,8 @@ mod bpf_shim {
     type RangeFn = unsafe extern "C" fn(u64, u64) -> i32;
     type StateFn = unsafe extern "C" fn() -> *mut u64;
     type SetFwdFn = unsafe extern "C" fn(u64, u32, u32, u32);
+    type SetXducerFn = unsafe extern "C" fn(u32, u32);
+    type SetCountFn = unsafe extern "C" fn(u32);
     type CountFn = unsafe extern "C" fn() -> u64;
     type BaseFn = unsafe extern "C" fn() -> u64;
     type VoidFn = unsafe extern "C" fn();
@@ -1027,6 +1095,9 @@ mod bpf_shim {
         refbits_base: BaseFn,
         livebits_base: BaseFn,
         first_src_base: BaseFn,
+        ov2_base: BaseFn,
+        set_fwd_transducer: SetXducerFn,
+        set_count_refs: SetCountFn,
         compact_words: CountFn,
         prefail: CountFn,
         dbg_print: VoidFn,
@@ -1059,6 +1130,9 @@ mod bpf_shim {
                     refbits_base: std::mem::transmute(sym("gcb0_refbits_base")),
                     livebits_base: std::mem::transmute(sym("gcb0_livebits_base")),
                     first_src_base: std::mem::transmute(sym("gcb0_first_src_base")),
+                    ov2_base: std::mem::transmute(sym("gcb0_ov2_base")),
+                    set_fwd_transducer: std::mem::transmute(sym("gcb0_set_fwd_transducer")),
+                    set_count_refs: std::mem::transmute(sym("gcb0_set_count_refs")),
                     compact_words: std::mem::transmute(sym("gcb0_compact_words")),
                     prefail: std::mem::transmute(sym("gcb0_prefail")),
                     dbg_print: std::mem::transmute(sym("gcb0_dbg_print")),
@@ -1107,6 +1181,22 @@ mod bpf_shim {
         /// Userspace base of the per-page first-source index (R1, in the arena).
         pub fn first_src_base(&self) -> *mut u32 {
             unsafe { (self.first_src_base)() as *mut u32 }
+        }
+
+        /// Userspace base of the per-512B-block new-address table (arena).
+        pub fn ov2_base(&self) -> *mut u64 {
+            unsafe { (self.ov2_base)() as *mut u64 }
+        }
+
+        /// Enable the in-kernel transducer forward (+ flat-table cross-check).
+        pub fn set_fwd_transducer(&self, on: bool, check: bool) {
+            unsafe { (self.set_fwd_transducer)(on as u32, check as u32) }
+        }
+
+        /// Enable in-handler ref/word counters (debug only: the per-ref
+        /// contended atomic was the entire in-kernel defer tax).
+        pub fn set_count_refs(&self, on: bool) {
+            unsafe { (self.set_count_refs)(on as u32) }
         }
 
         pub fn init(&self, base: Address, span: usize) -> Address {

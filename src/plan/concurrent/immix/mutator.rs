@@ -41,7 +41,8 @@ pub fn concurrent_immix_mutator_release<VM: VMBinding>(
 
     // Deactivate SATB
     if (current_pause == Pause::Full || current_pause == Pause::FinalMark)
-        && !crate::util::satb_pages::satb_pages_active()
+        && (!crate::util::satb_pages::satb_pages_active()
+            || crate::util::satb_pages::satb_verify())
     {
         debug!("Deactivate SATB barrier active for {:?}", mutator as *mut _);
         mutator
@@ -71,7 +72,8 @@ pub fn concurent_immix_mutator_prepare<VM: VMBinding>(
 
     // Activate SATB
     if current_pause == Pause::InitialMark
-        && !crate::util::satb_pages::satb_pages_active()
+        && (!crate::util::satb_pages::satb_pages_active()
+            || crate::util::satb_pages::satb_verify())
     {
         debug!("Activate SATB barrier active for {:?}", mutator as *mut _);
         mutator
@@ -117,7 +119,8 @@ pub fn create_concurrent_immix_mutator<VM: VMBinding>(
 
     let builder = MutatorBuilder::new(mutator_tls, mmtk, config);
     let mut mutator = builder
-        .barrier(if crate::util::satb_pages::satb_pages_active() {
+        .barrier(if crate::util::satb_pages::satb_pages_active()
+            && !crate::util::satb_pages::satb_verify() {
             // Page-COW SATB: no compiled barrier at all; snapshots are
             // taken in-kernel at WP-fault time.
             Box::new(crate::plan::barriers::NoBarrier)
@@ -130,7 +133,9 @@ pub fn create_concurrent_immix_mutator<VM: VMBinding>(
         .build();
 
     // Set barrier active, based on whether concurrent marking is in progress
-    if !crate::util::satb_pages::satb_pages_active() {
+    if !crate::util::satb_pages::satb_pages_active()
+        || crate::util::satb_pages::satb_verify()
+    {
         mutator
             .barrier
             .downcast_mut::<BarrierType<VM>>()

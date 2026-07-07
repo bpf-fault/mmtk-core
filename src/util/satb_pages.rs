@@ -28,6 +28,18 @@ pub fn satb_pages_active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
+static VERIFY: AtomicBool = AtomicBool::new(false);
+
+/// MMTK_SATB_VERIFY: differential oracle — the compiled SATB barrier
+/// stays enabled (correct execution), while the page machinery arms,
+/// snapshots and extracts in parallel, CLASSIFYING its output at
+/// FinalMark instead of tracing: {valid+marked, valid+unmarked(=refs
+/// only pages would rescue), garbage}.  Pinpoints extractor defects
+/// without crash-roulette.
+pub fn satb_verify() -> bool {
+    VERIFY.load(Ordering::Relaxed)
+}
+
 pub(crate) fn satb_pages() -> Option<&'static SatbPages> {
     TRACKER.get()
 }
@@ -43,6 +55,9 @@ pub(crate) fn init_satb_pages(start: Address, end: Address) {
         .ok()
         .expect("satb pages initialized twice");
     ACTIVE.store(true, Ordering::Relaxed);
+    if std::env::var_os("MMTK_SATB_VERIFY").is_some() {
+        VERIFY.store(true, Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct SatbPages {
@@ -102,6 +117,9 @@ impl SatbPages {
         let flags = shim.flags();
         let snaps = shim.snapshots();
         assert!(!flags.is_null() && !snaps.is_null());
+        if std::env::var_os("MMTK_SATB_NOOP").is_some() {
+            shim.set_noop();
+        }
         SatbPages {
             base,
             span,
@@ -166,8 +184,64 @@ impl SatbPages {
                 assert_eq!(self.shim.register(start, bytes), 0, "gcsatb register");
             }
         }
-        assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on");
+        if std::env::var_os("MMTK_SATB_UFFD").is_some() {
+            self.uffd_arm(start, bytes);
+        } else if std::env::var_os("MMTK_SATB_NOWP").is_none() {
+            assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on");
+        }
         self.armed.lock().unwrap().push((start, bytes));
+    }
+
+    /// Mainline userfaultfd WP-async arming (MMTK_SATB_UFFD=1): the
+    /// SAME wrprotect + in-kernel async resolution flow as bpf-fault WP,
+    /// through battle-tested mainline code with zero bpf involvement.
+    /// Differential oracle for the kernel path: if ConcurrentImmix
+    /// corrupts under THIS arming too, the fault mechanism is exonerated
+    /// and the corruption is an upstream plan race exposed by fault
+    /// timing; if it is clean, the bug lives in the (small) diff between
+    /// the two kernel paths.
+    pub fn uffd_arm(&self, start: Address, bytes: usize) {
+        use std::sync::atomic::AtomicI32;
+        static UFFD: AtomicI32 = AtomicI32::new(-1);
+        let mut fd = UFFD.load(Ordering::Relaxed);
+        if fd < 0 {
+            unsafe {
+                // userfaultfd(O_CLOEXEC) + API handshake with WP_ASYNC
+                fd = libc::syscall(libc::SYS_userfaultfd, 0o2000000i32) as i32;
+                assert!(fd >= 0, "userfaultfd syscall failed");
+                #[repr(C)]
+                struct UffdioApi { api: u64, features: u64, ioctls: u64 }
+                let mut api = UffdioApi {
+                    api: 0xAA,                       // UFFD_API
+                    features: 1 << 15,               // UFFD_FEATURE_WP_ASYNC
+                    ioctls: 0,
+                };
+                let r = libc::ioctl(fd, 0xc018aa3f_u64 as _, &mut api); // UFFDIO_API
+                assert_eq!(r, 0, "UFFDIO_API failed");
+                UFFD.store(fd, Ordering::Relaxed);
+            }
+        }
+        unsafe {
+            #[repr(C)]
+            struct UffdioRange { start: u64, len: u64 }
+            #[repr(C)]
+            struct UffdioRegister { range: UffdioRange, mode: u64, ioctls: u64 }
+            let mut reg = UffdioRegister {
+                range: UffdioRange { start: start.as_usize() as u64, len: bytes as u64 },
+                mode: 1 << 1,                        // UFFDIO_REGISTER_MODE_WP
+                ioctls: 0,
+            };
+            let r = libc::ioctl(fd, 0xc020aa00_u64 as _, &mut reg); // UFFDIO_REGISTER
+            assert_eq!(r, 0, "UFFDIO_REGISTER failed");
+            #[repr(C)]
+            struct UffdioWriteprotect { range: UffdioRange, mode: u64 }
+            let mut wp = UffdioWriteprotect {
+                range: UffdioRange { start: start.as_usize() as u64, len: bytes as u64 },
+                mode: 1,                             // UFFDIO_WRITEPROTECT_MODE_WP
+            };
+            let r = libc::ioctl(fd, 0xc018aa06_u64 as _, &mut wp); // UFFDIO_WRITEPROTECT
+            assert_eq!(r, 0, "UFFDIO_WRITEPROTECT failed");
+        }
     }
 
     /// Arm an arbitrary page-aligned run (LOS object runs, immortal
@@ -206,7 +280,9 @@ impl SatbPages {
             c += 1;
         }
         self.snapshot_alloc_map_range(start, bytes);
-        assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on (run)");
+        if std::env::var_os("MMTK_SATB_NOWP").is_none() {
+            assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on (run)");
+        }
         self.armed.lock().unwrap().push((start, bytes));
     }
 
@@ -382,7 +458,13 @@ impl SatbPages {
     }
 
     /// Was `addr` an allocated object start at mark start (8-byte grain)?
+    /// Bounds-checked: extracted values can be wild (space descriptors
+    /// cover VA extents far beyond committed memory) — measured as an
+    /// out-of-bounds alloc_map read 5.5GB past the buffer.
     pub fn in_alloc_map(&self, addr: Address) -> bool {
+        if addr < self.base || addr >= self.base + self.span {
+            return false;
+        }
         let off = addr - self.base;
         let byte = off >> 6;          /* VO: 1 bit per 8 bytes */
         let bit = ((off >> 3) & 7) as u8;
@@ -453,6 +535,16 @@ mod shim {
     }
 
     impl Shim {
+        pub fn set_noop(&self) {
+            unsafe {
+                let cname = std::ffi::CString::new("gcsatb_set_noop").unwrap();
+                let p = libc::dlsym(libc::RTLD_DEFAULT as *mut libc::c_void, cname.as_ptr());
+                if !p.is_null() {
+                    let f: unsafe extern "C" fn(u32) = std::mem::transmute(p);
+                    f(1);
+                }
+            }
+        }
         pub fn load() -> Self {
             let path = std::env::var("MMTK_BPF_SHIM")
                 .unwrap_or_else(|_| "/mydata/gc-bpf-fault/shim/libgcbpf.so".to_string());

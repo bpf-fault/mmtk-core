@@ -199,6 +199,12 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     t.clear_young();
                     t.allow_drainer();
                     t.clear_alloc_map();
+                    // bisect gates
+                    let noarm = std::env::var_os("MMTK_SATB_NOARM").is_some();
+                    let no_los = std::env::var_os("MMTK_SATB_NOLOS").is_some();
+                    if noarm {
+                        // passive init only: no WP anywhere
+                    } else {
                     for chunk in self.immix_space.chunk_map.all_chunks() {
                         t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
                         t.arm(chunk.start(), Chunk::BYTES);
@@ -208,6 +214,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                         t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
                         t.arm(chunk.start(), Chunk::BYTES);
                     }
+                    if !no_los {
                     // LOS + immortal: arm live-object page runs.  Their
                     // overwritten slots were the measured retention gap
                     // (big arrays -- e.g. ConcurrentHashMap tables -- live
@@ -250,6 +257,8 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                         for (s, b) in coalesced {
                             t.arm_pages(s, b);
                         }
+                    }
+                    }
                     }
                 }
                 self.immix_space.prepare(

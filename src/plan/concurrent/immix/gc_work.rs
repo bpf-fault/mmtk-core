@@ -336,6 +336,59 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                 });
             }
         }
+        // VERIFY mode: classify instead of tracing — the compiled
+        // barrier is handling correctness; report the extractor's output
+        // quality (valid+marked / valid+unmarked / garbage samples).
+        if satb_pages::satb_verify() {
+            let (mut ok_marked, mut ok_unmarked, mut garbage) = (0u64, 0u64, 0u64);
+            let mut samples: Vec<String> = Vec::new();
+            for o in &nodes {
+                let a = o.to_raw_address();
+                let in_immix = plan.immix_space.address_in_space(a);
+                let valid = if in_immix {
+                    t.in_alloc_map(a)
+                } else {
+                    // non-immix: chunk-of-space check only
+                    true
+                };
+                if !valid {
+                    garbage += 1;
+                    if samples.len() < 8 {
+                        samples.push(format!("garbage {:?}", o));
+                    }
+                    continue;
+                }
+                #[cfg(feature = "vo_bit")]
+                if in_immix && !crate::util::metadata::vo_bit::is_vo_bit_set(*o) {
+                    garbage += 1;
+                    if samples.len() < 8 {
+                        samples.push(format!("no-vo {:?}", o));
+                    }
+                    continue;
+                }
+                // marked = the barrier/tracer already reached it
+                if plan.immix_space.is_marked(*o) {
+                    ok_marked += 1;
+                } else {
+                    ok_unmarked += 1;
+                    if samples.len() < 8 {
+                        samples.push(format!("unmarked {:?}", o));
+                    }
+                }
+            }
+            eprintln!(
+                "[satbverify] extracted={} marked={} unmarked={} garbage={}",
+                nodes.len(),
+                ok_marked,
+                ok_unmarked,
+                garbage
+            );
+            for s in samples {
+                eprintln!("[satbverify]   {}", s);
+            }
+            t.reset_cursor();
+            return;
+        }
         // Filter + trace: non-immix refs are genuine (kept spaces);
         // immix refs must be mark-start objects (snapshot membership) —
         // post-mark allocations are allocate-black already.

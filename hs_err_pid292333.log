@@ -1,0 +1,1018 @@
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  SIGSEGV (0xb) at pc=0x000074e0406a09be, pid=292333, tid=292342
+#
+# JRE version: OpenJDK Runtime Environment (21.0.9) (build 21.0.9-internal-adhoc.talzuss.openjdk-mmtk)
+# Java VM: OpenJDK 64-Bit Server VM (21.0.9-internal-adhoc.talzuss.openjdk-mmtk, mixed mode, sharing, tiered, compressed oops, compressed class ptrs, third-party gc, linux-amd64)
+# Problematic frame:
+# C  [libmmtk_openjdk.so+0x2a09be]  _$LT$mmtk..plan..concurrent..immix..gc_work..SatbFinalDrain$LT$VM$GT$$u20$as$u20$mmtk..scheduler..work..GCWork$LT$VM$GT$$GT$::do_work::h99199484dacfec84+0x59e
+#
+# Core dump will be written. Default location: Core dumps may be processed with "/usr/share/apport/apport -p%p -s%s -c%c -d%d -P%P -u%u -g%g -F%F -- %E" (or dumping to /mydata/mmtk-core/core.292333)
+#
+# If you would like to submit a bug report, please visit:
+#   https://bugreport.java.com/bugreport/crash.jsp
+#
+
+---------------  S U M M A R Y ------------
+
+Command Line: -XX:+UseThirdPartyHeap -Xms512m -Xmx512m /mydata/dacapo/dacapo-23.11/dacapo-23.11-MR2-chopin.jar luindex -n 3
+
+Host: AMD EPYC 7302P 16-Core Processor, 32 cores, 125G, Ubuntu 24.04.4 LTS
+Time: Tue Jul  7 12:23:32 2026 MDT elapsed time: 18.288814 seconds (0d 0h 0m 18s)
+
+---------------  T H R E A D  ---------------
+
+Current thread (0x000074e03c52ed60):  NamedThread "MMTk Collector Thread" [id=292342, stack(0x000068334c3ff000,0x000068334c4ff000) (1024K)]
+
+Stack: [0x000068334c3ff000,0x000068334c4ff000],  sp=0x000068334c4fd960,  free space=1018k
+Native frames: (J=compiled Java code, j=interpreted, Vv=VM code, C=native code)
+C  [libmmtk_openjdk.so+0x2a09be]  _$LT$mmtk..plan..concurrent..immix..gc_work..SatbFinalDrain$LT$VM$GT$$u20$as$u20$mmtk..scheduler..work..GCWork$LT$VM$GT$$GT$::do_work::h99199484dacfec84+0x59e
+
+siginfo: si_signo: 11 (SIGSEGV), si_code: 1 (SEGV_MAPERR), si_addr: 0x000074e1a047b8d8
+
+Registers:
+RAX=0x0000000058000000, RBX=0x00000000400a5750, RCX=0x000074e04047b8d8, RDX=0x0000683307000000
+RSP=0x000068334c4fd960, RBP=0x000074e040803308, RSI=0x00000000400a5910, RDI=0x0000683307000001
+R8 =0x7fffffffffffffff, R9 =0x0000000000000000, R10=0x000068334c4fda20, R11=0x000068334c4fda70
+R12=0x00000000400a5950, R13=0x000068334c4fda20, R14=0x00000000400a4ff0, R15=0x000068330737bb18
+RIP=0x000074e0406a09be, EFLAGS=0x0000000000010293, CSGSFS=0x002b000000000033, ERR=0x0000000000000004
+  TRAPNO=0x000000000000000e
+
+XMM[0]=0x1818181818181818 0x1818181818181818
+XMM[1]=0xffffffffffffffff 0xffffffffffffffff
+XMM[2]=0x07ffffff6210ffff 0xffff1d7eff3fff18
+XMM[3]=0x0000000000000000 0x00000000000000ff
+XMM[4]=0x0000000000000000 0x00006832e8000090
+XMM[5]=0x00000000403a5f28 0x0000000040079070
+XMM[6]=0x000000004007af00 0x0000000040bbd198
+XMM[7]=0x00000000400a02d0 0x00000000400771d0
+XMM[8]=0x00000000403a5f28 0x000000000000001e
+XMM[9]=0x0000000000000000 0x0000000000000000
+XMM[10]=0x3f3f3f3f3f3f3f3f 0x3f3f3f3f3f3f3f3f
+XMM[11]=0x9999999999999999 0x9999999999999999
+XMM[12]=0x2020202020202020 0x2020202020202020
+XMM[13]=0x0000000000000000 0x0000000000000000
+XMM[14]=0x0000000000000000 0x0000000000000000
+XMM[15]=0x0000000000000000 0x0000000000000000
+  MXCSR=0x00001fa2
+
+
+Register to memory mapping:
+
+RAX=
+[error occurred during error reporting (printing register info), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:444)]
+RBX=
+[error occurred during error reporting (printing register info, attempt 2), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:444)]
+RCX=
+[error occurred during error reporting (printing register info, attempt 3), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:444)]
+Top of Stack: (sp=0x000068334c4fd960)
+0x000068334c4fd960:   00000000400a5750 00000000400a4ff0
+0x000068334c4fd970:   000074e03c3df960 00002000000a5000
+0x000068334c4fd980:   000068329c019d30 000074e040802ba0
+0x000068334c4fd990:   000074e03c52b750 0000000000000040
+0x000068334c4fd9a0:   0000000000000800 00006832e8004db0
+0x000068334c4fd9b0:   0000000000000475 0000000000000040
+0x000068334c4fd9c0:   00006832e8003db0 000000000000003f
+0x000068334c4fd9d0:   00006832e8003eb0 00006832e8003db0
+0x000068334c4fd9e0:   000074e040803308 000068334c4fda20
+0x000068334c4fd9f0:   000068334c4fd978 000068334c4fda78
+0x000068334c4fda00:   000068334c4fda70 000068334c4fda57
+0x000068334c4fda10:   000068334c4fda58 000068334c4fd9a0
+0x000068334c4fda20:   00000000000000a5 0000000000000001
+0x000068334c4fda30:   000074e0407c4e48 000074e03c046048
+0x000068334c4fda40:   000000004c4fda90 000068330737bd88
+0x000068334c4fda50:   000074e03c52b750 0000000000000100
+0x000068334c4fda60:   00006832e8001c10 0000000000000088
+0x000068334c4fda70:   0000000040000000 00000000400a5000
+0x000068334c4fda80:   000074e040803308 000068330737bb18
+0x000068334c4fda90:   000074e03c06f900 000074e03c06f600
+0x000068334c4fdaa0:   000074e03c06f300 000074e03c06f000
+0x000068334c4fdab0:   000074e03c06ed00 000074e03c06ea00
+0x000068334c4fdac0:   00006832e8003fa8 000068334c4fda28
+0x000068334c4fdad0:   000074e040802ba0 0000000000000040
+0x000068334c4fdae0:   000068334c4fda90 00006832e8002050
+0x000068334c4fdaf0:   00006832e8001c98 000074e040802ba0
+0x000068334c4fdb00:   000074e0407c4e48 000074e0420add50
+0x000068334c4fdb10:   000068334c4fdbd8 0000000000000001
+0x000068334c4fdb20:   000074e03c046240 000074e0406f14a8
+0x000068334c4fdb30:   00006833ffffffff 000074e03c52b5f0
+0x000068334c4fdb40:   000074e03c046220 000074e000000000
+0x000068334c4fdb50:   000074e03c52b750 000074e03c06cf00 
+
+Instructions: (pc=0x000074e0406a09be)
+0x000074e0406a08be:   00 00 48 8b 44 24 60 48 89 44 24 78 4c 8d ac 24
+0x000074e0406a08ce:   c0 00 00 00 48 8b 44 24 58 48 89 84 24 78 01 00
+0x000074e0406a08de:   00 4d 85 e4 0f 84 18 0b 00 00 48 8b 44 24 78 4a
+0x000074e0406a08ee:   8d 0c e0 48 89 8c 24 60 01 00 00 eb 2c 0f 1f 44
+0x000074e0406a08fe:   00 00 4c 89 e6 48 8d 94 24 80 00 00 00 e8 50 45
+0x000074e0406a090e:   fe ff 48 8b 44 24 70 48 83 c0 08 48 3b 84 24 60
+0x000074e0406a091e:   01 00 00 0f 84 d9 0a 00 00 48 89 44 24 70 4c 8b
+0x000074e0406a092e:   20 48 89 ac 24 80 00 00 00 4c 89 ac 24 88 00 00
+0x000074e0406a093e:   00 48 8d 44 24 18 48 89 84 24 90 00 00 00 48 8d
+0x000074e0406a094e:   84 24 18 01 00 00 48 89 84 24 98 00 00 00 48 8d
+0x000074e0406a095e:   84 24 10 01 00 00 48 89 84 24 a0 00 00 00 48 8d
+0x000074e0406a096e:   84 24 f7 00 00 00 48 89 84 24 a8 00 00 00 48 8d
+0x000074e0406a097e:   84 24 f8 00 00 00 48 89 84 24 b0 00 00 00 48 8d
+0x000074e0406a098e:   44 24 40 48 89 84 24 b8 00 00 00 41 8b 44 24 08
+0x000074e0406a099e:   48 8b 15 73 38 16 00 48 8b 0d 74 38 16 00 48 d3
+0x000074e0406a09ae:   e0 48 8d 3c 10 8b 44 10 0c 48 8d 0d 1a af dd ff
+0x000074e0406a09be:   48 63 04 81 48 01 c8 ff e0 4c 89 24 24 48 89 bc
+0x000074e0406a09ce:   24 28 01 00 00 48 63 87 28 01 00 00 48 85 c0 0f
+0x000074e0406a09de:   84 68 07 00 00 48 8b 94 24 28 01 00 00 48 63 8a
+0x000074e0406a09ee:   ac 00 00 00 48 8d 0c ca 48 63 92 2c 01 00 00 48
+0x000074e0406a09fe:   8d 34 d1 4c 8d 24 d1 49 81 c4 d8 01 00 00 48 8d
+0x000074e0406a0a0e:   04 c6 48 05 d8 01 00 00 48 89 84 24 e8 00 00 00
+0x000074e0406a0a1e:   eb 12 49 83 c4 08 4c 3b a4 24 e8 00 00 00 0f 84
+0x000074e0406a0a2e:   19 07 00 00 45 8b 7c 24 04 4d 85 ff 74 e4 4d 63
+0x000074e0406a0a3e:   2c 24 4c 03 2c 24 31 ed eb 26 0f 1f 84 00 00 00
+0x000074e0406a0a4e:   00 00 48 8b 44 24 48 4a 89 1c f0 49 ff c6 4c 89
+0x000074e0406a0a5e:   74 24 50 4c 8b 74 24 08 48 ff c5 4c 39 fd 74 b2
+0x000074e0406a0a6e:   48 8d 34 ad 00 00 00 00 4c 01 ee 48 89 f0 48 b9
+0x000074e0406a0a7e:   ff ff ff ff ff ff ff 7f 48 21 c8 48 89 c1 48 2b
+0x000074e0406a0a8e:   0d cd 28 16 00 48 89 cf 48 c1 ef 0c 48 3b bc 24
+0x000074e0406a0a9e:   c0 00 00 00 75 3c 48 8b 4c 24 18 48 8b 94 24 18
+0x000074e0406a0aae:   01 00 00 48 29 d0 8b 1c 01 48 85 db 74 aa 4c 8b 
+
+
+Stack slot to memory mapping:
+
+stack at sp + 0 slots: 
+[error occurred during error reporting (inspecting top of stack), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:444)]
+stack at sp + 1 slots: 
+[error occurred during error reporting (inspecting top of stack, attempt 2), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:444)]
+stack at sp + 2 slots: 
+[error occurred during error reporting (inspecting top of stack, attempt 3), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:444)]
+
+---------------  P R O C E S S  ---------------
+
+Threads class SMR info:
+_java_thread_list=0x000068327808fa70, length=16, elements={
+0x000074e03c02b240, 0x000074e03c526750, 0x000074e03c527fe0, 0x000074e03c529ad0,
+0x000074e03c548300, 0x000074e03c549c50, 0x000074e03c54b510, 0x000074e03c54d350,
+0x000074e03c556d20, 0x000074e03c59df60, 0x000074e03c5a0f60, 0x0000683280031740,
+0x000068326400ea40, 0x000068328008f320, 0x0000683280090420, 0x000068326802d130
+}
+
+Java Threads: ( => current thread )
+  0x000074e03c02b240 JavaThread "main"                              [_thread_blocked, id=292334, stack(0x000074e040817000,0x000074e040917000) (1024K)]
+  0x000074e03c526750 JavaThread "Reference Handler"          daemon [_thread_blocked, id=292338, stack(0x000074e0044fd000,0x000074e0045fd000) (1024K)]
+  0x000074e03c527fe0 JavaThread "Finalizer"                  daemon [_thread_blocked, id=292339, stack(0x00006833502fc000,0x00006833503fc000) (1024K)]
+  0x000074e03c529ad0 JavaThread "MMTk Finalizer Thread"      daemon [_thread_blocked, id=292340, stack(0x000068334c8ff000,0x000068334c9ff000) (1024K)]
+  0x000074e03c548300 JavaThread "Signal Dispatcher"          daemon [_thread_blocked, id=292364, stack(0x0000683305cee000,0x0000683305dee000) (1024K)]
+  0x000074e03c549c50 JavaThread "Service Thread"             daemon [_thread_blocked, id=292365, stack(0x0000683305bee000,0x0000683305cee000) (1024K)]
+  0x000074e03c54b510 JavaThread "Monitor Deflation Thread"   daemon [_thread_blocked, id=292366, stack(0x0000683305aee000,0x0000683305bee000) (1024K)]
+  0x000074e03c54d350 JavaThread "C2 CompilerThread0"         daemon [_thread_blocked, id=292367, stack(0x00006833059ee000,0x0000683305aee000) (1024K)]
+  0x000074e03c556d20 JavaThread "C1 CompilerThread0"         daemon [_thread_blocked, id=292368, stack(0x00006833058ee000,0x00006833059ee000) (1024K)]
+  0x000074e03c59df60 JavaThread "Notification Thread"        daemon [_thread_blocked, id=292371, stack(0x00006833055ee000,0x00006833056ee000) (1024K)]
+  0x000074e03c5a0f60 JavaThread "Common-Cleaner"             daemon [_thread_blocked, id=292372, stack(0x00006833054ee000,0x00006833055ee000) (1024K)]
+  0x0000683280031740 JavaThread "C1 CompilerThread1"         daemon [_thread_blocked, id=292380, stack(0x00006833053ee000,0x00006833054ee000) (1024K)]
+  0x000068326400ea40 JavaThread "C2 CompilerThread1"         daemon [_thread_blocked, id=292381, stack(0x00006833057ee000,0x00006833058ee000) (1024K)]
+  0x000068328008f320 JavaThread "C1 CompilerThread2"         daemon [_thread_blocked, id=292383, stack(0x00006833052ee000,0x00006833053ee000) (1024K)]
+  0x0000683280090420 JavaThread "C1 CompilerThread3"         daemon [_thread_blocked, id=292384, stack(0x00006833051ee000,0x00006833052ee000) (1024K)]
+  0x000068326802d130 JavaThread "C1 CompilerThread4"         daemon [_thread_blocked, id=292390, stack(0x00006833050ee000,0x00006833051ee000) (1024K)]
+Total: 16
+
+Other Threads:
+  0x000074e03c51b2a0 VMThread "VM Thread"                           [id=292337, stack(0x000074e0045fe000,0x000074e0046fe000) (1024K)]
+  0x000074e03c508ef0 WatcherThread "VM Periodic Task Thread"        [id=292336, stack(0x000074e0046ff000,0x000074e0047ff000) (1024K)]
+
+=>0x000074e03c52ed60 (exited) NamedThread "MMTk Collector Thread"   [id=292342, stack(0x000068334c3ff000,0x000068334c4ff000) (1024K)]
+Total: 3
+
+Threads with active compile tasks:
+Total: 0
+
+VM state: at safepoint (normal execution)
+
+VM Mutex/Monitor currently owned by a thread:  ([mutex/lock_event])
+[0x000074e041f580d0] Threads_lock - owner thread: 0x000074e03c51b2a0
+[0x000074e041f57fd0] Heap_lock - owner thread: 0x000074e03c3e48a0
+
+Heap address: 0x0000000040000000, size: 3072 MB, Compressed Oops mode: 32-bit
+
+CDS archive(s) mapped at: [0x0000683307000000-0x0000683307ca3000-0x0000683307ca3000), size 13250560, SharedBaseAddress: 0x0000683307000000, ArchiveRelocationMode: 1.
+Compressed class space mapped at: 0x0000683308000000-0x0000683348000000, reserved size: 1073741824
+Narrow klass base: 0x0000683307000000, Narrow klass shift: 0, Narrow klass range: 0x100000000
+
+GC Precious Log:
+<Empty>
+
+Heap:
+
+[error occurred during error reporting (printing heap information), id 0xe0000000, Internal Error (/mydata/mmtk-openjdk/openjdk/share/mmtkHeap.cpp:424)]
+Metaspace:
+
+Usage:
+  Non-class:      6.42 MB used.
+      Class:    773.73 KB used.
+       Both:      7.18 MB used.
+
+Virtual space:
+  Non-class space:       64.00 MB reserved,       6.56 MB ( 10%) committed,  1 nodes.
+      Class space:        1.00 GB reserved,     896.00 KB ( <1%) committed,  1 nodes.
+             Both:        1.06 GB reserved,       7.44 MB ( <1%) committed. 
+
+Chunk freelists:
+   Non-Class:  8.20 MB
+       Class:  14.96 MB
+        Both:  23.16 MB
+
+MaxMetaspaceSize: unlimited
+CompressedClassSpaceSize: 1.00 GB
+Initial GC threshold: 21.00 MB
+Current GC threshold: 21.00 MB
+CDS: on
+ - commit_granule_bytes: 65536.
+ - commit_granule_words: 8192.
+ - virtual_space_node_default_size: 8388608.
+ - enlarge_chunks_in_place: 1.
+ - use_allocation_guard: 0.
+
+
+Internal statistics:
+
+num_allocs_failed_limit: 0.
+num_arena_births: 196.
+num_arena_deaths: 0.
+num_vsnodes_births: 2.
+num_vsnodes_deaths: 0.
+num_space_committed: 119.
+num_space_uncommitted: 0.
+num_chunks_returned_to_freelist: 0.
+num_chunks_taken_from_freelist: 417.
+num_chunk_merges: 0.
+num_chunk_splits: 274.
+num_chunks_enlarged: 183.
+num_inconsistent_stats: 0.
+
+CodeHeap 'non-profiled nmethods': size=118880Kb used=859Kb max_used=859Kb free=118020Kb
+ bounds [0x000074e02c3e8000, 0x000074e02c658000, 0x000074e033800000]
+CodeHeap 'profiled nmethods': size=118876Kb used=3219Kb max_used=3219Kb free=115656Kb
+ bounds [0x000074e024800000, 0x000074e024b30000, 0x000074e02bc17000]
+CodeHeap 'non-nmethods': size=8004Kb used=3475Kb max_used=3492Kb free=4528Kb
+ bounds [0x000074e02bc17000, 0x000074e02c007000, 0x000074e02c3e8000]
+CodeCache: size=245760Kb, used=7553Kb, max_used=7570Kb, free=238204Kb
+ total_blobs=2342, nmethods=1837, adapters=405, full_count=0
+Compilation: enabled, stopped_count=0, restarted_count=0
+
+Compilation events (20 events):
+Event: 18.131 Thread 0x0000683280090420 nmethod 1828 0x000074e02c4bc510 code [0x000074e02c4bc6a0, 0x000074e02c4bc760]
+Event: 18.132 Thread 0x000068326802d130 1829       3       java.io.BufferedOutputStream::growIfNeeded (59 bytes)
+Event: 18.132 Thread 0x000068326802d130 nmethod 1829 0x000074e024b23d10 code [0x000074e024b23ec0, 0x000074e024b24150]
+Event: 18.134 Thread 0x000068326400ea40 nmethod 1827 0x000074e02c4bc810 code [0x000074e02c4bc9e0, 0x000074e02c4bcec0]
+Event: 18.144 Thread 0x0000683280031740 1830       3       java.nio.HeapByteBuffer::compact (85 bytes)
+Event: 18.144 Thread 0x0000683280031740 nmethod 1830 0x000074e024b24290 code [0x000074e024b24480, 0x000074e024b24b60]
+Event: 18.153 Thread 0x000068326802d130 1831       1       org.apache.lucene.util.InfoStream$NoOutput::isEnabled (2 bytes)
+Event: 18.153 Thread 0x000068326802d130 nmethod 1831 0x000074e02c4bd310 code [0x000074e02c4bd4a0, 0x000074e02c4bd560]
+Event: 18.257 Thread 0x000068326400ea40 1832       4       java.lang.String::indexOf (37 bytes)
+Event: 18.259 Thread 0x000068326400ea40 nmethod 1832 0x000074e02c4bd610 code [0x000074e02c4bd7c0, 0x000074e02c4bdbe0]
+Event: 18.261 Thread 0x000074e03c54d350 1833       4       org.apache.lucene.util.Accountable$$Lambda/0x00006833080215f0::ramBytesUsed (4 bytes)
+Event: 18.261 Thread 0x000074e03c54d350 nmethod 1833 0x000074e02c4bdd90 code [0x000074e02c4bdf00, 0x000074e02c4bdf88]
+Event: 18.262 Thread 0x000074e03c54d350 1834       4       java.util.concurrent.atomic.AtomicLong::incrementAndGet (14 bytes)
+Event: 18.262 Thread 0x000074e03c54d350 nmethod 1834 0x000074e02c4be090 code [0x000074e02c4be200, 0x000074e02c4be298]
+Event: 18.266 Thread 0x000068326400ea40 1835       4       java.util.concurrent.atomic.AtomicLong::getAndIncrement (12 bytes)
+Event: 18.266 Thread 0x000068326400ea40 nmethod 1835 0x000074e02c4be390 code [0x000074e02c4be500, 0x000074e02c4be590]
+Event: 18.268 Thread 0x000074e03c54d350 1836       4       org.apache.lucene.analysis.ReusableStringReader::close (14 bytes)
+Event: 18.268 Thread 0x000068326400ea40 1837       4       java.util.concurrent.atomic.AtomicInteger::incrementAndGet (14 bytes)
+Event: 18.268 Thread 0x000074e03c54d350 nmethod 1836 0x000074e02c4be690 code [0x000074e02c4be800, 0x000074e02c4be898]
+Event: 18.268 Thread 0x000068326400ea40 nmethod 1837 0x000074e02c4be990 code [0x000074e02c4beb00, 0x000074e02c4beb98]
+
+GC Heap History (0 events):
+No events
+
+Dll operation events (8 events):
+Event: 0.001 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjava.so
+Event: 2.235 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjsvml.so
+Event: 2.248 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnio.so
+Event: 2.251 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libzip.so
+Event: 2.265 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjimage.so
+Event: 2.291 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnet.so
+Event: 17.143 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement.so
+Event: 17.145 Loaded shared library /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement_ext.so
+
+Deoptimization events (20 events):
+Event: 17.851 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.851 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.852 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.852 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.853 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.853 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.854 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.854 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.854 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.854 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.855 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.855 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.855 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.855 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 17.856 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e024b12974 sp=0x000074e040914a30
+Event: 17.856 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6ab2f sp=0x000074e040913fa8 mode 0
+Event: 18.001 Thread 0x000074e03c02b240 Uncommon trap: trap_request=0xffffff45 fr.pc=0x000074e02c499298 relative=0x0000000000000a18
+Event: 18.001 Thread 0x000074e03c02b240 Uncommon trap: reason=unstable_if action=reinterpret pc=0x000074e02c499298 method=org.apache.lucene.util.BytesRefHash.rehash(IZ)V @ 101 c2
+Event: 18.001 Thread 0x000074e03c02b240 DEOPT PACKING pc=0x000074e02c499298 sp=0x000074e040914940
+Event: 18.001 Thread 0x000074e03c02b240 DEOPT UNPACKING pc=0x000074e02bc6a399 sp=0x000074e0409148c8 mode 2
+
+Classes loaded (20 events):
+Event: 17.284 Loading class java/util/Spliterators$IntArraySpliterator
+Event: 17.284 Loading class java/util/Spliterators$IntArraySpliterator done
+Event: 17.284 Loading class java/util/stream/IntPipeline$Head
+Event: 17.284 Loading class java/util/stream/IntPipeline$Head done
+Event: 17.295 Loading class java/lang/reflect/UndeclaredThrowableException
+Event: 17.295 Loading class java/lang/reflect/UndeclaredThrowableException done
+Event: 17.298 Loading class java/lang/ArrayIndexOutOfBoundsException
+Event: 17.298 Loading class java/lang/ArrayIndexOutOfBoundsException done
+Event: 17.389 Loading class java/util/WeakHashMap$KeyIterator
+Event: 17.389 Loading class java/util/WeakHashMap$HashIterator
+Event: 17.389 Loading class java/util/WeakHashMap$HashIterator done
+Event: 17.389 Loading class java/util/WeakHashMap$KeyIterator done
+Event: 17.839 Loading class java/lang/CharacterData01
+Event: 17.840 Loading class java/lang/CharacterData01 done
+Event: 18.124 Loading class java/nio/BufferUnderflowException
+Event: 18.124 Loading class java/nio/BufferUnderflowException done
+Event: 18.124 Loading class java/nio/HeapByteBufferR
+Event: 18.124 Loading class java/nio/HeapByteBufferR done
+Event: 18.125 Loading class java/nio/FloatBuffer
+Event: 18.125 Loading class java/nio/FloatBuffer done
+
+Classes unloaded (0 events):
+No events
+
+Classes redefined (0 events):
+No events
+
+Internal exceptions (20 events):
+Event: 2.309 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000401b5ca8}: 'void java.lang.invoke.DirectMethodHandle$Holder.invokeVirtual(java.lang.Object, java.lang.Object)'> (0x00000000401b5ca8) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 2.314 Thread 0x000074e03c02b240 Exception <a 'java/io/FileNotFoundException'{0x0000000040196858}> (0x0000000040196858) 
+thrown [src/hotspot/share/prims/jni.cpp, line 520]
+Event: 2.324 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x0000000040128350}: 'java.lang.Object java.lang.invoke.Invokers$Holder.invokeExact_MT(java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object)'> (0x0000000040128350) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.119 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x000000004002b9b0}: 'void java.lang.invoke.DirectMethodHandle$Holder.invokeVirtual(java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object)'> (0x000000004002b9b0) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.119 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x000000004002f650}: 'void java.lang.invoke.DirectMethodHandle$Holder.invokeSpecial(java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object)'> (0x000000004002f650) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.139 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000402c4408}: 'long java.lang.invoke.DirectMethodHandle$Holder.invokeStatic(java.lang.Object)'> (0x00000000402c4408) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.139 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000402c7ba0}: 'long java.lang.invoke.DirectMethodHandle$Holder.invokeStaticInit(java.lang.Object)'> (0x00000000402c7ba0) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.142 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000402a00d0}: 'void java.lang.invoke.DirectMethodHandle$Holder.invokeStatic(java.lang.Object, java.lang.Object, java.lang.Object)'> (0x00000000402a00d0) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.148 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000401c2908}: 'int java.lang.invoke.DirectMethodHandle$Holder.invokeSpecial(java.lang.Object, java.lang.Object, java.lang.Object)'> (0x00000000401c2908) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.149 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000401a9560}: 'java.lang.Object java.lang.invoke.DirectMethodHandle$Holder.invokeInterface(java.lang.Object, java.lang.Object, java.lang.Object)'> (0x00000000401a9560) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.151 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x0000000040188998}: 'java.lang.Object java.lang.invoke.DirectMethodHandle$Holder.invokeStatic(java.lang.Object, java.lang.Object, int)'> (0x0000000040188998) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.152 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x000000004015e5d0}: 'void java.lang.invoke.DelegatingMethodHandle$Holder.delegate(java.lang.Object, java.lang.Object, int, java.lang.Object)'> (0x000000004015e5d0) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.161 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000400a78a0}: 'void java.lang.invoke.DirectMethodHandle$Holder.invokeStaticInit(java.lang.Object, java.lang.Object)'> (0x00000000400a78a0) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.221 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x00000000408357e8}: 'int java.lang.invoke.DirectMethodHandle$Holder.invokeStaticInit(java.lang.Object, java.lang.Object, java.lang.Object)'> (0x00000000408357e8) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.226 Thread 0x000074e03c02b240 Exception <a 'sun/nio/fs/UnixException'{0x0000000040ff9e30}> (0x0000000040ff9e30) 
+thrown [src/hotspot/share/prims/jni.cpp, line 520]
+Event: 17.234 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x0000000040f72bb0}: 'java.lang.Object java.lang.invoke.DirectMethodHandle$Holder.newInvokeSpecial(java.lang.Object, java.lang.Object, java.lang.Object, int, java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object, java.lang.Object, int)'> (0x0000000040f72bb0) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.237 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x0000000040f3f240}: 'long java.lang.invoke.DirectMethodHandle$Holder.invokeSpecial(java.lang.Object, java.lang.Object)'> (0x0000000040f3f240) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.284 Thread 0x000074e03c02b240 Exception <a 'java/lang/NoSuchMethodError'{0x0000000040cd59d8}: 'void java.lang.invoke.DirectMethodHandle$Holder.invokeInterface(java.lang.Object, java.lang.Object, int)'> (0x0000000040cd59d8) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 772]
+Event: 17.284 Thread 0x000074e03c02b240 Exception <a 'java/lang/IncompatibleClassChangeError'{0x0000000040cc9018}: Found class java.lang.Object, but interface was expected> (0x0000000040cc9018) 
+thrown [src/hotspot/share/interpreter/linkResolver.cpp, line 840]
+Event: 17.297 Thread 0x000074e03c02b240 Implicit null exception at 0x000074e02c412ef7 to 0x000074e02c412fb8
+
+ZGC Phase Switch (0 events):
+No events
+
+VM Operations (20 events):
+Event: 11.281 Executing VM operation: Cleanup done
+Event: 12.281 Executing VM operation: Cleanup
+Event: 12.281 Executing VM operation: Cleanup done
+Event: 17.117 Executing VM operation: ThirdPartyHeapOperation
+Event: 17.118 Executing VM operation: ThirdPartyHeapOperation done
+Event: 17.121 Executing VM operation: ThirdPartyHeapOperation
+Event: 17.123 Executing VM operation: ThirdPartyHeapOperation done
+Event: 17.151 Executing VM operation: HandshakeAllThreads (Deoptimize)
+Event: 17.151 Executing VM operation: HandshakeAllThreads (Deoptimize) done
+Event: 17.260 Executing VM operation: HandshakeAllThreads (Deoptimize)
+Event: 17.260 Executing VM operation: HandshakeAllThreads (Deoptimize) done
+Event: 17.709 Executing VM operation: ICBufferFull
+Event: 17.709 Executing VM operation: ICBufferFull done
+Event: 18.124 Executing VM operation: HandshakeAllThreads (Deoptimize)
+Event: 18.124 Executing VM operation: HandshakeAllThreads (Deoptimize) done
+Event: 18.125 Executing VM operation: HandshakeAllThreads (Deoptimize)
+Event: 18.125 Executing VM operation: HandshakeAllThreads (Deoptimize) done
+Event: 18.278 Executing VM operation: ThirdPartyHeapOperation
+Event: 18.284 Executing VM operation: ThirdPartyHeapOperation done
+Event: 18.287 Executing VM operation: ThirdPartyHeapOperation
+
+Memory protections (20 events):
+Event: 2.234 Protecting memory [0x00006833058ee000,0x00006833058f2000] with protection modes 0
+Event: 2.244 Protecting memory [0x00006833057ee000,0x00006833057f2000] with protection modes 0
+Event: 2.245 Protecting memory [0x00006833056ee000,0x00006833056f2000] with protection modes 0
+Event: 2.246 Protecting memory [0x00006833055ee000,0x00006833055f2000] with protection modes 0
+Event: 2.247 Protecting memory [0x00006833054ee000,0x00006833054f2000] with protection modes 0
+Event: 2.296 Protecting memory [0x00006833053ee000,0x00006833053f2000] with protection modes 0
+Event: 2.302 Protecting memory [0x00006833052ee000,0x00006833052f2000] with protection modes 0
+Event: 2.306 Protecting memory [0x00006833051ee000,0x00006833051f2000] with protection modes 0
+Event: 11.192 Protecting memory [0x00006833053ee000,0x00006833053f2000] with protection modes 0
+Event: 17.142 Protecting memory [0x00006833053ee000,0x00006833053f2000] with protection modes 0
+Event: 17.261 Protecting memory [0x00006833057ee000,0x00006833057f2000] with protection modes 0
+Event: 17.264 Protecting memory [0x00006833056ee000,0x00006833056f2000] with protection modes 0
+Event: 17.304 Protecting memory [0x00006833052ee000,0x00006833052f2000] with protection modes 0
+Event: 17.304 Protecting memory [0x00006833051ee000,0x00006833051f2000] with protection modes 0
+Event: 17.317 Protecting memory [0x00006833050ee000,0x00006833050f2000] with protection modes 0
+Event: 17.317 Protecting memory [0x0000683304fee000,0x0000683304ff2000] with protection modes 0
+Event: 17.317 Protecting memory [0x0000683304eee000,0x0000683304ef2000] with protection modes 0
+Event: 17.317 Protecting memory [0x0000683304dee000,0x0000683304df2000] with protection modes 0
+Event: 17.317 Protecting memory [0x0000683304cee000,0x0000683304cf2000] with protection modes 0
+Event: 17.730 Protecting memory [0x00006833050ee000,0x00006833050f2000] with protection modes 0
+
+Nmethod flushes (0 events):
+No events
+
+Events (20 events):
+Event: 8.075 Thread 0x0000683274015c40 Thread exited: 0x0000683274015c40
+Event: 11.192 Thread 0x000074e03c54d350 Thread added: 0x000068327c061fb0
+Event: 11.631 Thread 0x000068327c061fb0 Thread exited: 0x000068327c061fb0
+Event: 17.142 Thread 0x000074e03c556d20 Thread added: 0x0000683280031740
+Event: 17.261 Thread 0x0000683280031740 Thread added: 0x000068326400ea40
+Event: 17.264 Thread 0x000068326400ea40 Thread added: 0x000068327403b1b0
+Event: 17.304 Thread 0x000074e03c556d20 Thread added: 0x000068328008f320
+Event: 17.304 Thread 0x000074e03c556d20 Thread added: 0x0000683280090420
+Event: 17.317 Thread 0x0000683280031740 Thread added: 0x000068326405b1b0
+Event: 17.317 Thread 0x0000683280031740 Thread added: 0x000068326405cdf0
+Event: 17.317 Thread 0x0000683280031740 Thread added: 0x000068326405e0d0
+Event: 17.317 Thread 0x0000683280031740 Thread added: 0x000068326405f9d0
+Event: 17.317 Thread 0x0000683280031740 Thread added: 0x0000683264061350
+Event: 17.501 Thread 0x0000683264061350 Thread exited: 0x0000683264061350
+Event: 17.661 Thread 0x000068326405f9d0 Thread exited: 0x000068326405f9d0
+Event: 17.662 Thread 0x000068326405e0d0 Thread exited: 0x000068326405e0d0
+Event: 17.672 Thread 0x000068326405cdf0 Thread exited: 0x000068326405cdf0
+Event: 17.672 Thread 0x000068326405b1b0 Thread exited: 0x000068326405b1b0
+Event: 17.730 Thread 0x000068328008f320 Thread added: 0x000068326802d130
+Event: 17.750 Thread 0x000068327403b1b0 Thread exited: 0x000068327403b1b0
+
+
+Dynamic libraries:
+40000000-40400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+40400000-40800000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+40800000-41400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+41400000-43c00000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+43c00000-44000000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+44000000-45c00000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+45c00000-46000000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+46000000-47800000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+47800000-47c00000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+47c00000-49000000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+49000000-49400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+49400000-4a000000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+4a000000-4a400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+4a400000-4c400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+4c400000-4c800000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+4c800000-4e000000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+4e000000-4e400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+4e400000-4f400000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+4f400000-4f800000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:immix]
+4f800000-50000000 rw-p 00000000 00:00 0                                  [anon:mmtk:space:los]
+200000000000-2000c00c0000 rw-s 00000000 00:10 68                         anon_inode:bpf-map
+5bf2123a8000-5bf2123a9000 r--p 00000000 fc:00 49676320                   /mydata/openjdk-mmtk/build/b0test/images/jdk/bin/java
+5bf2123a9000-5bf2123aa000 r-xp 00001000 fc:00 49676320                   /mydata/openjdk-mmtk/build/b0test/images/jdk/bin/java
+5bf2123aa000-5bf2123ab000 r--p 00002000 fc:00 49676320                   /mydata/openjdk-mmtk/build/b0test/images/jdk/bin/java
+5bf2123ab000-5bf2123ac000 r--p 00002000 fc:00 49676320                   /mydata/openjdk-mmtk/build/b0test/images/jdk/bin/java
+5bf2123ac000-5bf2123ad000 rw-p 00003000 fc:00 49676320                   /mydata/openjdk-mmtk/build/b0test/images/jdk/bin/java
+5bf2157df000-5bf215827000 rw-p 00000000 00:00 0                          [heap]
+68324c000000-68324c335000 rw-p 00000000 00:00 0 
+68324c335000-683250000000 ---p 00000000 00:00 0 
+683250000000-6832501aa000 rw-p 00000000 00:00 0 
+6832501aa000-683254000000 ---p 00000000 00:00 0 
+683254000000-6832541e6000 rw-p 00000000 00:00 0 
+6832541e6000-683258000000 ---p 00000000 00:00 0 
+683258000000-683258186000 rw-p 00000000 00:00 0 
+683258186000-68325c000000 ---p 00000000 00:00 0 
+68325c000000-68325c11c000 rw-p 00000000 00:00 0 
+68325c11c000-683260000000 ---p 00000000 00:00 0 
+683260000000-683260161000 rw-p 00000000 00:00 0 
+683260161000-683264000000 ---p 00000000 00:00 0 
+683264000000-683264246000 rw-p 00000000 00:00 0 
+683264246000-683268000000 ---p 00000000 00:00 0 
+683268000000-68326804d000 rw-p 00000000 00:00 0 
+68326804d000-68326c000000 ---p 00000000 00:00 0 
+68326c000000-68326c021000 rw-p 00000000 00:00 0 
+68326c021000-683270000000 ---p 00000000 00:00 0 
+683270000000-683270021000 rw-p 00000000 00:00 0 
+683270021000-683274000000 ---p 00000000 00:00 0 
+683274000000-68327435d000 rw-p 00000000 00:00 0 
+68327435d000-683278000000 ---p 00000000 00:00 0 
+683278000000-6832782e9000 rw-p 00000000 00:00 0 
+6832782e9000-68327c000000 ---p 00000000 00:00 0 
+68327c000000-68327c63b000 rw-p 00000000 00:00 0 
+68327c63b000-683280000000 ---p 00000000 00:00 0 
+683280000000-6832800ab000 rw-p 00000000 00:00 0 
+6832800ab000-683284000000 ---p 00000000 00:00 0 
+683284000000-683284021000 rw-p 00000000 00:00 0 
+683284021000-683288000000 ---p 00000000 00:00 0 
+683288000000-683288021000 rw-p 00000000 00:00 0 
+683288021000-68328c000000 ---p 00000000 00:00 0 
+68328c000000-68328c021000 rw-p 00000000 00:00 0 
+68328c021000-683290000000 ---p 00000000 00:00 0 
+683290000000-683290021000 rw-p 00000000 00:00 0 
+683290021000-683294000000 ---p 00000000 00:00 0 
+683294000000-683294021000 rw-p 00000000 00:00 0 
+683294021000-683298000000 ---p 00000000 00:00 0 
+683298000000-683298021000 rw-p 00000000 00:00 0 
+683298021000-68329c000000 ---p 00000000 00:00 0 
+68329c000000-68329c022000 rw-p 00000000 00:00 0 
+68329c022000-6832a0000000 ---p 00000000 00:00 0 
+6832a0000000-6832a0021000 rw-p 00000000 00:00 0 
+6832a0021000-6832a4000000 ---p 00000000 00:00 0 
+6832a4000000-6832a4022000 rw-p 00000000 00:00 0 
+6832a4022000-6832a8000000 ---p 00000000 00:00 0 
+6832a8000000-6832a8067000 rw-p 00000000 00:00 0 
+6832a8067000-6832ac000000 ---p 00000000 00:00 0 
+6832ac000000-6832ac021000 rw-p 00000000 00:00 0 
+6832ac021000-6832b0000000 ---p 00000000 00:00 0 
+6832b0000000-6832b0021000 rw-p 00000000 00:00 0 
+6832b0021000-6832b4000000 ---p 00000000 00:00 0 
+6832b4000000-6832b4021000 rw-p 00000000 00:00 0 
+6832b4021000-6832b8000000 ---p 00000000 00:00 0 
+6832b8000000-6832b8021000 rw-p 00000000 00:00 0 
+6832b8021000-6832bc000000 ---p 00000000 00:00 0 
+6832bc000000-6832bc021000 rw-p 00000000 00:00 0 
+6832bc021000-6832c0000000 ---p 00000000 00:00 0 
+6832c0000000-6832c0023000 rw-p 00000000 00:00 0 
+6832c0023000-6832c4000000 ---p 00000000 00:00 0 
+6832c4000000-6832c4021000 rw-p 00000000 00:00 0 
+6832c4021000-6832c8000000 ---p 00000000 00:00 0 
+6832c8000000-6832c8021000 rw-p 00000000 00:00 0 
+6832c8021000-6832cc000000 ---p 00000000 00:00 0 
+6832cc000000-6832cc033000 rw-p 00000000 00:00 0 
+6832cc033000-6832d0000000 ---p 00000000 00:00 0 
+6832d0000000-6832d0029000 rw-p 00000000 00:00 0 
+6832d0029000-6832d4000000 ---p 00000000 00:00 0 
+6832d4000000-6832d402b000 rw-p 00000000 00:00 0 
+6832d402b000-6832d8000000 ---p 00000000 00:00 0 
+6832d8000000-6832d8021000 rw-p 00000000 00:00 0 
+6832d8021000-6832dc000000 ---p 00000000 00:00 0 
+6832dc000000-6832dc021000 rw-p 00000000 00:00 0 
+6832dc021000-6832e0000000 ---p 00000000 00:00 0 
+6832e0000000-6832e0021000 rw-p 00000000 00:00 0 
+6832e0021000-6832e4000000 ---p 00000000 00:00 0 
+6832e4000000-6832e4023000 rw-p 00000000 00:00 0 
+6832e4023000-6832e8000000 ---p 00000000 00:00 0 
+6832e8000000-6832e803d000 rw-p 00000000 00:00 0 
+6832e803d000-6832ec000000 ---p 00000000 00:00 0 
+6832ec000000-6832ec021000 rw-p 00000000 00:00 0 
+6832ec021000-6832f0000000 ---p 00000000 00:00 0 
+6832f0000000-6832f0021000 rw-p 00000000 00:00 0 
+6832f0021000-6832f4000000 ---p 00000000 00:00 0 
+6832f4000000-6832f4021000 rw-p 00000000 00:00 0 
+6832f4021000-6832f8000000 ---p 00000000 00:00 0 
+6832f8000000-6832f8021000 rw-p 00000000 00:00 0 
+6832f8021000-6832fc000000 ---p 00000000 00:00 0 
+6832fc000000-6832fc2c0000 rw-p 00000000 00:00 0 
+6832fc2c0000-6832fc400000 ---p 00000000 00:00 0 
+6832fc400000-6832fc7d0000 rw-p 00000000 00:00 0 
+6832fc7d0000-683300000000 ---p 00000000 00:00 0 
+683300000000-683300021000 rw-p 00000000 00:00 0 
+683300021000-683304000000 ---p 00000000 00:00 0 
+683304cee000-683304cf2000 ---p 00000000 00:00 0 
+683304cf2000-683304dee000 rw-p 00000000 00:00 0 
+683304dee000-683304df2000 ---p 00000000 00:00 0 
+683304df2000-683304eee000 rw-p 00000000 00:00 0 
+683304eee000-683304ef2000 ---p 00000000 00:00 0 
+683304ef2000-683304fee000 rw-p 00000000 00:00 0 
+683304fee000-683304ff2000 ---p 00000000 00:00 0 
+683304ff2000-6833050ee000 rw-p 00000000 00:00 0 
+6833050ee000-6833050f2000 ---p 00000000 00:00 0 
+6833050f2000-6833051ee000 rw-p 00000000 00:00 0 
+6833051ee000-6833051f2000 ---p 00000000 00:00 0 
+6833051f2000-6833052ee000 rw-p 00000000 00:00 0 
+6833052ee000-6833052f2000 ---p 00000000 00:00 0 
+6833052f2000-6833053ee000 rw-p 00000000 00:00 0 
+6833053ee000-6833053f2000 ---p 00000000 00:00 0 
+6833053f2000-6833054ee000 rw-p 00000000 00:00 0 
+6833054ee000-6833054f2000 ---p 00000000 00:00 0 
+6833054f2000-6833055ee000 rw-p 00000000 00:00 0 
+6833055ee000-6833055f2000 ---p 00000000 00:00 0 
+6833055f2000-6833056ee000 rw-p 00000000 00:00 0 
+6833056ee000-6833056f2000 ---p 00000000 00:00 0 
+6833056f2000-6833057ee000 rw-p 00000000 00:00 0 
+6833057ee000-6833057f2000 ---p 00000000 00:00 0 
+6833057f2000-6833058ee000 rw-p 00000000 00:00 0 
+6833058ee000-6833058f2000 ---p 00000000 00:00 0 
+6833058f2000-6833059ee000 rw-p 00000000 00:00 0 
+6833059ee000-6833059f2000 ---p 00000000 00:00 0 
+6833059f2000-683305aee000 rw-p 00000000 00:00 0 
+683305aee000-683305af2000 ---p 00000000 00:00 0 
+683305af2000-683305bee000 rw-p 00000000 00:00 0 
+683305bee000-683305bf2000 ---p 00000000 00:00 0 
+683305bf2000-683305cee000 rw-p 00000000 00:00 0 
+683305cee000-683305cf2000 ---p 00000000 00:00 0 
+683305cf2000-683305dee000 rw-p 00000000 00:00 0 
+683305dee000-683305def000 ---p 00000000 00:00 0 
+683305def000-683305eef000 rw-p 00000000 00:00 0 
+683305eef000-683305ef0000 ---p 00000000 00:00 0 
+683305ef0000-683305ff0000 rw-p 00000000 00:00 0 
+683305ff0000-683305ff1000 ---p 00000000 00:00 0 
+683305ff1000-6833060f1000 rw-p 00000000 00:00 0 
+6833060f1000-6833060f2000 ---p 00000000 00:00 0 
+6833060f2000-6833061f2000 rw-p 00000000 00:00 0 
+6833061f2000-6833061f3000 ---p 00000000 00:00 0 
+6833061f3000-6833062f3000 rw-p 00000000 00:00 0 
+6833062f3000-6833062f4000 ---p 00000000 00:00 0 
+6833062f4000-6833063f4000 rw-p 00000000 00:00 0 
+6833063f4000-6833063f5000 ---p 00000000 00:00 0 
+6833063f5000-6833064f5000 rw-p 00000000 00:00 0 
+6833064f5000-6833064f6000 ---p 00000000 00:00 0 
+6833064f6000-6833065f6000 rw-p 00000000 00:00 0 
+6833065f6000-6833065f7000 ---p 00000000 00:00 0 
+6833065f7000-6833066f7000 rw-p 00000000 00:00 0 
+6833066f7000-6833066f8000 ---p 00000000 00:00 0 
+6833066f8000-6833067f8000 rw-p 00000000 00:00 0 
+6833067f8000-6833067f9000 ---p 00000000 00:00 0 
+6833067f9000-6833068f9000 rw-p 00000000 00:00 0 
+6833068f9000-6833068fa000 ---p 00000000 00:00 0 
+6833068fa000-6833069fa000 rw-p 00000000 00:00 0 
+6833069fa000-6833069fb000 ---p 00000000 00:00 0 
+6833069fb000-683306afb000 rw-p 00000000 00:00 0 
+683306afb000-683306afc000 ---p 00000000 00:00 0 
+683306afc000-683306bfc000 rw-p 00000000 00:00 0 
+683306bfc000-683306bfd000 ---p 00000000 00:00 0 
+683306bfd000-683306cfd000 rw-p 00000000 00:00 0 
+683306cfd000-683306cfe000 ---p 00000000 00:00 0 
+683306cfe000-683306dfe000 rw-p 00000000 00:00 0 
+683306dfe000-683306dff000 ---p 00000000 00:00 0 
+683306dff000-683306eff000 rw-p 00000000 00:00 0 
+683306eff000-683306f00000 ---p 00000000 00:00 0 
+683306f00000-683307000000 rw-p 00000000 00:00 0 
+683307000000-683307ca3000 rw-p 00001000 fc:00 49677004                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/classes.jsa
+683307ca3000-683308000000 ---p 00000000 00:00 0 
+683308000000-683308040000 rw-p 00000000 00:00 0 
+683308040000-6833080c0000 rw-p 00000000 00:00 0 
+6833080c0000-6833080d0000 rw-p 00000000 00:00 0 
+6833080d0000-683308100000 ---p 00000000 00:00 0 
+683308100000-683308110000 rw-p 00000000 00:00 0 
+683308110000-683348000000 ---p 00000000 00:00 0 
+683348000000-683348021000 rw-p 00000000 00:00 0 
+683348021000-68334c000000 ---p 00000000 00:00 0 
+68334c0fb000-68334c0fc000 ---p 00000000 00:00 0 
+68334c0fc000-68334c1fc000 rw-p 00000000 00:00 0 
+68334c1fc000-68334c1fd000 ---p 00000000 00:00 0 
+68334c1fd000-68334c2fd000 rw-p 00000000 00:00 0 
+68334c2fd000-68334c2fe000 ---p 00000000 00:00 0 
+68334c2fe000-68334c3fe000 rw-p 00000000 00:00 0 
+68334c3fe000-68334c3ff000 ---p 00000000 00:00 0 
+68334c3ff000-68334c4ff000 rw-p 00000000 00:00 0 
+68334c4ff000-68334c500000 ---p 00000000 00:00 0 
+68334c500000-68334c600000 rw-p 00000000 00:00 0 
+68334c600000-68334c8eb000 r--p 00000000 08:03 1410552                    /usr/lib/locale/locale-archive
+68334c8ff000-68334c903000 ---p 00000000 00:00 0 
+68334c903000-68334c9ff000 rw-p 00000000 00:00 0 
+68334c9ff000-68334d000000 rw-p 00000000 00:00 0 
+68334d000000-683350000000 rw-p 00000000 00:00 0 
+683350000000-68335000c000 r--p 00000000 fc:00 13107225                   /mydata/gc-bpf-fault/shim/libgcbpf.so
+68335000c000-68335006e000 r-xp 0000c000 fc:00 13107225                   /mydata/gc-bpf-fault/shim/libgcbpf.so
+68335006e000-68335021b000 r--p 0006e000 fc:00 13107225                   /mydata/gc-bpf-fault/shim/libgcbpf.so
+68335021b000-68335021d000 r--p 0021b000 fc:00 13107225                   /mydata/gc-bpf-fault/shim/libgcbpf.so
+68335021d000-68335021e000 rw-p 0021d000 fc:00 13107225                   /mydata/gc-bpf-fault/shim/libgcbpf.so
+68335021e000-68335021f000 rw-p 00000000 00:00 0 
+68335024b000-6833502fc000 rw-p 00000000 00:00 0 
+6833502fc000-683350300000 ---p 00000000 00:00 0 
+683350300000-6833503fc000 rw-p 00000000 00:00 0 
+6833503fc000-683380400000 rw-p 00000000 00:00 0 
+683380400000-683381400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+683381400000-683381800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:VO_BIT]
+683381800000-6a3382400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+6a3382400000-6a3382800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:CHUNK_MARK]
+6a3382800000-6a3385400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+6a3385400000-6a3385800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:VMGlobalLogBitSpec]
+6a3385800000-6c3b84800000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+6c3b84800000-6c3b84c00000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:IX_LINE_MARK]
+6c3b84c00000-6cbb84400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+6cbb84400000-6cbb84800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:IX_BLOCK_DEFRAG]
+6cbb84800000-6cbc84400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+6cbc84400000-6cbc84800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:IX_BLOCK_MARK]
+6cbc84800000-72de04400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+72de04400000-72de04800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:los:VMLocalLOSMarkNurserySpec]
+72de04800000-72e005400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+72e005400000-72e005800000 rw-p 00000000 00:00 0                          [anon:mmtk:sidemeta:immix:VMLocalMarkBitSpec]
+72e005800000-74e004400000 ---p 00000000 00:00 0                          [anon:mmtk:sidemeta:all:all-quarantined]
+74e00442c000-74e004431000 r--p 00000000 fc:00 49676385                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjsvml.so
+74e004431000-74e004472000 r-xp 00005000 fc:00 49676385                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjsvml.so
+74e004472000-74e0044fb000 r--p 00046000 fc:00 49676385                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjsvml.so
+74e0044fb000-74e0044fc000 r--p 000ce000 fc:00 49676385                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjsvml.so
+74e0044fc000-74e0044fd000 rw-p 000cf000 fc:00 49676385                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjsvml.so
+74e0044fd000-74e004501000 ---p 00000000 00:00 0 
+74e004501000-74e0045fd000 rw-p 00000000 00:00 0 
+74e0045fd000-74e0045fe000 ---p 00000000 00:00 0 
+74e0045fe000-74e0046fe000 rw-p 00000000 00:00 0 
+74e0046fe000-74e0046ff000 ---p 00000000 00:00 0 
+74e0046ff000-74e0047ff000 rw-p 00000000 00:00 0 
+74e0047ff000-74e024800000 rw-p 00000000 00:00 0 
+74e024800000-74e024b30000 rwxp 00000000 00:00 0 
+74e024b30000-74e02bc17000 ---p 00000000 00:00 0 
+74e02bc17000-74e02c007000 rwxp 00000000 00:00 0 
+74e02c007000-74e02c3e8000 ---p 00000000 00:00 0 
+74e02c3e8000-74e02c658000 rwxp 00000000 00:00 0 
+74e02c658000-74e033800000 ---p 00000000 00:00 0 
+74e033800000-74e03bfa0000 r--s 00000000 fc:00 49676291                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/modules
+74e03c000000-74e03c84a000 rw-p 00000000 00:00 0 
+74e03c84a000-74e040000000 ---p 00000000 00:00 0 
+74e040061000-74e040068000 r--s 00000000 08:03 1436340                    /usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache
+74e040068000-74e04006a000 r--p 00000000 fc:00 49676335                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libzip.so
+74e04006a000-74e04006f000 r-xp 00002000 fc:00 49676335                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libzip.so
+74e04006f000-74e040071000 r--p 00007000 fc:00 49676335                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libzip.so
+74e040071000-74e040072000 r--p 00008000 fc:00 49676335                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libzip.so
+74e040072000-74e040073000 rw-p 00009000 fc:00 49676335                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libzip.so
+74e040073000-74e040074000 ---p 00000000 00:00 0 
+74e040074000-74e040174000 rw-p 00000000 00:00 0 
+74e040174000-74e040178000 r--p 00000000 08:03 1410107                    /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.5
+74e040178000-74e04021f000 r-xp 00004000 08:03 1410107                    /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.5
+74e04021f000-74e04022c000 r--p 000ab000 08:03 1410107                    /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.5
+74e04022c000-74e04022d000 r--p 000b7000 08:03 1410107                    /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.5
+74e04022d000-74e04022e000 rw-p 000b8000 08:03 1410107                    /usr/lib/x86_64-linux-gnu/libzstd.so.1.5.5
+74e04022e000-74e040233000 rw-p 00000000 00:00 0 
+74e040233000-74e040317000 ---p 00000000 00:00 0 
+74e040317000-74e04031e000 rw-p 00000000 00:00 0 
+74e04031e000-74e040400000 ---p 00000000 00:00 0 
+74e040400000-74e040547000 r--p 00000000 fc:00 49676344                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libmmtk_openjdk.so
+74e040547000-74e0407c2000 r-xp 00146000 fc:00 49676344                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libmmtk_openjdk.so
+74e0407c2000-74e040802000 r--p 003c0000 fc:00 49676344                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libmmtk_openjdk.so
+74e040802000-74e040804000 rw-p 003ff000 fc:00 49676344                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libmmtk_openjdk.so
+74e040804000-74e040807000 rw-p 00000000 00:00 0 
+74e040808000-74e04080b000 r--p 00000000 fc:00 49676331                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnet.so
+74e04080b000-74e040813000 r-xp 00003000 fc:00 49676331                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnet.so
+74e040813000-74e040815000 r--p 0000b000 fc:00 49676331                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnet.so
+74e040815000-74e040816000 r--p 0000c000 fc:00 49676331                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnet.so
+74e040816000-74e040817000 rw-p 0000d000 fc:00 49676331                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnet.so
+74e040817000-74e04081b000 ---p 00000000 00:00 0 
+74e04081b000-74e040917000 rw-p 00000000 00:00 0 
+74e040917000-74e040927000 r--p 00000000 08:03 1411099                    /usr/lib/x86_64-linux-gnu/libm.so.6
+74e040927000-74e0409a6000 r-xp 00010000 08:03 1411099                    /usr/lib/x86_64-linux-gnu/libm.so.6
+74e0409a6000-74e0409fe000 r--p 0008f000 08:03 1411099                    /usr/lib/x86_64-linux-gnu/libm.so.6
+74e0409fe000-74e0409ff000 r--p 000e7000 08:03 1411099                    /usr/lib/x86_64-linux-gnu/libm.so.6
+74e0409ff000-74e040a00000 rw-p 000e8000 08:03 1411099                    /usr/lib/x86_64-linux-gnu/libm.so.6
+74e040a00000-74e040ca9000 r--p 00000000 fc:00 49676343                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libjvm.so
+74e040ca9000-74e041b3c000 r-xp 002a9000 fc:00 49676343                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libjvm.so
+74e041b3c000-74e041e20000 r--p 0113c000 fc:00 49676343                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libjvm.so
+74e041e20000-74e041ef6000 r--p 0141f000 fc:00 49676343                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libjvm.so
+74e041ef6000-74e041f26000 rw-p 014f5000 fc:00 49676343                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/server/libjvm.so
+74e041f26000-74e041f8c000 rw-p 00000000 00:00 0 
+74e041f8d000-74e041f94000 r--p 00000000 fc:00 49676332                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnio.so
+74e041f94000-74e041f9d000 r-xp 00007000 fc:00 49676332                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnio.so
+74e041f9d000-74e041fa1000 r--p 00010000 fc:00 49676332                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnio.so
+74e041fa1000-74e041fa2000 r--p 00014000 fc:00 49676332                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnio.so
+74e041fa2000-74e041fa3000 rw-p 00015000 fc:00 49676332                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libnio.so
+74e041fa3000-74e041fa6000 r--p 00000000 08:03 1410420                    /usr/lib/x86_64-linux-gnu/libelf-0.190.so
+74e041fa6000-74e041fbc000 r-xp 00003000 08:03 1410420                    /usr/lib/x86_64-linux-gnu/libelf-0.190.so
+74e041fbc000-74e041fc0000 r--p 00019000 08:03 1410420                    /usr/lib/x86_64-linux-gnu/libelf-0.190.so
+74e041fc0000-74e041fc1000 r--p 0001c000 08:03 1410420                    /usr/lib/x86_64-linux-gnu/libelf-0.190.so
+74e041fc1000-74e041fc2000 rw-p 0001d000 08:03 1410420                    /usr/lib/x86_64-linux-gnu/libelf-0.190.so
+74e041fc4000-74e041fc6000 r--p 00000000 fc:00 49676434                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement_ext.so
+74e041fc6000-74e041fc9000 r-xp 00002000 fc:00 49676434                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement_ext.so
+74e041fc9000-74e041fca000 r--p 00005000 fc:00 49676434                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement_ext.so
+74e041fca000-74e041fcb000 r--p 00006000 fc:00 49676434                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement_ext.so
+74e041fcb000-74e041fcc000 rw-p 00007000 fc:00 49676434                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement_ext.so
+74e041fcc000-74e041fd4000 rw-p 00000000 00:00 0 
+74e041fd4000-74e041fdc000 ---p 00000000 00:00 0 
+74e041fdc000-74e041fe9000 r--p 00000000 fc:00 49676327                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjava.so
+74e041fe9000-74e041ff8000 r-xp 0000d000 fc:00 49676327                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjava.so
+74e041ff8000-74e041ffd000 r--p 0001c000 fc:00 49676327                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjava.so
+74e041ffd000-74e041ffe000 r--p 00021000 fc:00 49676327                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjava.so
+74e041ffe000-74e041fff000 rw-p 00022000 fc:00 49676327                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjava.so
+74e041fff000-74e042000000 rw-p 00000000 00:00 0 
+74e042000000-74e042028000 r--p 00000000 08:03 1410238                    /usr/lib/x86_64-linux-gnu/libc.so.6
+74e042028000-74e0421b0000 r-xp 00028000 08:03 1410238                    /usr/lib/x86_64-linux-gnu/libc.so.6
+74e0421b0000-74e0421ff000 r--p 001b0000 08:03 1410238                    /usr/lib/x86_64-linux-gnu/libc.so.6
+74e0421ff000-74e042203000 r--p 001fe000 08:03 1410238                    /usr/lib/x86_64-linux-gnu/libc.so.6
+74e042203000-74e042205000 rw-p 00202000 08:03 1410238                    /usr/lib/x86_64-linux-gnu/libc.so.6
+74e042205000-74e042212000 rw-p 00000000 00:00 0 
+74e042212000-74e042214000 r--p 00000000 fc:00 49676363                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement.so
+74e042214000-74e042215000 r-xp 00002000 fc:00 49676363                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement.so
+74e042215000-74e042216000 r--p 00003000 fc:00 49676363                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement.so
+74e042216000-74e042217000 r--p 00003000 fc:00 49676363                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement.so
+74e042217000-74e042218000 rw-p 00004000 fc:00 49676363                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libmanagement.so
+74e042218000-74e042220000 rw-s 00000000 08:03 237590                     /tmp/hsperfdata_root/292333
+74e042220000-74e042224000 r--p 00000000 fc:00 49676328                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjimage.so
+74e042224000-74e04223b000 r-xp 00004000 fc:00 49676328                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjimage.so
+74e04223b000-74e042240000 r--p 0001b000 fc:00 49676328                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjimage.so
+74e042240000-74e042242000 r--p 00020000 fc:00 49676328                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjimage.so
+74e042242000-74e042243000 rw-p 00022000 fc:00 49676328                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjimage.so
+74e042243000-74e042247000 r--p 00000000 08:03 1410148                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+74e042247000-74e04226b000 r-xp 00004000 08:03 1410148                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+74e04226b000-74e04226f000 r--p 00028000 08:03 1410148                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+74e04226f000-74e042270000 r--p 0002b000 08:03 1410148                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+74e042270000-74e042271000 rw-p 0002c000 08:03 1410148                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+74e042271000-74e042273000 rw-p 00000000 00:00 0 
+74e042273000-74e042275000 r--p 00000000 08:03 1409104                    /usr/lib/x86_64-linux-gnu/libz.so.1.3
+74e042275000-74e042287000 r-xp 00002000 08:03 1409104                    /usr/lib/x86_64-linux-gnu/libz.so.1.3
+74e042287000-74e04228d000 r--p 00014000 08:03 1409104                    /usr/lib/x86_64-linux-gnu/libz.so.1.3
+74e04228d000-74e04228e000 r--p 0001a000 08:03 1409104                    /usr/lib/x86_64-linux-gnu/libz.so.1.3
+74e04228e000-74e04228f000 rw-p 0001b000 08:03 1409104                    /usr/lib/x86_64-linux-gnu/libz.so.1.3
+74e042294000-74e042295000 rw-s 00000000 00:10 68                         anon_inode:bpf-map
+74e042295000-74e042296000 r--s 00000000 00:10 68                         anon_inode:bpf-map
+74e042296000-74e042297000 ---p 00000000 00:00 0 
+74e042297000-74e042298000 r--p 00000000 00:00 0 
+74e042298000-74e042299000 ---p 00000000 00:00 0 
+74e042299000-74e04229b000 r--p 00000000 fc:00 49676329                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjli.so
+74e04229b000-74e0422a5000 r-xp 00002000 fc:00 49676329                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjli.so
+74e0422a5000-74e0422a8000 r--p 0000c000 fc:00 49676329                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjli.so
+74e0422a8000-74e0422a9000 r--p 0000f000 fc:00 49676329                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjli.so
+74e0422a9000-74e0422aa000 rw-p 00010000 fc:00 49676329                   /mydata/openjdk-mmtk/build/b0test/images/jdk/lib/libjli.so
+74e0422aa000-74e0422ac000 rw-p 00000000 00:00 0 
+74e0422ac000-74e0422b0000 r--p 00000000 00:00 0                          [vvar]
+74e0422b0000-74e0422b2000 r--p 00000000 00:00 0                          [vvar_vclock]
+74e0422b2000-74e0422b4000 r-xp 00000000 00:00 0                          [vdso]
+74e0422b4000-74e0422b5000 r--p 00000000 08:03 1409763                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+74e0422b5000-74e0422e0000 r-xp 00001000 08:03 1409763                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+74e0422e0000-74e0422ea000 r--p 0002c000 08:03 1409763                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+74e0422ea000-74e0422ec000 r--p 00036000 08:03 1409763                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+74e0422ec000-74e0422ee000 rw-p 00038000 08:03 1409763                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7ffe51196000-7ffe511b7000 rw-p 00000000 00:00 0                          [stack]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
+Total number of mappings: 376
+
+JVMTI agents: none
+
+
+VM Arguments:
+jvm_args: -XX:+UseThirdPartyHeap -Xms512m -Xmx512m 
+java_command: /mydata/dacapo/dacapo-23.11/dacapo-23.11-MR2-chopin.jar luindex -n 3
+java_class_path (initial): /mydata/dacapo/dacapo-23.11/dacapo-23.11-MR2-chopin.jar
+Launcher Type: SUN_STANDARD
+
+[Global flags]
+     intx CICompilerCount                          = 15                                        {product} {ergonomic}
+   size_t InitialHeapSize                          = 536870912                                 {product} {command line}
+   size_t MaxHeapSize                              = 536870912                                 {product} {command line}
+   size_t MinHeapDeltaBytes                        = 524288                                    {product} {ergonomic}
+   size_t MinHeapSize                              = 536870912                                 {product} {command line}
+    uintx NonNMethodCodeHeapSize                   = 8192380                                {pd product} {ergonomic}
+    uintx NonProfiledCodeHeapSize                  = 121732930                              {pd product} {ergonomic}
+    uintx ProfiledCodeHeapSize                     = 121732930                              {pd product} {ergonomic}
+    uintx ReservedCodeCacheSize                    = 251658240                              {pd product} {ergonomic}
+     bool SegmentedCodeCache                       = true                                      {product} {ergonomic}
+   size_t SoftMaxHeapSize                          = 536870912                              {manageable} {ergonomic}
+     bool UseCompressedOops                        = true                           {product lp64_product} {ergonomic}
+
+Logging:
+Log output configuration:
+ #0: stdout all=warning uptime,level,tags foldmultilines=false
+ #1: stderr all=off uptime,level,tags foldmultilines=false
+
+Release file:
+IMPLEMENTOR="N/A"
+JAVA_RUNTIME_VERSION="21.0.9-internal-adhoc.talzuss.openjdk-mmtk"
+JAVA_VERSION="21.0.9"
+JAVA_VERSION_DATE="2025-10-21"
+LIBC="gnu"
+MODULES="java.base java.compiler java.datatransfer java.xml java.prefs java.desktop java.instrument java.logging java.management java.security.sasl java.naming java.rmi java.management.rmi java.net.http java.scripting java.security.jgss java.transaction.xa java.sql java.sql.rowset java.xml.crypto java.se java.smartcardio jdk.accessibility jdk.internal.jvmstat jdk.attach jdk.charsets jdk.internal.opt jdk.zipfs jdk.compiler jdk.crypto.ec jdk.crypto.cryptoki jdk.dynalink jdk.internal.ed jdk.editpad jdk.hotspot.agent jdk.httpserver jdk.incubator.vector jdk.internal.le jdk.internal.vm.ci jdk.internal.vm.compiler jdk.internal.vm.compiler.management jdk.jartool jdk.javadoc jdk.jcmd jdk.management jdk.management.agent jdk.jconsole jdk.jdeps jdk.jdwp.agent jdk.jdi jdk.jfr jdk.jlink jdk.jpackage jdk.jshell jdk.jsobject jdk.jstatd jdk.localedata jdk.management.jfr jdk.naming.dns jdk.naming.rmi jdk.net jdk.nio.mapmode jdk.random jdk.sctp jdk.security.auth jdk.security.jgss jdk.unsupported jdk.unsupported.desktop jdk.xml.dom"
+OS_ARCH="x86_64"
+OS_NAME="Linux"
+SOURCE=".:git:b557520f04b3+"
+
+Environment Variables:
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+SHELL=/bin/bash
+LANG=en_US.UTF-8
+TERM=tmux-256color
+
+Active Locale:
+LC_ALL=en_US.UTF-8
+LC_COLLATE=en_US.UTF-8
+LC_CTYPE=en_US.UTF-8
+LC_MESSAGES=en_US.UTF-8
+LC_MONETARY=en_US.UTF-8
+LC_NUMERIC=en_US.UTF-8
+LC_TIME=en_US.UTF-8
+
+Signal Handlers:
+   SIGSEGV: crash_handler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, unblocked
+    SIGBUS: crash_handler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, unblocked
+    SIGFPE: crash_handler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, unblocked
+   SIGPIPE: javaSignalHandler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, blocked
+   SIGXFSZ: javaSignalHandler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, blocked
+    SIGILL: crash_handler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, unblocked
+   SIGUSR2: SR_handler in libjvm.so, mask=00000000000000000000000000000000, flags=SA_RESTART|SA_SIGINFO, blocked
+    SIGHUP: UserHandler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, blocked
+    SIGINT: UserHandler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, blocked
+   SIGTERM: UserHandler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, blocked
+   SIGQUIT: UserHandler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, blocked
+   SIGTRAP: crash_handler in libjvm.so, mask=11100100010111111101111111111110, flags=SA_RESTART|SA_SIGINFO, unblocked
+
+
+Periodic native trim disabled
+
+---------------  S Y S T E M  ---------------
+
+OS:
+DISTRIB_ID=Ubuntu
+DISTRIB_RELEASE=24.04
+DISTRIB_CODENAME=noble
+DISTRIB_DESCRIPTION="Ubuntu 24.04.4 LTS"
+uname: Linux 6.17.0-bpf-fault+ #1 SMP PREEMPT_DYNAMIC Mon Jul  6 16:43:12 MDT 2026 x86_64
+OS uptime: 0 days 19:26 hours
+libc: glibc 2.39 NPTL 2.39 
+rlimit (soft/hard): STACK 8192k/infinity , CORE 0k/0k , NPROC 513205/513205 , NOFILE 1048576/1048576 , AS infinity/infinity , CPU infinity/infinity , DATA infinity/infinity , FSIZE infinity/infinity , MEMLOCK 16436528k/16436528k
+load average: 0.87 0.78 0.84
+
+/proc/meminfo:
+MemTotal:       131492232 kB
+MemFree:        82172908 kB
+MemAvailable:   123966500 kB
+Buffers:          510112 kB
+Cached:         40690392 kB
+SwapCached:            0 kB
+Active:          2183128 kB
+Inactive:       40391104 kB
+Active(anon):    1390160 kB
+Inactive(anon):        0 kB
+Active(file):     792968 kB
+Inactive(file): 40391104 kB
+Unevictable:       41912 kB
+Mlocked:           38840 kB
+SwapTotal:       8388604 kB
+SwapFree:        8388604 kB
+Zswap:                 0 kB
+Zswapped:              0 kB
+Dirty:           1242716 kB
+Writeback:             0 kB
+AnonPages:       1416924 kB
+Mapped:          3391116 kB
+Shmem:              5316 kB
+KReclaimable:    1860756 kB
+Slab:            2378712 kB
+SReclaimable:    1860756 kB
+SUnreclaim:       517956 kB
+KernelStack:        9920 kB
+PageTables:        27284 kB
+SecPageTables:      8692 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:    74134720 kB
+Committed_AS:   159881124 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:       35924 kB
+VmallocChunk:          0 kB
+Percpu:            48896 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:   2152448 kB
+FilePmdMapped:         0 kB
+Unaccepted:            0 kB
+Balloon:               0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
+DirectMap4k:      645952 kB
+DirectMap2M:    18864128 kB
+DirectMap1G:    114294784 kB
+
+/sys/kernel/mm/transparent_hugepage/enabled: always [madvise] never
+/sys/kernel/mm/transparent_hugepage/hpage_pmd_size: 2097152
+/sys/kernel/mm/transparent_hugepage/defrag (defrag/compaction efforts parameter): always defer defer+madvise [madvise] never
+
+Process Memory:
+Virtual Size: 13617948108K (peak: 13617948108K)
+Resident Set Size: 4031768K (peak: 4031768K) (anon: 858256K, file: 3173512K, shmem: 0K)
+Swapped out: 0K
+C-Heap outstanding allocations: 1343037K, retained: 14434K
+glibc malloc tunables: (default)
+
+/proc/sys/kernel/threads-max (system-wide limit on the number of threads): 1026411
+/proc/sys/vm/max_map_count (maximum number of memory map areas a process may have): 1048576
+/proc/sys/vm/swappiness (control to define how aggressively the kernel swaps out anonymous memory): 60
+/proc/sys/kernel/pid_max (system-wide limit on number of process identifiers): 4194304
+
+container information not found.
+Steal ticks since vm start: 0
+Steal ticks percentage since vm start:  0.000
+
+CPU: total 32 (initial active 32) (32 cores per cpu, 2 threads per core) family 23 model 49 stepping 0 microcode 0x830107c, cx8, cmov, fxsr, ht, mmx, 3dnowpref, sse, sse2, sse3, ssse3, sse4a, sse4.1, sse4.2, popcnt, lzcnt, tsc, tscinvbit, avx, avx2, aes, clmul, bmi1, bmi2, adx, sha, fma, vzeroupper, clflush, clflushopt, rdtscp, rdpid, f16c
+CPU Model and flags from /proc/cpuinfo:
+model name	: AMD EPYC 7302P 16-Core Processor
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local clzero irperf xsaveerptr rdpru wbnoinvd amd_ppin arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif v_spec_ctrl umip rdpid overflow_recov succor smca sev sev_es
+
+Online cpus: 0-31
+Offline cpus: 
+BIOS frequency limitation: <Not Available>
+Frequency switch latency (ns): <Not Available>
+Available cpu frequencies: <Not Available>
+Current governor: <Not Available>
+Core performance/turbo boost: <Not Available>
+
+Memory: 4k page, physical 131492232k(123966500k free), swap 8388604k(8388604k free)
+Page Sizes: 4k
+
+vm_info: OpenJDK 64-Bit Server VM (21.0.9-internal-adhoc.talzuss.openjdk-mmtk) for linux-amd64 JRE (21.0.9-internal-adhoc.talzuss.openjdk-mmtk), built on 2026-07-06T23:13:08Z by "talzuss" with gcc 13.3.0
+heap_info: MMTk OpenJDK 0.32.0 (15c0350-dirty), using MMTk 0.32.0 (06c0b68-dirty, BUILTIN_ENV_LOGGER, DEFAULT, EAGER_SWEEPING, VO_BIT)@
+
+END.

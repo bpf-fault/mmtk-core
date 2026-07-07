@@ -79,6 +79,17 @@ pub(crate) struct SatbPages {
     /// edges, measured as downstream heap corruption).
     drain_stop: AtomicBool,
     drainer_running: AtomicBool,
+    /// VO-bitmap snapshot taken at InitialMark, BEFORE any of this cycle's
+    /// marking.  Conservative candidates are validated against THIS map:
+    /// the live VO map is poisoned by our own conservative marks at the
+    /// next sweep (CopyFromMarkBits copies mark bits, including marks we
+    /// set on candidates, into VO bits) -- measured as ASCII text data
+    /// acquiring vo=true and then crashing the tracer.  The snapshot is
+    /// pure by induction: marks only ever land on snapshot-validated
+    /// genuine objects, so the sweep-copied VO stays a true allocation
+    /// map.  Post-mark-start allocations are absent and skipped (they are
+    /// allocate-black and need no SATB rescue).
+    alloc_map: *mut u8,
 }
 
 unsafe impl Sync for SatbPages {}
@@ -109,6 +120,16 @@ impl SatbPages {
             stash: std::sync::Mutex::new(Vec::new()),
             drain_stop: AtomicBool::new(false),
             drainer_running: AtomicBool::new(false),
+            alloc_map: unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    (span >> 6).max(4096),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                ) as *mut u8
+            },
         }
     }
 
@@ -146,6 +167,46 @@ impl SatbPages {
             }
         }
         assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on");
+        self.armed.lock().unwrap().push((start, bytes));
+    }
+
+    /// Arm an arbitrary page-aligned run (LOS object runs, immortal
+    /// pages): register+pre-touch its chunk envelope, WP the exact run,
+    /// snapshot its alloc-map slice.  Overwritten refs in un-armed spaces
+    /// were the measured retention gap (ConcurrentHashMap tables live in
+    /// the LOS; their overwritten slots' old targets were lost).
+    pub fn arm_pages(&self, start: Address, bytes: usize) {
+        let cstart = unsafe { Address::from_usize(start.as_usize() & !(CHUNK - 1)) };
+        let cend = (start + bytes).align_up(CHUNK);
+        // pre-touch + register the chunk envelope (idempotent)
+        let mut c = (cstart - self.base) / CHUNK;
+        let end_c = (cend - self.base) / CHUNK;
+        while c < end_c {
+            let (w, b) = (c >> 6, c & 63);
+            if self.touched[w].load(Ordering::Relaxed) & (1 << b) == 0 {
+                unsafe {
+                    let mut off = c * CHUNK;
+                    let lim = off + CHUNK;
+                    while off < lim {
+                        std::ptr::write_volatile(self.snaps.add(off), 0);
+                        off += BYTES_IN_PAGE;
+                    }
+                    std::ptr::write_volatile(
+                        self.flags.add(c * (CHUNK >> LOG_BYTES_IN_PAGE)),
+                        0,
+                    );
+                }
+                self.touched[w].fetch_or(1 << b, Ordering::Relaxed);
+            }
+            let chunk_addr = self.base + c * CHUNK;
+            let mut reg = self.registered.lock().unwrap();
+            if reg.insert(chunk_addr.as_usize()) {
+                assert_eq!(self.shim.register(chunk_addr, CHUNK), 0, "gcsatb register");
+            }
+            c += 1;
+        }
+        self.snapshot_alloc_map_range(start, bytes);
+        assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on (run)");
         self.armed.lock().unwrap().push((start, bytes));
     }
 
@@ -217,6 +278,115 @@ impl SatbPages {
     /// InitialMark: allow the next drainer to run.
     pub fn allow_drainer(&self) {
         self.drain_stop.store(false, Ordering::Release);
+    }
+
+    /// InitialMark: clear the whole alloc-map snapshot before the
+    /// per-range copies -- slices for chunks NOT re-snapshotted this
+    /// cycle would otherwise hold STALE starts (measured: phantom
+    /// spanning-heads from freed chunks feeding garbage to the tracer).
+    pub fn clear_alloc_map(&self) {
+        unsafe {
+            std::ptr::write_bytes(self.alloc_map, 0, self.span >> 6);
+        }
+    }
+
+    /// Find the last alloc-map start strictly before `addr`, scanning back
+    /// at most `max_back` bytes (LOS objects span megabytes; a short
+    /// window misses their heads and loses their overwritten slots).
+    pub fn prev_start(&self, addr: Address, max_back: usize) -> Option<Address> {
+        let w_end = (addr - self.base) >> 3; // exclusive, 8-byte grain
+        let w_lo = w_end.saturating_sub(max_back >> 3);
+        let mut byte = (w_end + 7) >> 3;
+        let byte_lo = w_lo >> 3;
+        while byte > byte_lo {
+            byte -= 1;
+            let v = unsafe { *self.alloc_map.add(byte) };
+            if v != 0 {
+                // highest set bit whose word index < w_end
+                for bit in (0..8).rev() {
+                    if v & (1 << bit) != 0 {
+                        let w = (byte << 3) | bit;
+                        if w < w_end && w >= w_lo {
+                            return Some(self.base + (w << 3));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// InitialMark (before any marking): snapshot the VO bitmap slice for
+    /// one chunk into the trusted allocation map.  PER-CHUNK: VO metadata
+    /// is only mapped for in-use chunks; a whole-span copy faults on the
+    /// gaps (the same lesson as the candidate-filter metadata reads).
+    pub fn snapshot_alloc_map_range(&self, start: Address, bytes: usize) {
+        #[cfg(feature = "vo_bit")]
+        unsafe {
+            let spec = &crate::util::metadata::side_metadata::spec_defs::VO_BIT;
+            let src = crate::util::metadata::side_metadata::address_to_meta_address(
+                spec, start,
+            );
+            std::ptr::copy_nonoverlapping(
+                src.to_ptr::<u8>(),
+                self.alloc_map.add((start - self.base) >> 6),
+                bytes >> 6,
+            );
+        }
+    }
+
+    /// Sweep all flagged snapshot pages, visiting (page_index) and
+    /// clearing flags.  FinalMark only (drainer quiesced).
+    pub fn sweep_flags<F: FnMut(usize)>(&self, mut visit: F) {
+        let total = self.span >> LOG_BYTES_IN_PAGE;
+        for idx in 0..total {
+            let flag = unsafe { std::ptr::read_volatile(self.flags.add(idx)) };
+            if flag != 0 {
+                unsafe { std::ptr::write_volatile(self.flags.add(idx), 0) };
+                visit(idx);
+            }
+        }
+    }
+
+    /// Is this page currently flagged (snapshot present)?  For mixed-source
+    /// slot reads during the FinalMark sweep, flags must be consulted via
+    /// `snapshotted` BEFORE clearing -- so the sweep records indices first.
+    pub fn snapshot_page(&self, idx: usize) -> *const u8 {
+        unsafe { self.snaps.add(idx << LOG_BYTES_IN_PAGE) }
+    }
+
+    pub fn page_index_of(&self, addr: Address) -> usize {
+        (addr - self.base) >> LOG_BYTES_IN_PAGE
+    }
+
+    pub fn heap_base(&self) -> Address {
+        self.base
+    }
+
+    pub fn heap_span(&self) -> usize {
+        self.span
+    }
+
+    /// Scan the alloc-map snapshot for object starts in [start, start+bytes)
+    /// (8-byte grain), visiting each start address.
+    pub fn alloc_map_starts<F: FnMut(Address)>(&self, start: Address, bytes: usize, mut visit: F) {
+        let first = (start - self.base) >> 3;
+        let last = (start + bytes - self.base) >> 3;
+        for w in first..last {
+            let byte = w >> 3;
+            let bit = (w & 7) as u8;
+            if unsafe { (*self.alloc_map.add(byte) >> bit) & 1 } == 1 {
+                visit(self.base + (w << 3));
+            }
+        }
+    }
+
+    /// Was `addr` an allocated object start at mark start (8-byte grain)?
+    pub fn in_alloc_map(&self, addr: Address) -> bool {
+        let off = addr - self.base;
+        let byte = off >> 6;          /* VO: 1 bit per 8 bytes */
+        let bit = ((off >> 3) & 7) as u8;
+        unsafe { (*self.alloc_map.add(byte) >> bit) & 1 == 1 }
     }
 
     /// Drain up to `max_pages` flagged snapshot pages: conservatively

@@ -189,6 +189,69 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 );
             }
             Pause::InitialMark => {
+                // Page-COW SATB: write-protect the immix space so first
+                // writes snapshot their page in-kernel.  (LOS/immortal/
+                // nonmoving are not armed; FinalMark rescans them.)
+                if let Some(t) = crate::util::satb_pages::satb_pages() {
+                    use crate::util::heap::chunk_map::Chunk;
+                    use crate::util::linear_scan::Region;
+                    t.reset_cursor();
+                    t.clear_young();
+                    t.allow_drainer();
+                    t.clear_alloc_map();
+                    for chunk in self.immix_space.chunk_map.all_chunks() {
+                        t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
+                        t.arm(chunk.start(), Chunk::BYTES);
+                    }
+                    // Nonmoving is an immix space too: arm its chunks.
+                    for chunk in self.common.get_nonmoving().chunk_map.all_chunks() {
+                        t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
+                        t.arm(chunk.start(), Chunk::BYTES);
+                    }
+                    // LOS + immortal: arm live-object page runs.  Their
+                    // overwritten slots were the measured retention gap
+                    // (big arrays -- e.g. ConcurrentHashMap tables -- live
+                    // in the LOS).
+                    {
+                        use crate::util::object_enum::ClosureObjectEnumerator;
+                        use crate::vm::ObjectModel as _;
+                        const PAGE: usize = crate::util::satb_pages::BYTES_IN_PAGE;
+                        let mut runs: Vec<(crate::util::Address, usize)> = Vec::new();
+                        {
+                            let mut push = |obj: crate::util::ObjectReference| {
+                                let s = obj.to_object_start::<VM>().align_down(PAGE);
+                                let e = (obj.to_object_start::<VM>()
+                                    + VM::VMObjectModel::get_current_size(obj))
+                                .align_up(PAGE);
+                                runs.push((s, e - s));
+                            };
+                            let mut en = ClosureObjectEnumerator::<_, VM>::new(&mut push);
+                            // Space-trait enumerate: visits the ALLOC
+                            // NURSERY too -- fresh LOS objects (e.g. a
+                            // growing ConcurrentHashMap's new table) were
+                            // unarmed via to_space-only enumeration, the
+                            // measured retention gap.
+                            crate::policy::space::Space::enumerate_objects(
+                                self.common.get_los(), &mut en);
+                            let mut en = ClosureObjectEnumerator::<_, VM>::new(&mut push);
+                            self.common.get_immortal().enumerate_objects(&mut en);
+                        }
+                        runs.sort_unstable_by_key(|r| r.0);
+                        let mut coalesced: Vec<(crate::util::Address, usize)> = Vec::new();
+                        for (s, b) in runs {
+                            match coalesced.last_mut() {
+                                Some(l) if s <= l.0 + l.1 => {
+                                    let e = std::cmp::max(l.0 + l.1, s + b);
+                                    l.1 = e - l.0;
+                                }
+                                _ => coalesced.push((s, b)),
+                            }
+                        }
+                        for (s, b) in coalesced {
+                            t.arm_pages(s, b);
+                        }
+                    }
+                }
                 self.immix_space.prepare(
                     true,
                     Some(StatsForDefrag::new(self)),
@@ -200,19 +263,6 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 // Bulk set log bits so SATB barrier will be triggered on the existing objects.
                 self.common
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
-                // Page-COW SATB: write-protect the immix space so first
-                // writes snapshot their page in-kernel.  (LOS/immortal/
-                // nonmoving are not armed; FinalMark rescans them.)
-                if let Some(t) = crate::util::satb_pages::satb_pages() {
-                    use crate::util::heap::chunk_map::Chunk;
-                    use crate::util::linear_scan::Region;
-                    t.reset_cursor();
-                    t.clear_young();
-                    t.allow_drainer();
-                    for chunk in self.immix_space.chunk_map.all_chunks() {
-                        t.arm(chunk.start(), Chunk::BYTES);
-                    }
-                }
             }
             Pause::FinalMark => (),
         }
@@ -402,12 +452,8 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
         scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<
             ConcurrentImmixGCWorkContext<UnsupportedProcessEdges<VM>>,
         >::new(self));
-        if crate::util::satb_pages::satb_pages_active() {
-            // Runs in the pause; spawns the drainer THREAD (see
-            // SatbDrainStart for why it must not be a re-enqueueing packet).
-            scheduler.work_buckets[WorkBucketStage::Unconstrained]
-                .add(super::gc_work::SatbDrainStart::<VM>::new());
-        }
+        // EXACT drain design: all snapshot processing happens at
+        // FinalMark; no concurrent drainer (flags simply accumulate).
     }
 
     fn schedule_concurrent_marking_final_pause(&'static self, scheduler: &GCWorkScheduler<VM>) {

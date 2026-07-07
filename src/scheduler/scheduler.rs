@@ -658,6 +658,12 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
 
     pub(super) fn schedule_concurrent_packets(&self) -> bool {
         let concurrent_bucket = &self.work_buckets[WorkBucketStage::Concurrent];
+        if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+            eprintln!(
+                "[sched] gc_finished: concurrent_bucket empty={}",
+                concurrent_bucket.is_empty()
+            );
+        }
         if !concurrent_bucket.is_empty() {
             concurrent_bucket.set_enabled(true);
             concurrent_bucket.open();

@@ -70,12 +70,28 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         if !self.satb.is_empty() {
             if self.should_create_satb_packets() {
                 let satb = self.satb.take();
-                let bucket = if self.plan.concurrent_work_in_progress() {
+                // Once the FinalMark pause is CURRENT (set at schedule
+                // time), SATB packets must go to a bucket this pause
+                // drains: packets left in Concurrent are re-opened AFTER
+                // the pause and trace with marking off, racing sweeping
+                // and mutators (measured heap corruption).  The mutator
+                // flushes run inside stop_all_mutators, BEFORE
+                // notify_mutators_paused clears the marking state, so the
+                // state alone cannot make this choice.
+                let nofix = std::env::var_os("MMTK_SATB_NOFIX").is_some();
+                let bucket = if self.plan.concurrent_work_in_progress()
+                    && (nofix || self.plan.current_pause() != Some(Pause::FinalMark))
+                {
                     WorkBucketStage::Concurrent
                 } else {
                     debug_assert_ne!(self.plan.current_pause(), Some(Pause::InitialMark));
                     WorkBucketStage::Closure
                 };
+                if std::env::var_os("MMTK_SATB_COMMS").is_some()
+                    && self.plan.current_pause() == Some(Pause::FinalMark)
+                {
+                    eprintln!("[sched] FinalMark flush_satb -> {:?}", bucket);
+                }
                 self.mmtk.scheduler.work_buckets[bucket]
                     .add(ProcessModBufSATB::<VM, P, KIND>::new(satb));
             } else {
@@ -88,7 +104,11 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
     fn flush_weak_refs(&mut self) {
         if !self.refs.is_empty() {
             let nodes = self.refs.take();
-            let bucket = if self.plan.concurrent_work_in_progress() {
+            // Same FinalMark routing as flush_satb (see above).
+            let nofix = std::env::var_os("MMTK_SATB_NOFIX").is_some();
+            let bucket = if self.plan.concurrent_work_in_progress()
+                && (nofix || self.plan.current_pause() != Some(Pause::FinalMark))
+            {
                 WorkBucketStage::Concurrent
             } else {
                 debug_assert_ne!(self.plan.current_pause(), Some(Pause::InitialMark));

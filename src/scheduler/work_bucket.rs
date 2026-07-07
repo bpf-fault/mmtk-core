@@ -32,6 +32,10 @@ impl<VM: VMBinding> BucketQueue<VM> {
         self.queue.push(w);
     }
 
+    fn steal_one(&self) -> crossbeam::deque::Steal<Box<dyn GCWork<VM>>> {
+        self.queue.steal()
+    }
+
     fn push_all(&self, ws: Vec<Box<dyn GCWork<VM>>>) {
         for w in ws {
             self.queue.push(w);
@@ -197,6 +201,25 @@ impl<VM: VMBinding> WorkBucket<VM> {
     }
 
     /// Add a work packet to this bucket
+    /// Move every queued packet into `target`.  Used by concurrent plans
+    /// to migrate the Concurrent bucket's backlog into a pause bucket so
+    /// the pause processes it (packets left behind would otherwise be
+    /// re-opened AFTER the pause and run with marking state cleared).
+    pub fn drain_to(&self, target: &WorkBucket<VM>) -> usize {
+        let mut n = 0;
+        loop {
+            match self.queue.steal_one() {
+                crossbeam::deque::Steal::Success(w) => {
+                    target.add_boxed_no_notify(w);
+                    n += 1;
+                }
+                crossbeam::deque::Steal::Empty => break,
+                crossbeam::deque::Steal::Retry => continue,
+            }
+        }
+        n
+    }
+
     pub fn add_boxed(&self, work: Box<dyn GCWork<VM>>) {
         self.queue.push(work);
         self.notify_one_worker();

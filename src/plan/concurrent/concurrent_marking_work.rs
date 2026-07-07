@@ -54,7 +54,21 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
             let objects = self.next_objects.take();
             let worker = self.worker();
             let w = Self::new(objects, worker.mmtk);
-            worker.add_work(WorkBucketStage::Concurrent, w);
+            // Follow-on tracing must run in the bucket of the CURRENT
+            // phase: during the FinalMark pause (marking state off),
+            // pushing to Concurrent would leave the packet for AFTER the
+            // pause, where it traces with marking off and races sweeping
+            // and mutators (measured heap corruption); Closure is drained
+            // within the pause.
+            let nofix = std::env::var_os("MMTK_SATB_NOFIX").is_some();
+            let bucket = if self.plan.concurrent_work_in_progress()
+                && (nofix || self.plan.current_pause() != Some(super::Pause::FinalMark))
+            {
+                WorkBucketStage::Concurrent
+            } else {
+                WorkBucketStage::Closure
+            };
+            worker.add_work(bucket, w);
         }
     }
 

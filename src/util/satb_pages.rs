@@ -29,6 +29,7 @@ pub fn satb_pages_active() -> bool {
 }
 
 static VERIFY: AtomicBool = AtomicBool::new(false);
+static UFFD_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
 /// MMTK_SATB_VERIFY: differential oracle — the compiled SATB barrier
 /// stays enabled (correct execution), while the page machinery arms,
@@ -57,6 +58,9 @@ pub(crate) fn init_satb_pages(start: Address, end: Address) {
     ACTIVE.store(true, Ordering::Relaxed);
     if std::env::var_os("MMTK_SATB_VERIFY").is_some() {
         VERIFY.store(true, Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+        TRACKER.get().unwrap().spawn_comm_dumper();
     }
 }
 
@@ -111,6 +115,23 @@ unsafe impl Sync for SatbPages {}
 unsafe impl Send for SatbPages {}
 
 impl SatbPages {
+    /// Spawn a thread that dumps the fault-comm table every second
+    /// (crash-tolerant: visible before FinalMark's disarm).
+    pub fn spawn_comm_dumper(&self) {
+        std::thread::spawn(|| unsafe {
+            let c = std::ffi::CString::new("gcsatb_dump_comms").unwrap();
+            let p = libc::dlsym(libc::RTLD_DEFAULT as *mut libc::c_void, c.as_ptr());
+            if p.is_null() {
+                return;
+            }
+            let f: unsafe extern "C" fn() = std::mem::transmute(p);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                f();
+            }
+        });
+    }
+
     fn new(base: Address, span: usize) -> Self {
         let shim = shim::Shim::load();
         assert_eq!(shim.init(base, span), 0, "gcsatb_init failed");
@@ -154,6 +175,7 @@ impl SatbPages {
     /// Arm a (chunk-aligned) range: register, pre-touch its arena slice
     /// (first time), and write-protect it.
     pub fn arm(&self, start: Address, bytes: usize) {
+        let uffd_mode = std::env::var_os("MMTK_SATB_UFFD").is_some();
         debug_assert!(start >= self.base && start + bytes <= self.base + self.span);
         let mut c = (start - self.base) / CHUNK;
         let end_c = (start + bytes - self.base).div_ceil(CHUNK);
@@ -201,9 +223,7 @@ impl SatbPages {
     /// timing; if it is clean, the bug lives in the (small) diff between
     /// the two kernel paths.
     pub fn uffd_arm(&self, start: Address, bytes: usize) {
-        use std::sync::atomic::AtomicI32;
-        static UFFD: AtomicI32 = AtomicI32::new(-1);
-        let mut fd = UFFD.load(Ordering::Relaxed);
+        let mut fd = UFFD_FD.load(Ordering::Relaxed);
         if fd < 0 {
             unsafe {
                 // userfaultfd(O_CLOEXEC) + API handshake with WP_ASYNC
@@ -218,7 +238,7 @@ impl SatbPages {
                 };
                 let r = libc::ioctl(fd, 0xc018aa3f_u64 as _, &mut api); // UFFDIO_API
                 assert_eq!(r, 0, "UFFDIO_API failed");
-                UFFD.store(fd, Ordering::Relaxed);
+                UFFD_FD.store(fd, Ordering::Relaxed);
             }
         }
         unsafe {
@@ -226,13 +246,26 @@ impl SatbPages {
             struct UffdioRange { start: u64, len: u64 }
             #[repr(C)]
             struct UffdioRegister { range: UffdioRange, mode: u64, ioctls: u64 }
-            let mut reg = UffdioRegister {
-                range: UffdioRange { start: start.as_usize() as u64, len: bytes as u64 },
-                mode: 1 << 1,                        // UFFDIO_REGISTER_MODE_WP
-                ioctls: 0,
-            };
-            let r = libc::ioctl(fd, 0xc020aa00_u64 as _, &mut reg); // UFFDIO_REGISTER
-            assert_eq!(r, 0, "UFFDIO_REGISTER failed");
+            // Register ONCE per range: re-registering an already-
+            // registered range returns EBUSY (this assert firing on the
+            // SECOND cycle's arming was the entire "uffd failure" class
+            // in the bisect matrix -- a harness bug, not a kernel or
+            // plan defect).
+            {
+                let mut seen = self.registered.lock().unwrap();
+                if seen.insert(start.as_usize() | 1) {
+                    let mut reg = UffdioRegister {
+                        range: UffdioRange {
+                            start: start.as_usize() as u64,
+                            len: bytes as u64,
+                        },
+                        mode: 1 << 1,                // UFFDIO_REGISTER_MODE_WP
+                        ioctls: 0,
+                    };
+                    let r = libc::ioctl(fd, 0xc020aa00_u64 as _, &mut reg);
+                    assert_eq!(r, 0, "UFFDIO_REGISTER failed");
+                }
+            }
             #[repr(C)]
             struct UffdioWriteprotect { range: UffdioRange, mode: u64 }
             let mut wp = UffdioWriteprotect {
@@ -241,6 +274,30 @@ impl SatbPages {
             };
             let r = libc::ioctl(fd, 0xc018aa06_u64 as _, &mut wp); // UFFDIO_WRITEPROTECT
             assert_eq!(r, 0, "UFFDIO_WRITEPROTECT failed");
+        }
+    }
+
+    /// Resolve uffd write-protection on a range (mode = 0).
+    pub fn uffd_disarm(&self, start: Address, bytes: usize) {
+        use std::sync::atomic::AtomicI32;
+        // same fd as uffd_arm's static
+        static UFFD2: AtomicI32 = AtomicI32::new(-1);
+        let _ = &UFFD2;
+        unsafe {
+            #[repr(C)]
+            struct UffdioRange { start: u64, len: u64 }
+            #[repr(C)]
+            struct UffdioWriteprotect { range: UffdioRange, mode: u64 }
+            let fd = UFFD_FD.load(Ordering::Relaxed);
+            if fd < 0 {
+                return;
+            }
+            let mut wp = UffdioWriteprotect {
+                range: UffdioRange { start: start.as_usize() as u64, len: bytes as u64 },
+                mode: 0,
+            };
+            let r = libc::ioctl(fd, 0xc018aa06_u64 as _, &mut wp);
+            assert_eq!(r, 0, "UFFDIO_WRITEPROTECT(off) failed");
         }
     }
 
@@ -370,6 +427,9 @@ impl SatbPages {
     /// at most `max_back` bytes (LOS objects span megabytes; a short
     /// window misses their heads and loses their overwritten slots).
     pub fn prev_start(&self, addr: Address, max_back: usize) -> Option<Address> {
+        if addr <= self.base || addr > self.base + self.span {
+            return None;
+        }
         let w_end = (addr - self.base) >> 3; // exclusive, 8-byte grain
         let w_lo = w_end.saturating_sub(max_back >> 3);
         let mut byte = (w_end + 7) >> 3;
@@ -428,10 +488,17 @@ impl SatbPages {
     /// slot reads during the FinalMark sweep, flags must be consulted via
     /// `snapshotted` BEFORE clearing -- so the sweep records indices first.
     pub fn snapshot_page(&self, idx: usize) -> *const u8 {
+        assert!(idx < self.span >> LOG_BYTES_IN_PAGE, "snapshot_page OOB");
         unsafe { self.snaps.add(idx << LOG_BYTES_IN_PAGE) }
     }
 
+    /// Page index; usize::MAX for out-of-span addresses (slot iteration
+    /// can yield addresses outside the heap span — VM spaces, or wild
+    /// values downstream of corruption; never index buffers with them).
     pub fn page_index_of(&self, addr: Address) -> usize {
+        if addr < self.base || addr >= self.base + self.span {
+            return usize::MAX;
+        }
         (addr - self.base) >> LOG_BYTES_IN_PAGE
     }
 
@@ -446,6 +513,9 @@ impl SatbPages {
     /// Scan the alloc-map snapshot for object starts in [start, start+bytes)
     /// (8-byte grain), visiting each start address.
     pub fn alloc_map_starts<F: FnMut(Address)>(&self, start: Address, bytes: usize, mut visit: F) {
+        if start < self.base || start + bytes > self.base + self.span {
+            return;
+        }
         let first = (start - self.base) >> 3;
         let last = (start + bytes - self.base) >> 3;
         for w in first..last {

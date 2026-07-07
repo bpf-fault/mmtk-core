@@ -153,6 +153,9 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         };
 
         self.current_pause.store(Some(pause), Ordering::SeqCst);
+        if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+            eprintln!("[sched] schedule_collection pause={:?}", pause);
+        }
 
         probe!(mmtk, concurrent_pause_determined, pause as usize);
 
@@ -189,16 +192,33 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 );
             }
             Pause::InitialMark => {
+                // Pure-timing probe: a plain sleep in prepare, no memory
+                // mechanism at all.  If this alone corrupts the heap, the
+                // race is an upstream InitialMark scheduling window that
+                // ANY slow prepare exposes.
+                if let Ok(ms) = std::env::var("MMTK_SATB_SLEEP") {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
+                }
                 // Page-COW SATB: write-protect the immix space so first
                 // writes snapshot their page in-kernel.  (LOS/immortal/
                 // nonmoving are not armed; FinalMark rescans them.)
                 if let Some(t) = crate::util::satb_pages::satb_pages() {
                     use crate::util::heap::chunk_map::Chunk;
                     use crate::util::linear_scan::Region;
+                    let phase = std::env::var("MMTK_SATB_ARMPHASE")
+                        .unwrap_or_else(|_| "initial".into());
+                    if phase == "final" {
+                        // faults-outside-marking probe: pages armed at the
+                        // previous FinalMark; resolve them now.
+                        t.disarm_all();
+                    }
                     t.reset_cursor();
                     t.clear_young();
                     t.allow_drainer();
                     t.clear_alloc_map();
+                    if phase != "final" {
                     // bisect gates
                     let noarm = std::env::var_os("MMTK_SATB_NOARM").is_some();
                     let no_los = std::env::var_os("MMTK_SATB_NOLOS").is_some();
@@ -270,6 +290,11 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     }
                     }
                     }
+                    }
+                    if phase == "pulse" {
+                        // PTE-churn-only probe: no delayed mutator stores.
+                        t.disarm_all();
+                    }
                 }
                 self.immix_space.prepare(
                     true,
@@ -283,7 +308,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 self.common
                     .schedule_unlog_bits_op(UnlogBitsOperation::BulkSet);
             }
-            Pause::FinalMark => (),
+            Pause::FinalMark => {
+                if std::env::var("MMTK_SATB_ARMPHASE").as_deref() == Ok("final") {
+                    if let Some(t) = crate::util::satb_pages::satb_pages() {
+                        use crate::util::heap::chunk_map::Chunk;
+                        use crate::util::linear_scan::Region;
+                        for chunk in self.immix_space.chunk_map.all_chunks() {
+                            t.arm(chunk.start(), Chunk::BYTES);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -292,7 +327,9 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
         match pause {
             Pause::InitialMark => (),
             Pause::Full | Pause::FinalMark => {
-                if pause == Pause::FinalMark {
+                if pause == Pause::FinalMark
+                    && std::env::var("MMTK_SATB_ARMPHASE").as_deref() != Ok("final")
+                {
                     if let Some(t) = crate::util::satb_pages::satb_pages() {
                         t.disarm_all();
                     }
@@ -338,6 +375,9 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             // We keep the value of `self.should_do_full_gc` so that if full GC is triggered,
             // the next GC will be full GC.
         }
+        if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+            eprintln!("[phase] {:?} end", pause);
+        }
         info!("{:?} end", pause);
     }
 
@@ -381,12 +421,32 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
             }
             Pause::FinalMark => {
                 debug_assert!(self.concurrent_marking_in_progress());
-                // Flush barrier buffers
+                // Flush barrier buffers.  (Routing to the correct bucket
+                // is handled inside flush_satb: once current_pause is
+                // FinalMark, packets go to Closure.)
                 for mutator in <VM as VMBinding>::VMActivePlan::mutators() {
                     mutator.barrier.flush();
                 }
                 self.set_concurrent_marking_state(false);
+                // Concurrent-bucket BACKLOG (packets flushed during
+                // marking that no worker picked up before this pause):
+                // they hold genuine SATB nodes and MUST be traced by this
+                // FinalMark.  Migrate them into Closure.
+                let moved = if std::env::var_os("MMTK_SATB_NOFIX").is_some() {
+                    0
+                } else {
+                    _scheduler.work_buckets[crate::scheduler::WorkBucketStage::Concurrent]
+                        .drain_to(&_scheduler.work_buckets[crate::scheduler::WorkBucketStage::Closure])
+                };
+                if moved > 0 {
+                    if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+                        eprintln!("[sched] FinalMark migrated {} backlog packets", moved);
+                    }
+                }
             }
+        }
+        if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+            eprintln!("[phase] {:?} start", pause);
         }
         info!("{:?} start", pause);
     }

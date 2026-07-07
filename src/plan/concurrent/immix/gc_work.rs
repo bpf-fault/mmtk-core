@@ -256,6 +256,17 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         let Some(t) = satb_pages::satb_pages() else {
             return;
         };
+        // VERIFY mode: pure passive arming — the compiled barrier does
+        // all SATB work; skip the drain entirely.  (Classification served
+        // its diagnostic purpose; the drain's liveness certificate is
+        // additionally unsound under lazy sweeping DURING the cycle —
+        // objects in the InitialMark VO snapshot can be swept+recycled
+        // mid-mark, so iterating them crashes.  Fix separately for real
+        // mode: needs sweep-fence or mark-state filtering.)
+        if satb_pages::satb_verify() {
+            t.reset_cursor();
+            return;
+        }
         // Quiesce the drainer (it shares flags with this sweep).
         t.stop_drainer_and_wait();
         t.reset_cursor();
@@ -271,8 +282,12 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         // Extracted values are genuine mark-start references: no
         // conservative candidates exist in this scheme, so exact marking
         // never marks non-objects and the VO->snapshot induction holds.
+        let dbg = std::env::var_os("MMTK_SATB_COMMS").is_some();
         let mut flagged: Vec<usize> = Vec::new();
         t.sweep_flags(|idx| flagged.push(idx));
+        if dbg {
+            eprintln!("[drain] flagged={}", flagged.len());
+        }
         let in_snap = |addr: crate::util::Address, flagged: &[usize], t: &satb_pages::SatbPages| {
             // flagged is sorted (sweep order); binary search page index
             flagged.binary_search(&t.page_index_of(addr)).is_ok()
@@ -285,15 +300,29 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
             // objects starting on this page, plus the spanning head:
             // the nearest alloc-map start within MAX_OBJ before the page
             // whose extent reaches into it.
+            // Iterate an object only if it exists at mark start (alloc
+            // snapshot) AND still exists now (current VO bit): lazy sweep
+            // reclaims previous-cycle-dead objects DURING this cycle, so
+            // snapshot membership alone admits recycled memory (measured
+            // wild-slot crashes).  Mark-start-LIVE objects cannot be
+            // swept mid-cycle, so current-VO loses no SATB obligation.
+            let alive = |a: crate::util::Address| -> Option<ObjectReference> {
+                let o = ObjectReference::from_raw_address(a)?;
+                #[cfg(feature = "vo_bit")]
+                if !crate::util::metadata::vo_bit::is_vo_bit_set(o) {
+                    return None;
+                }
+                Some(o)
+            };
             let mut objs: Vec<ObjectReference> = Vec::new();
             // spanning head: LOS objects reach megabytes, so search far
             if let Some(h) = t.prev_start(pstart, 64 << 20) {
-                if let Some(o) = ObjectReference::from_raw_address(h) {
+                if let Some(o) = alive(h) {
                     objs.push(o);
                 }
             }
             t.alloc_map_starts(pstart, satb_pages::BYTES_IN_PAGE, |a| {
-                if let Some(o) = ObjectReference::from_raw_address(a) {
+                if let Some(o) = alive(a) {
                     objs.push(o);
                 }
             });
@@ -389,6 +418,9 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
             t.reset_cursor();
             return;
         }
+        if dbg {
+            eprintln!("[drain] extracted nodes={}", nodes.len());
+        }
         // Filter + trace: non-immix refs are genuine (kept spaces);
         // immix refs must be mark-start objects (snapshot membership) —
         // post-mark allocations are allocate-black already.
@@ -408,6 +440,9 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                 ConcurrentImmix<VM>,
                 TRACE_KIND_FAST,
             >::new(std::mem::take(&mut queue.0)));
+        }
+        if dbg {
+            eprintln!("[drain] trace-filter done");
         }
         t.reset_cursor();
         // Un-armed spaces: wholesale rescan as live roots (their children
@@ -431,6 +466,9 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
             plan.common()
                 .get_nonmoving()
                 .enumerate_objects(&mut enumerator);
+            if dbg {
+                eprintln!("[drain] wholesale roots={}", roots.len());
+            }
             if !roots.is_empty() {
                 mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(ProcessModBufSATB::<
                     VM,

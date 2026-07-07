@@ -222,6 +222,9 @@ impl<C: GCWorkContext> StopMutators<C> {
 impl<C: GCWorkContext> GCWork<C::VM> for StopMutators<C> {
     fn do_work(&mut self, worker: &mut GCWorker<C::VM>, mmtk: &'static MMTK<C::VM>) {
         trace!("stop_all_mutators start");
+        if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+            eprintln!("[sched] StopMutators begin");
+        }
         mmtk.state.prepare_for_stack_scanning();
         <C::VM as VMBinding>::VMCollection::stop_all_mutators(worker.tls, |mutator| {
             // TODO: The stack scanning work won't start immediately, as the `Prepare` bucket is not opened yet (the bucket is opened in notify_mutators_paused).

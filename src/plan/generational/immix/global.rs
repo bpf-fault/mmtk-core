@@ -238,6 +238,11 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         // every mature page is clean now (the nursery is empty, so no
         // old->young refs exist).  Newly mapped chunks are registered first.
         // Dirty bits set by faults during the GC itself are stale; discard.
+        if let Some(z) = crate::util::zheap::zheap() {
+            let mut chunks: Vec<(Address, usize)> = Vec::new();
+            self.for_each_mature_chunk(|start, bytes| chunks.push((start, bytes)));
+            z.sweep(&chunks);
+        }
         if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
             // Drain residual dirty bits (GC-time faults); this also records
             // their chunks in the dirty-chunk set.
@@ -392,6 +397,10 @@ impl<VM: VMBinding> GenImmix<VM> {
         {
             let backend = *args.options.dirty_tracking;
             let vm_layout = crate::util::heap::layout::vm_layout::vm_layout();
+            crate::util::zheap::init_zheap(
+                crate::util::heap::layout::vm_layout::vm_layout().heap_start,
+                crate::util::heap::layout::vm_layout::vm_layout().heap_end,
+            );
             crate::util::dirty_track::init_dirty_tracker(
                 backend,
                 vm_layout.heap_start,

@@ -205,7 +205,17 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     if noarm {
                         // passive init only: no WP anywhere
                     } else {
-                    for chunk in self.immix_space.chunk_map.all_chunks() {
+                    // MMTK_SATB_FRAC=N: arm only every Nth chunk (race
+                    // sensitivity probe -- does corruption need broad
+                    // slowdown or do a few slow writes suffice?)
+                    let frac: usize = std::env::var("MMTK_SATB_FRAC")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1);
+                    for (i, chunk) in self.immix_space.chunk_map.all_chunks().enumerate() {
+                        if i % frac != 0 {
+                            continue;
+                        }
                         t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
                         t.arm(chunk.start(), Chunk::BYTES);
                     }

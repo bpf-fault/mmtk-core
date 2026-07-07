@@ -75,6 +75,17 @@ pub(crate) static REFBITS_POPULATED: std::sync::atomic::AtomicUsize =
 /// slots/GC on h2) and costs whole seconds per GC when always on.
 static REFBITS_DEBUG: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// MMTK_FORCE_REFBITS (measurement knob): record the reference bitmap even
+/// in non-defer mode (forwarding still happens at stage time).  Isolates
+/// the stage-time recording cost from the install-time forward cost when
+/// decomposing the defer-forward tax: B.1 vs B.1+recording vs B v2.
+static FORCE_REFBITS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the reference bitmap should be recorded during staging.
+pub fn record_refbits() -> bool {
+    defer_forward() || FORCE_REFBITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Class B v2: defer reference forwarding from staging to install time,
 /// driven by the reference bitmap (MMTK_COMPACT_DEFER_FORWARD).
 static DEFER_FORWARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -130,6 +141,9 @@ pub(crate) fn init_compact_faults(
     }
     if std::env::var_os("MMTK_REFBITS_DEBUG").is_some() {
         REFBITS_DEBUG.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_FORCE_REFBITS").is_some() {
+        FORCE_REFBITS.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var_os("MMTK_COMPACT_INKERNEL").is_some() {
         // In-kernel compaction implies deferred forwarding (the handler does

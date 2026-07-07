@@ -285,6 +285,18 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
         match self.immix_space().get_reusable_block(self.copy) {
             Some(block) => {
                 trace!("{:?}: acquire_recyclable_block -> {:?}", self.tls, block);
+                // Dirty-chunk re-arm: promotion targets sit inside protected
+                // mature chunks; unprotect the block up front (one WP call)
+                // instead of paying a fault per promoted page, and remember
+                // the chunk for end_of_gc re-arming.  Gate is tracker-active:
+                // in GenImmix every ImmixAllocator is a GC copy context (the
+                // `copy` flag marks defrag, NOT copy-context).
+                if let Some(t) = crate::util::dirty_track::dirty_tracker() {
+                    t.unprotect_copy_block(
+                        block.start(),
+                        crate::policy::immix::block::Block::BYTES,
+                    );
+                }
                 // Set the hole-searching cursor to the start of this block.
                 self.line = Some(block.start_line());
                 true
@@ -308,6 +320,14 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     block.start(),
                     block.end()
                 );
+                // Dirty-chunk re-arm: see acquire_recyclable_block.  Clean
+                // blocks in existing mature chunks are protected too.
+                if let Some(t) = crate::util::dirty_track::dirty_tracker() {
+                    t.unprotect_copy_block(
+                        block.start(),
+                        crate::policy::immix::block::Block::BYTES,
+                    );
+                }
                 // Bulk clear stale line mark state
                 Line::MARK_TABLE
                     .bzero_metadata(block.start(), crate::policy::immix::block::Block::BYTES);

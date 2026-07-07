@@ -52,6 +52,9 @@ pub struct GenImmix<VM: VMBinding> {
     pub last_gc_was_defrag: AtomicBool,
     /// Whether the last GC was a full heap GC
     pub last_gc_was_full_heap: AtomicBool,
+    /// Force a full protect-all at the next end_of_gc (startup: chunks
+    /// begin unprotected; the dirty-chunk set can't know that).
+    pub rearm_all: AtomicBool,
     /// Conservative remembered set for spaces without page dirty tracking
     /// (LOS/immortal/nonmoving): filled in `prepare()` while the LOS
     /// treadmill is still quiescent, consumed by `ScanDirtyStash` in Closure.
@@ -157,15 +160,20 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         // (promotion into recycled blocks, defrag) never fault.  Mutators are
         // already suspended; the dirty set is drained later in Closure.
         if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
-            // Unprotect the whole mature space so GC-time writes (promotion
-            // into recycled blocks, forwarding) never fault.  Measured
-            // alternatives are not cheaper: leaving pages protected trades
-            // this O(mature) unprotect for an equally-large O(promoted)
-            // GC-time fault bill (recycled immix blocks land in protected
-            // chunks).  The per-GC O(mature-space) re-arming cost is
-            // fundamental to page-granularity barriers and dominates at high
-            // GC frequency (tight heaps) — see the heap-size sweep.
-            self.for_each_mature_chunk(|start, bytes| tracker.unprotect(start, bytes));
+            // Dirty-chunk re-arm policy: on NURSERY GCs the mature space
+            // stays protected.  GC-time writes never fault anyway:
+            // reference updates target dirty pages (mutator faults already
+            // unprotected them) and promotion targets are unprotected by
+            // the copy allocator's acquire-block hook (one WP call/block).
+            // Only chunks that actually lost protection are re-armed at
+            // end_of_gc — O(dirty) instead of O(mature) — which is the
+            // difference at medium/large heaps where the mature space is
+            // hundreds of chunks and the write working set is small.
+            // FULL-HEAP GCs move mature objects arbitrarily: fall back to
+            // unprotect-all here + protect-all at end_of_gc.
+            if full_heap {
+                self.for_each_mature_chunk(|start, bytes| tracker.unprotect(start, bytes));
+            }
             for (start, bytes) in self.los_protected.lock().unwrap().drain(..) {
                 tracker.unprotect(start, bytes);
             }
@@ -231,11 +239,35 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         // old->young refs exist).  Newly mapped chunks are registered first.
         // Dirty bits set by faults during the GC itself are stale; discard.
         if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
+            // Drain residual dirty bits (GC-time faults); this also records
+            // their chunks in the dirty-chunk set.
             tracker.drain_dirty(|_| {});
-            self.for_each_mature_chunk(|start, bytes| {
-                tracker.ensure_registered(start, bytes);
-                tracker.protect(start, bytes);
-            });
+            let full_rearm = self.rearm_all.swap(false, Ordering::Relaxed)
+                || self.last_gc_was_full_heap.load(Ordering::Relaxed);
+            if full_rearm {
+                // Startup / post-full-heap: everything is unprotected.
+                tracker.take_dirty_chunks();
+                self.for_each_mature_chunk(|start, bytes| {
+                    tracker.ensure_registered(start, bytes);
+                    tracker.protect(start, bytes);
+                });
+            } else {
+                // Nursery GC: re-arm only chunks that lost protection
+                // (dirty pages + promotion blocks).  Restrict to chunks the
+                // mature walk knows about (skip LOS chunks: the LOS re-arms
+                // via live-object runs below).
+                let mut mature: std::collections::HashSet<Address> =
+                    std::collections::HashSet::new();
+                self.for_each_mature_chunk(|start, _| {
+                    mature.insert(start);
+                });
+                for chunk in tracker.take_dirty_chunks() {
+                    if mature.contains(&chunk) {
+                        tracker.ensure_registered(chunk, 4 << 20);
+                        tracker.protect(chunk, 4 << 20);
+                    }
+                }
+            }
             // Protect the pages of all live LOS objects (coalesced runs).
             // The treadmill is quiescent here (post-release).
             {
@@ -391,6 +423,7 @@ impl<VM: VMBinding> GenImmix<VM> {
             immix_space,
             last_gc_was_defrag: AtomicBool::new(false),
             last_gc_was_full_heap: AtomicBool::new(false),
+            rearm_all: AtomicBool::new(true),
             dirty_stash: std::sync::Mutex::new(Vec::new()),
             los_protected: std::sync::Mutex::new(Vec::new()),
         }

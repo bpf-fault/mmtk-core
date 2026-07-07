@@ -66,6 +66,13 @@ pub(crate) struct DirtyTracker {
     /// Page-range starts (chunk granularity) already registered with the
     /// kernel mechanism.
     registered: Mutex<HashSet<Address>>,
+    /// Lock-free fast path for `registered` (bit per 4MiB chunk of the
+    /// span): set only AFTER successful kernel registration.
+    registered_bits: Vec<std::sync::atomic::AtomicU64>,
+    /// Chunk starts whose protection was dropped since the last re-arm,
+    /// as an atomic bitmap: the promotion acquire hook runs on every GC
+    /// worker (locks here measurably regressed lusearch).
+    dirty_chunk_bits: Vec<std::sync::atomic::AtomicU64>,
     uffd: uffd::UffdState,
     bpf: bpf::BpfShim,
 }
@@ -88,6 +95,12 @@ impl DirtyTracker {
             span_pages,
             user_bitmap,
             registered: Mutex::new(HashSet::new()),
+            registered_bits: (0..(span_pages << LOG_BYTES_IN_PAGE >> 22).div_ceil(64).max(1))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            dirty_chunk_bits: (0..(span_pages << LOG_BYTES_IN_PAGE >> 22).div_ceil(64).max(1))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             uffd: if backend == DirtyTracking::Uffd {
                 uffd::UffdState::open()
             } else {
@@ -128,12 +141,69 @@ impl DirtyTracker {
         self.user_bitmap[idx >> 6].fetch_or(1 << (idx & 63), Ordering::Relaxed);
     }
 
+    /// Record that a chunk's protection was (or will be) dropped this
+    /// cycle: dirty-page faults land here at drain time, and the GC copy
+    /// allocator's acquire-block hook adds promotion targets.  end_of_gc
+    /// re-arms ONLY these chunks (O(dirty) instead of O(mature)), leaving
+    /// never-written chunks protected across GCs.
+    pub(crate) fn note_unprotected_range(&self, start: Address, bytes: usize) {
+        const CHUNK: usize = 4 << 20;
+        let mut a = start.align_down(CHUNK);
+        let end = (start + bytes).align_up(CHUNK);
+        while a < end {
+            let c = (a - self.span_start.align_down(CHUNK)) >> 22;
+            let w = c >> 6;
+            if w < self.dirty_chunk_bits.len() {
+                // Skip the RMW when already set (the common case for hot
+                // chunks) — a shared-line atomic per promoted block was a
+                // measurable regression.
+                if self.dirty_chunk_bits[w].load(Ordering::Relaxed) & (1 << (c & 63)) == 0 {
+                    self.dirty_chunk_bits[w].fetch_or(1 << (c & 63), Ordering::Relaxed);
+                }
+            }
+            a = a + CHUNK;
+        }
+    }
+
+    /// Take the set of chunks needing re-protection this cycle.
+    pub(crate) fn take_dirty_chunks(&self) -> Vec<Address> {
+        const CHUNK: usize = 4 << 20;
+        let base = self.span_start.align_down(CHUNK);
+        let mut out = Vec::new();
+        for (w, word) in self.dirty_chunk_bits.iter().enumerate() {
+            let mut v = word.swap(0, Ordering::Relaxed);
+            while v != 0 {
+                let bit = v.trailing_zeros() as usize;
+                v &= v - 1;
+                out.push(base + (((w << 6) | bit) << 22));
+            }
+        }
+        out
+    }
+
+    /// Unprotect a promotion block (GC copy allocator acquire hook) and
+    /// remember its chunk for re-arming.
+    pub(crate) fn unprotect_copy_block(&self, start: Address, bytes: usize) {
+        self.ensure_registered_range(start, bytes);
+        self.unprotect(start, bytes);
+        self.note_unprotected_range(start, bytes);
+    }
+
     /// Register a range with the kernel mechanism if not yet registered.
     /// Ranges are tracked by their start address; callers must pass stable
     /// (chunk-aligned) ranges.
     pub(crate) fn ensure_registered(&self, start: Address, bytes: usize) {
         if self.backend == DirtyTracking::Segv {
             return; // mprotect needs no registration
+        }
+        // Lock-free fast path: bit set only after successful registration.
+        const CHUNK: usize = 4 << 20;
+        let c = (start.align_down(CHUNK) - self.span_start.align_down(CHUNK)) >> 22;
+        let w = c >> 6;
+        if w < self.registered_bits.len()
+            && self.registered_bits[w].load(Ordering::Acquire) & (1 << (c & 63)) != 0
+        {
+            return;
         }
         let mut reg = self.registered.lock().unwrap();
         if reg.contains(&start) {
@@ -145,6 +215,9 @@ impl DirtyTracker {
             _ => unreachable!(),
         }
         reg.insert(start);
+        if w < self.registered_bits.len() {
+            self.registered_bits[w].fetch_or(1 << (c & 63), Ordering::Release);
+        }
     }
 
     /// Register every 4 MiB-aligned chunk overlapping the range (chunk
@@ -195,7 +268,11 @@ impl DirtyTracker {
                 let bit = v.trailing_zeros() as usize;
                 v &= v - 1;
                 count += 1;
-                visit(self.span_start + ((w << 6 | bit) << LOG_BYTES_IN_PAGE));
+                let page = self.span_start + ((w << 6 | bit) << LOG_BYTES_IN_PAGE);
+                // A dirty page's fault dropped its protection: its chunk
+                // needs re-arming at end_of_gc (dirty-chunk re-arm policy).
+                self.note_unprotected_range(page, 1 << LOG_BYTES_IN_PAGE);
+                visit(page);
             }
         }
         count

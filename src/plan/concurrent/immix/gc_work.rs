@@ -294,8 +294,12 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         };
         let mut nodes: Vec<ObjectReference> = Vec::new();
         let base = t.heap_base();
+        let trace = std::env::var_os("MMTK_SATB_TRACE").is_some();
         for &idx in &flagged {
             let pstart = base + (idx << satb_pages::LOG_BYTES_IN_PAGE);
+            if trace {
+                eprintln!("[xt] page {:x}", pstart.as_usize());
+            }
             let snap = t.snapshot_page(idx);
             // objects starting on this page, plus the spanning head:
             // the nearest alloc-map start within MAX_OBJ before the page
@@ -327,6 +331,9 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                 }
             });
             for obj in objs {
+                if trace {
+                    eprintln!("[xt]   obj {:?}", obj);
+                }
                 SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
                     let Some(sa) = s.slot_address() else { return };
                     let v: u32 = if t.page_index_of(sa) == idx {
@@ -421,61 +428,158 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         if dbg {
             eprintln!("[drain] extracted nodes={}", nodes.len());
         }
-        // Filter + trace: non-immix refs are genuine (kept spaces);
-        // immix refs must be mark-start objects (snapshot membership) —
-        // post-mark allocations are allocate-black already.
-        let mut queue = CollectQueue(Vec::new());
+        // Filter + trace IMMIX refs only, validated as mark-start object
+        // starts (alloc snapshot).  Non-immix refs are DROPPED: the
+        // wholesale rescan below already retains every LOS/immortal/
+        // nonmoving object as a live root, so snapshot refs into those
+        // spaces are redundant -- and extracted values can be garbage
+        // when a mark-start object's start was recycled mid-cycle (live
+        // klass iterated over old snapshot content), which panics
+        // vm_trace_object for non-space addresses (measured).
+        // Validation per space: immix by mark-start alloc snapshot; LOS/
+        // immortal/nonmoving by space membership (SFT chunk-accurate for
+        // discontiguous spaces, safe on arbitrary addresses) + current VO
+        // bit (metadata mapped once membership holds).  LOS refs MUST be
+        // traced: the wholesale rescan enumerates only to_space (already-
+        // traced objects), so an LOS object whose only mark-start ref was
+        // an overwritten immix slot is rescued exactly here.  Anything
+        // else (VM space, garbage) is dropped -- tracing a non-space
+        // address panics vm_trace_object.
+        let los = plan.common().get_los();
+        let immortal = plan.common().get_immortal();
+        let nonmoving = plan.common().get_nonmoving();
+        let vo_ok = |o: ObjectReference| -> bool {
+            #[cfg(feature = "vo_bit")]
+            return crate::util::metadata::vo_bit::is_vo_bit_set(o);
+            #[cfg(not(feature = "vo_bit"))]
+            return true;
+        };
+        // Collect VALIDATED refs and hand them UNTRACED to the packet:
+        // ProcessModBufSATB's tracer performs mark-test-and-scan, and it
+        // only SCANS objects it newly marks -- pre-tracing here would
+        // mark them without scanning, so their children would never be
+        // traced (measured as under-retention: reachable objects swept,
+        // Java-level BootstrapMethodError fallout).
+        let mut rescued: Vec<ObjectReference> = Vec::new();
         for o in nodes {
             let a = o.to_raw_address();
-            let in_immix = plan.immix_space.address_in_space(a);
-            if !in_immix || t.in_alloc_map(a) {
-                plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
+            // Alignment first: raw snapshot data can decode to misaligned
+            // values that ALIAS a genuine start's alloc-map bit (8-byte
+            // bit granularity: 0x...01 shares the bit with 0x...00) --
+            // measured as a garbage ObjectReference traced into the LOS
+            // treadmill and crashing later enumeration.
+            if !a.is_aligned_to(8) {
+                continue;
+            }
+            let keep = if plan.immix_space.address_in_space(a) {
+                t.in_alloc_map(a)
+            } else if los.address_in_space(a)
+                || immortal.address_in_space(a)
+                || nonmoving.address_in_space(a)
+            {
+                vo_ok(o)
+            } else {
+                false
+            };
+            if keep {
+                rescued.push(o);
             }
         }
-        // Children of genuine intact objects are genuine and intact:
-        // hand them to the normal exact tracer.
-        if !queue.0.is_empty() {
-            mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(ProcessModBufSATB::<
-                VM,
-                ConcurrentImmix<VM>,
-                TRACE_KIND_FAST,
-            >::new(std::mem::take(&mut queue.0)));
+        // VALIDATING closure over the rescued set: extraction sources
+        // include intact-dead objects (stale VO under lazy sweep), whose
+        // slot values can be stale; ProcessModBufSATB scans children
+        // unvalidated, so a single stale ref reaches iterate_fields on
+        // recycled memory (measured).  Validate EVERY hop with the same
+        // predicate as the seeds; children failing it are either garbage
+        // or allocate-black (already live).  Marks only ever land on
+        // validated genuine starts, so the CopyFromMarkBits->VO feedback
+        // stays a true allocation map (unlike the conservative-era
+        // poisoning).  Intact-dead survivors become bounded floating
+        // garbage.
+        {
+            use crate::plan::tracing::SlotIterator;
+            use crate::vm::slot::Slot;
+            let validate = |o: ObjectReference| -> bool {
+                let a = o.to_raw_address();
+                if !a.is_aligned_to(8) {
+                    return false;
+                }
+                if plan.immix_space.address_in_space(a) {
+                    t.in_alloc_map(a) && vo_ok(o)
+                } else if los.address_in_space(a)
+                    || immortal.address_in_space(a)
+                    || nonmoving.address_in_space(a)
+                {
+                    vo_ok(o)
+                } else {
+                    false
+                }
+            };
+            let mut queue = CollectQueue(Vec::new());
+            for o in rescued {
+                if validate(o) {
+                    plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
+                }
+            }
+            // Wholesale rescan, split by seed liveness certainty:
+            //  - immortal (live by definition) and LOS to_space (traced
+            //    this cycle => live): children are genuine current refs;
+            //    scan them in PARALLEL via ProcessModBufSATB.
+            //  - nonmoving (an immix-like space whose enumeration
+            //    includes INTACT-DEAD objects with stale slot values):
+            //    seed THIS validating closure so children are checked.
+            {
+                use crate::util::object_enum::ClosureObjectEnumerator;
+                let mut live_roots: Vec<ObjectReference> = Vec::new();
+                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    live_roots.push(obj);
+                });
+                plan.common().get_immortal().enumerate_objects(&mut en);
+                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    live_roots.push(obj);
+                });
+                plan.common().get_los().enumerate_to_space_objects(&mut en);
+                let mut stale_suspect: Vec<ObjectReference> = Vec::new();
+                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    stale_suspect.push(obj);
+                });
+                plan.common().get_nonmoving().enumerate_objects(&mut en);
+                if dbg {
+                    eprintln!(
+                        "[drain] wholesale live={} suspect={}",
+                        live_roots.len(),
+                        stale_suspect.len()
+                    );
+                }
+                if !live_roots.is_empty() {
+                    mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(
+                        ProcessModBufSATB::<VM, ConcurrentImmix<VM>, TRACE_KIND_FAST>::new(
+                            live_roots,
+                        ),
+                    );
+                }
+                for o in stale_suspect {
+                    plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
+                }
+            }
+            while let Some(obj) = queue.0.pop() {
+                let mut children: Vec<ObjectReference> = Vec::new();
+                SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
+                    if let Some(c) = s.load() {
+                        children.push(c);
+                    }
+                });
+                for c in children {
+                    if validate(c) {
+                        plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, c, worker);
+                    }
+                }
+                plan.post_scan_object(obj);
+            }
         }
         if dbg {
             eprintln!("[drain] trace-filter done");
         }
         t.reset_cursor();
-        // Un-armed spaces: wholesale rescan as live roots (their children
-        // flow through the same exact tracer; see above for why that is
-        // safe for objects live at the previous GC — LOS to_space and
-        // immortal/nonmoving enumerations satisfy that).
-        {
-            use crate::util::object_enum::ClosureObjectEnumerator;
-            let mut roots: Vec<ObjectReference> = Vec::new();
-            let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
-                roots.push(obj);
-            });
-            plan.common().get_immortal().enumerate_objects(&mut enumerator);
-            let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
-                roots.push(obj);
-            });
-            plan.common().get_los().enumerate_to_space_objects(&mut enumerator);
-            let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
-                roots.push(obj);
-            });
-            plan.common()
-                .get_nonmoving()
-                .enumerate_objects(&mut enumerator);
-            if dbg {
-                eprintln!("[drain] wholesale roots={}", roots.len());
-            }
-            if !roots.is_empty() {
-                mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(ProcessModBufSATB::<
-                    VM,
-                    ConcurrentImmix<VM>,
-                    TRACE_KIND_FAST,
-                >::new(roots));
-            }
-        }
     }
 }

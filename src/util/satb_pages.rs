@@ -408,6 +408,159 @@ impl SatbPages {
             std::hint::spin_loop();
         }
     }
+    /// Klass-window object-validity predicate: read the narrow-klass
+    /// word (safe: extraction objects live in armed, mapped chunks),
+    /// decode via the binding's compressed-klass base/shift, and require
+    /// the decoded pointer to fall inside the MAPPED class-space region
+    /// (found once from /proc/self/maps at the base).  No dereference of
+    /// the decoded pointer, so garbage narrow values are rejected
+    /// crash-free.  This is the principled replacement for the
+    /// boundary-position heuristics: bogus vo-and-alloc-map "objects"
+    /// carry garbage klass words and fail the window.
+    pub fn klass_plausible(&self, addr: Address) -> bool {
+        // Class space commits INCREMENTALLY: a single-segment window
+        // rejects genuine klass pointers in later-committed segments
+        // (measured: class-light luindex passed 3/3 while class-heavy
+        // xalan/pmd/lusearch under-retained deterministically).  Keep a
+        // segment list and refresh it from /proc/self/maps when a
+        // candidate decodes inside the reserved range but misses all
+        // cached segments -- newly loaded classes commit new segments.
+        static BASE_SHIFT: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+        static SEGS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+        let Some((base, shift)) = *BASE_SHIFT.get_or_init(|| unsafe {
+            let c = std::ffi::CString::new("mmtk_klass_decode_window").unwrap();
+            let p = libc::dlsym(libc::RTLD_DEFAULT as *mut libc::c_void, c.as_ptr());
+            if p.is_null() {
+                return None;
+            }
+            let f: unsafe extern "C" fn(*mut usize, *mut usize) = std::mem::transmute(p);
+            let (mut base, mut shift) = (0usize, 0usize);
+            f(&mut base, &mut shift);
+            if base == 0 {
+                None
+            } else {
+                Some((base, shift))
+            }
+        }) else {
+            return true; // uncompressed klass config: predicate disabled
+        };
+        let narrow = unsafe { (addr + 8usize).load::<u32>() } as usize;
+        if narrow == 0 {
+            return false;
+        }
+        let k = base + (narrow << shift);
+        // Degenerate encodings (measured leak: ASCII data with narrow=1
+        // decoding into the committed first page, kind tag aliasing the
+        // first real Klass): Klass* are word-aligned and the space's
+        // first page is reserved for the null encoding.
+        if k & 7 != 0 || (narrow << shift) < 4096 {
+            return false;
+        }
+        let in_segs = |segs: &[(usize, usize)]| segs.iter().any(|&(lo, hi)| k >= lo && k < hi);
+        {
+            let segs = SEGS.lock().unwrap();
+            if in_segs(&segs) {
+                return true;
+            }
+        }
+        if k >= base + ((u32::MAX as usize) << shift) {
+            return false; // outside the reachable narrow-klass range
+        }
+        // Miss inside the reserve: refresh committed segments -- but ONLY
+        // within the CONTIGUOUS reserved region containing `base`.  The
+        // class space is one contiguous reservation (committed r-- pieces
+        // + PROT_NONE reserve); unrelated mappings (the Java heap!) can
+        // fall inside [base, base+4GB) and previously leaked heap data
+        // through the window (measured: narrow=0x502f7440 = a heap ref
+        // read as klass, decoding into a heap mapping).
+        let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+            return false;
+        };
+        let mut all: Vec<(usize, usize, bool)> = Vec::new();
+        for line in maps.lines() {
+            let mut it = line.split_whitespace();
+            let Some(range) = it.next() else { continue };
+            let Some((lo_s, hi_s)) = range.split_once('-') else { continue };
+            let (Ok(lo), Ok(hi)) = (
+                usize::from_str_radix(lo_s, 16),
+                usize::from_str_radix(hi_s, 16),
+            ) else {
+                continue;
+            };
+            let readable = it.next().unwrap_or("").starts_with('r');
+            all.push((lo, hi, readable));
+        }
+        all.sort_unstable();
+        let Some(mut i) = all.iter().position(|&(lo, hi, _)| base >= lo && base < hi) else {
+            return false;
+        };
+        while i > 0 && all[i - 1].1 == all[i].0 {
+            i -= 1;
+        }
+        let mut j = i;
+        while j + 1 < all.len() && all[j + 1].0 == all[j].1 {
+            j += 1;
+        }
+        let mut segs = SEGS.lock().unwrap();
+        segs.clear();
+        for &(lo, hi, readable) in &all[i..=j] {
+            if readable {
+                segs.push((lo, hi));
+            }
+        }
+        if !in_segs(&segs) {
+            return false;
+        }
+        // Klass START detection via the C++ vptr: every real Klass begins
+        // with a vtable pointer into libjvm.so's mapped range.  Interior/
+        // aliased offsets (measured: narrow=0x1770-class small values
+        // decoding into the klass-rich base region and dispatching wild)
+        // hold arbitrary data at offset 0 and fail this check.
+        static JVM_RANGES: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
+        let ranges = JVM_RANGES.get_or_init(|| {
+            let mut v = Vec::new();
+            if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+                for line in maps.lines() {
+                    if !line.contains("libjvm.so") {
+                        continue;
+                    }
+                    let Some(range) = line.split_whitespace().next() else { continue };
+                    let Some((lo_s, hi_s)) = range.split_once('-') else { continue };
+                    if let (Ok(lo), Ok(hi)) = (
+                        usize::from_str_radix(lo_s, 16),
+                        usize::from_str_radix(hi_s, 16),
+                    ) {
+                        v.push((lo, hi));
+                    }
+                }
+            }
+            v
+        });
+        if !ranges.is_empty() {
+            let vptr = unsafe { *(k as *const usize) };
+            if !ranges.iter().any(|&(lo, hi)| vptr >= lo && vptr < hi) {
+                return false;
+            }
+        }
+        // Readability established: check the KlassKind tag via the
+        // binding.  This rejects garbage narrow-klass values that land
+        // inside committed class-space segments (the residual
+        // false-accept class after the window widened to all segments).
+        static KIND_VALID: OnceLock<Option<unsafe extern "C" fn(usize) -> i32>> = OnceLock::new();
+        match KIND_VALID.get_or_init(|| unsafe {
+            let c = std::ffi::CString::new("mmtk_klass_kind_valid").unwrap();
+            let p = libc::dlsym(libc::RTLD_DEFAULT as *mut libc::c_void, c.as_ptr());
+            if p.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(p))
+            }
+        }) {
+            Some(f) => unsafe { f(k) != 0 },
+            None => true,
+        }
+    }
+
     /// InitialMark: allow the next drainer to run.
     pub fn allow_drainer(&self) {
         self.drain_stop.store(false, Ordering::Release);

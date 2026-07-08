@@ -225,7 +225,16 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
         let mmtk = self.mmtk();
         let w = ConcurrentTraceObjects::<VM, P, KIND>::new(objects.clone(), mmtk);
 
-        worker.scheduler().work_buckets[WorkBucketStage::Concurrent].add_no_notify(w);
+        // Pause-aware: FinalMark root re-scans (page-SATB mode) must be
+        // traced within the pause, not left for post-pause "concurrent"
+        // execution with marking off.
+        let plan = mmtk.get_plan().concurrent().unwrap();
+        let bucket = if plan.current_pause() == Some(super::Pause::FinalMark) {
+            WorkBucketStage::Closure
+        } else {
+            WorkBucketStage::Concurrent
+        };
+        worker.scheduler().work_buckets[bucket].add_no_notify(w);
     }
 }
 

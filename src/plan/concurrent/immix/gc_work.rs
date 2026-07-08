@@ -286,7 +286,17 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         let mut flagged: Vec<usize> = Vec::new();
         t.sweep_flags(|idx| flagged.push(idx));
         if dbg {
-            eprintln!("[drain] flagged={}", flagged.len());
+            let dropped = unsafe {
+                let c = std::ffi::CString::new("gcsatb_dropped").unwrap();
+                let p = libc::dlsym(libc::RTLD_DEFAULT as *mut libc::c_void, c.as_ptr());
+                if p.is_null() {
+                    0
+                } else {
+                    let f: unsafe extern "C" fn() -> u64 = std::mem::transmute(p);
+                    f()
+                }
+            };
+            eprintln!("[drain] flagged={} dropped={}", flagged.len(), dropped);
         }
         let in_snap = |addr: crate::util::Address, flagged: &[usize], t: &satb_pages::SatbPages| {
             // flagged is sorted (sweep order); binary search page index
@@ -294,35 +304,39 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         };
         let mut nodes: Vec<ObjectReference> = Vec::new();
         let base = t.heap_base();
+        // EXACT extraction, restored with the full validity oracle.  The
+        // exact era originally failed on "bogus VO heads" -- now known to
+        // be the poison loop (our own conservative-era leaked marks
+        // flowing into VO via VO := MARK at sweep) which predated every
+        // oracle guard.  With alive() = current-VO AND klass_plausible
+        // (contiguous-window + vptr-start + kind/layout consistency),
+        // extraction sources are validated objects, slot values are
+        // exact (no text-data candidates exist at all), nothing bogus is
+        // ever marked, and the VO map stays a pure allocation map by
+        // induction from cycle 1.
         let trace = std::env::var_os("MMTK_SATB_TRACE").is_some();
         for &idx in &flagged {
             let pstart = base + (idx << satb_pages::LOG_BYTES_IN_PAGE);
-            if trace {
-                eprintln!("[xt] page {:x}", pstart.as_usize());
-            }
             let snap = t.snapshot_page(idx);
-            // objects starting on this page, plus the spanning head:
-            // the nearest alloc-map start within MAX_OBJ before the page
-            // whose extent reaches into it.
-            // Iterate an object only if it exists at mark start (alloc
-            // snapshot) AND still exists now (current VO bit): lazy sweep
-            // reclaims previous-cycle-dead objects DURING this cycle, so
-            // snapshot membership alone admits recycled memory (measured
-            // wild-slot crashes).  Mark-start-LIVE objects cannot be
-            // swept mid-cycle, so current-VO loses no SATB obligation.
             let alive = |a: crate::util::Address| -> Option<ObjectReference> {
                 let o = ObjectReference::from_raw_address(a)?;
                 #[cfg(feature = "vo_bit")]
                 if !crate::util::metadata::vo_bit::is_vo_bit_set(o) {
                     return None;
                 }
+                if !t.klass_plausible(a) {
+                    return None;
+                }
                 Some(o)
             };
             let mut objs: Vec<ObjectReference> = Vec::new();
-            // spanning head: LOS objects reach megabytes, so search far
+            // spanning head (>=16-byte boundary guard: header-only
+            // 16-byte objects at pstart-8 carry no reference fields)
             if let Some(h) = t.prev_start(pstart, 64 << 20) {
-                if let Some(o) = alive(h) {
-                    objs.push(o);
+                if pstart - h >= 16 {
+                    if let Some(o) = alive(h) {
+                        objs.push(o);
+                    }
                 }
             }
             t.alloc_map_starts(pstart, satb_pages::BYTES_IN_PAGE, |a| {
@@ -336,15 +350,12 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                 }
                 SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
                     let Some(sa) = s.slot_address() else { return };
+                    if sa < base || sa >= base + t.heap_span() {
+                        return;
+                    }
                     let v: u32 = if t.page_index_of(sa) == idx {
-                        // mark-start value from THIS page's snapshot
-                        unsafe {
-                            *(snap.add(sa - pstart) as *const u32)
-                        }
-                    } else if sa >= base
-                        && sa < base + t.heap_span()
-                        && in_snap(sa, &flagged, t)
-                    {
+                        unsafe { *(snap.add(sa - pstart) as *const u32) }
+                    } else if in_snap(sa, &flagged, t) {
                         let oidx = t.page_index_of(sa);
                         unsafe {
                             *(t.snapshot_page(oidx)
@@ -352,7 +363,6 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                                 as *const u32)
                         }
                     } else {
-                        // unwritten page: live == mark-start
                         match s.load() {
                             Some(o) => {
                                 nodes.push(o);
@@ -361,7 +371,6 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                             None => return,
                         }
                     };
-                    // decode unscaled compressed oop (our testbed configs)
                     if v == 0 {
                         return;
                     }
@@ -371,59 +380,6 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                     }
                 });
             }
-        }
-        // VERIFY mode: classify instead of tracing — the compiled
-        // barrier is handling correctness; report the extractor's output
-        // quality (valid+marked / valid+unmarked / garbage samples).
-        if satb_pages::satb_verify() {
-            let (mut ok_marked, mut ok_unmarked, mut garbage) = (0u64, 0u64, 0u64);
-            let mut samples: Vec<String> = Vec::new();
-            for o in &nodes {
-                let a = o.to_raw_address();
-                let in_immix = plan.immix_space.address_in_space(a);
-                let valid = if in_immix {
-                    t.in_alloc_map(a)
-                } else {
-                    // non-immix: chunk-of-space check only
-                    true
-                };
-                if !valid {
-                    garbage += 1;
-                    if samples.len() < 8 {
-                        samples.push(format!("garbage {:?}", o));
-                    }
-                    continue;
-                }
-                #[cfg(feature = "vo_bit")]
-                if in_immix && !crate::util::metadata::vo_bit::is_vo_bit_set(*o) {
-                    garbage += 1;
-                    if samples.len() < 8 {
-                        samples.push(format!("no-vo {:?}", o));
-                    }
-                    continue;
-                }
-                // marked = the barrier/tracer already reached it
-                if plan.immix_space.is_marked(*o) {
-                    ok_marked += 1;
-                } else {
-                    ok_unmarked += 1;
-                    if samples.len() < 8 {
-                        samples.push(format!("unmarked {:?}", o));
-                    }
-                }
-            }
-            eprintln!(
-                "[satbverify] extracted={} marked={} unmarked={} garbage={}",
-                nodes.len(),
-                ok_marked,
-                ok_unmarked,
-                garbage
-            );
-            for s in samples {
-                eprintln!("[satbverify]   {}", s);
-            }
-            t.reset_cursor();
-            return;
         }
         if dbg {
             eprintln!("[drain] extracted nodes={}", nodes.len());
@@ -505,21 +461,57 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                     return false;
                 }
                 if plan.immix_space.address_in_space(a) {
-                    t.in_alloc_map(a) && vo_ok(o)
+                    t.in_alloc_map(a) && vo_ok(o) && t.klass_plausible(a)
                 } else if los.address_in_space(a)
                     || immortal.address_in_space(a)
                     || nonmoving.address_in_space(a)
                 {
-                    vo_ok(o)
+                    vo_ok(o) && t.klass_plausible(a)
                 } else {
                     false
                 }
             };
             let mut queue = CollectQueue(Vec::new());
+            let (mut n_ok, mut n_align, mut n_space, mut n_am, mut n_vo, mut n_klass) =
+                (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
             for o in rescued {
-                if validate(o) {
-                    plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
+                // instrumented validate (same predicate, counted)
+                let a = o.to_raw_address();
+                if !a.is_aligned_to(8) {
+                    n_align += 1;
+                    continue;
                 }
+                let in_immix = plan.immix_space.address_in_space(a);
+                let in_other = los.address_in_space(a)
+                    || immortal.address_in_space(a)
+                    || nonmoving.address_in_space(a);
+                if !in_immix && !in_other {
+                    n_space += 1;
+                    continue;
+                }
+                if in_immix && !t.in_alloc_map(a) {
+                    n_am += 1;
+                    continue;
+                }
+                if !vo_ok(o) {
+                    n_vo += 1;
+                    continue;
+                }
+                if !t.klass_plausible(a) {
+                    n_klass += 1;
+                    continue;
+                }
+                n_ok += 1;
+                if std::env::var_os("MMTK_SATB_TRACE").is_some() {
+                    eprintln!("[vt] seed {:?}", o);
+                }
+                plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
+            }
+            if dbg {
+                eprintln!(
+                    "[val] ok={} align={} space={} am={} vo={} klass={}",
+                    n_ok, n_align, n_space, n_am, n_vo, n_klass
+                );
             }
             // Wholesale rescan, split by seed liveness certainty:
             //  - immortal (live by definition) and LOS to_space (traced
@@ -562,15 +554,32 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                     plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
                 }
             }
+            let vt = std::env::var_os("MMTK_SATB_TRACE").is_some();
             while let Some(obj) = queue.0.pop() {
+                if vt {
+                    let a = obj.to_raw_address();
+                    let narrow = unsafe { (a + 8usize).load::<u32>() };
+                    eprintln!("[vt] scan {:?} narrow={:#x}", obj, narrow);
+                }
                 let mut children: Vec<ObjectReference> = Vec::new();
                 SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
+                    // Same in-span slot gate as the extraction: a bogus
+                    // validated object yields garbage oop-map slot
+                    // addresses; never dereference those.
+                    if let Some(sa) = s.slot_address() {
+                        if sa < t.heap_base() || sa >= t.heap_base() + t.heap_span() {
+                            return;
+                        }
+                    }
                     if let Some(c) = s.load() {
                         children.push(c);
                     }
                 });
                 for c in children {
                     if validate(c) {
+                        if vt {
+                            eprintln!("[vt] child {:?} (of {:?})", c, obj);
+                        }
                         plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, c, worker);
                     }
                 }

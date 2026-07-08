@@ -481,7 +481,11 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
 
         let immix_args = ImmixSpaceArgs {
             mixed_age: false,
-            never_move_objects: false,
+            // Page-COW SATB v1 requires a non-moving space: the FinalMark
+            // drain iterates mark-start objects at their addresses while
+            // defrag evacuation would concurrently clobber from-copies
+            // (measured garbage-klass scans on defrag-heavy benchmarks).
+            never_move_objects: std::env::var_os("MMTK_SATB_PAGES").is_some(),
         };
 
         // These buckets are not used in an Immix plan. We can simply disable them.
@@ -542,7 +546,10 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
                 .add(super::gc_work::SatbFinalDrain::<VM>::new());
         }
 
-        // Skip root scanning in the final mark
+        // Skip root scanning in the final mark.  (A page-mode FinalMark
+        // root RESCAN was tested against the xalan/lusearch retention gap
+        // and did NOT help -- non-heap slot mutation is disconfirmed as
+        // the primary gap; see SESSION.md.)
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
             ConcurrentImmixGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_FAST>>,
         >::new_no_scan_roots());

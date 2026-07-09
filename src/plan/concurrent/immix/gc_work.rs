@@ -245,8 +245,8 @@ impl<VM: VMBinding> SatbFinalDrain<VM> {
 
 impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, mmtk: &'static MMTK<VM>) {
-        use crate::plan::PlanTraceObject;
         use crate::plan::tracing::SlotIterator;
+        use crate::plan::PlanTraceObject;
         use crate::vm::slot::Slot;
 
         let plan = mmtk
@@ -256,318 +256,80 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
         let Some(t) = satb_pages::satb_pages() else {
             return;
         };
-        // VERIFY mode: pure passive arming — the compiled barrier does
-        // all SATB work; skip the drain entirely.  (Classification served
-        // its diagnostic purpose; the drain's liveness certificate is
-        // additionally unsound under lazy sweeping DURING the cycle —
-        // objects in the InitialMark VO snapshot can be swept+recycled
-        // mid-mark, so iterating them crashes.  Fix separately for real
-        // mode: needs sweep-fence or mark-state filtering.)
         if satb_pages::satb_verify() {
             t.reset_cursor();
             return;
         }
-        // Quiesce the drainer (it shares flags with this sweep).
         t.stop_drainer_and_wait();
         t.reset_cursor();
-
-        // EXACT snapshot drain.  For every flagged page: enumerate the
-        // objects overlapping it from the ALLOC-MAP SNAPSHOT (object
-        // starts at mark start; membership certifies liveness at the
-        // previous GC, so both the object and its children are intact
-        // memory).  Iterate each object's fields via its LIVE layout
-        // (klass immutable), reading each slot VALUE from the snapshot
-        // copy when the slot's page was snapshotted (mark-start value)
-        // and from live memory otherwise (unwritten => identical).
-        // Extracted values are genuine mark-start references: no
-        // conservative candidates exist in this scheme, so exact marking
-        // never marks non-objects and the VO->snapshot induction holds.
         let dbg = std::env::var_os("MMTK_SATB_COMMS").is_some();
+        let drain_t0 = std::time::Instant::now();
         let mut flagged: Vec<usize> = Vec::new();
         t.sweep_flags(|idx| flagged.push(idx));
-        if dbg {
-            let dropped = unsafe {
-                let c = std::ffi::CString::new("gcsatb_dropped").unwrap();
-                let p = libc::dlsym(libc::RTLD_DEFAULT as *mut libc::c_void, c.as_ptr());
-                if p.is_null() {
-                    0
-                } else {
-                    let f: unsafe extern "C" fn() -> u64 = std::mem::transmute(p);
-                    f()
-                }
-            };
-            eprintln!("[drain] flagged={} dropped={}", flagged.len(), dropped);
-        }
-        let in_snap = |addr: crate::util::Address, flagged: &[usize], t: &satb_pages::SatbPages| {
-            // flagged is sorted (sweep order); binary search page index
-            flagged.binary_search(&t.page_index_of(addr)).is_ok()
-        };
-        let mut nodes: Vec<ObjectReference> = Vec::new();
         let base = t.heap_base();
-        // EXACT extraction, restored with the full validity oracle.  The
-        // exact era originally failed on "bogus VO heads" -- now known to
-        // be the poison loop (our own conservative-era leaked marks
-        // flowing into VO via VO := MARK at sweep) which predated every
-        // oracle guard.  With alive() = current-VO AND klass_plausible
-        // (contiguous-window + vptr-start + kind/layout consistency),
-        // extraction sources are validated objects, slot values are
-        // exact (no text-data candidates exist at all), nothing bogus is
-        // ever marked, and the VO map stays a pure allocation map by
-        // induction from cycle 1.
-        let trace = std::env::var_os("MMTK_SATB_TRACE").is_some();
+        // O(1) flagged lookup (was per-slot binary_search: measured in
+        // the 19ms median / 415ms max drain cost)
+        let npages = t.heap_span() >> satb_pages::LOG_BYTES_IN_PAGE;
+        let mut flag_bm = vec![0u64; npages.div_ceil(64)];
         for &idx in &flagged {
-            let pstart = base + (idx << satb_pages::LOG_BYTES_IN_PAGE);
-            let snap = t.snapshot_page(idx);
-            let alive = |a: crate::util::Address| -> Option<ObjectReference> {
-                let o = ObjectReference::from_raw_address(a)?;
-                #[cfg(feature = "vo_bit")]
-                if !crate::util::metadata::vo_bit::is_vo_bit_set(o) {
-                    return None;
-                }
-                if !t.klass_plausible(a) {
-                    return None;
-                }
-                Some(o)
-            };
-            let mut objs: Vec<ObjectReference> = Vec::new();
-            // spanning head (>=16-byte boundary guard: header-only
-            // 16-byte objects at pstart-8 carry no reference fields)
-            if let Some(h) = t.prev_start(pstart, 64 << 20) {
-                if pstart - h >= 16 {
-                    if let Some(o) = alive(h) {
-                        objs.push(o);
-                    }
-                }
-            }
-            t.alloc_map_starts(pstart, satb_pages::BYTES_IN_PAGE, |a| {
-                if let Some(o) = alive(a) {
-                    objs.push(o);
-                }
-            });
-            for obj in objs {
-                if trace {
-                    eprintln!("[xt]   obj {:?}", obj);
-                }
-                SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
-                    let Some(sa) = s.slot_address() else { return };
-                    if sa < base || sa >= base + t.heap_span() {
-                        return;
-                    }
-                    let v: u32 = if t.page_index_of(sa) == idx {
-                        unsafe { *(snap.add(sa - pstart) as *const u32) }
-                    } else if in_snap(sa, &flagged, t) {
-                        let oidx = t.page_index_of(sa);
-                        unsafe {
-                            *(t.snapshot_page(oidx)
-                                .add(sa - (base + (oidx << satb_pages::LOG_BYTES_IN_PAGE)))
-                                as *const u32)
-                        }
-                    } else {
-                        match s.load() {
-                            Some(o) => {
-                                nodes.push(o);
-                                return;
-                            }
-                            None => return,
-                        }
-                    };
-                    if v == 0 {
-                        return;
-                    }
-                    let addr = unsafe { crate::util::Address::from_usize(v as usize) };
-                    if let Some(o) = ObjectReference::from_raw_address(addr) {
-                        nodes.push(o);
-                    }
-                });
-            }
+            flag_bm[idx >> 6] |= 1 << (idx & 63);
         }
-        if dbg {
-            eprintln!("[drain] extracted nodes={}", nodes.len());
-        }
-        // Filter + trace IMMIX refs only, validated as mark-start object
-        // starts (alloc snapshot).  Non-immix refs are DROPPED: the
-        // wholesale rescan below already retains every LOS/immortal/
-        // nonmoving object as a live root, so snapshot refs into those
-        // spaces are redundant -- and extracted values can be garbage
-        // when a mark-start object's start was recycled mid-cycle (live
-        // klass iterated over old snapshot content), which panics
-        // vm_trace_object for non-space addresses (measured).
-        // Validation per space: immix by mark-start alloc snapshot; LOS/
-        // immortal/nonmoving by space membership (SFT chunk-accurate for
-        // discontiguous spaces, safe on arbitrary addresses) + current VO
-        // bit (metadata mapped once membership holds).  LOS refs MUST be
-        // traced: the wholesale rescan enumerates only to_space (already-
-        // traced objects), so an LOS object whose only mark-start ref was
-        // an overwritten immix slot is rescued exactly here.  Anything
-        // else (VM space, garbage) is dropped -- tracing a non-space
-        // address panics vm_trace_object.
+        let in_snap = |addr: crate::util::Address, _f: &[usize], t: &satb_pages::SatbPages| {
+            let i = t.page_index_of(addr);
+            i != usize::MAX && (flag_bm[i >> 6] >> (i & 63)) & 1 == 1
+        };
+
+        // Space-routed genuine-ref tracer with inline transitive scan.
+        // Callers guarantee refs are genuine (mark-start values of LIVE
+        // objects, or live wholesale enumerations): no object-validity
+        // oracle is needed, children of live objects are genuine.
         let los = plan.common().get_los();
         let immortal = plan.common().get_immortal();
         let nonmoving = plan.common().get_nonmoving();
-        let vo_ok = |o: ObjectReference| -> bool {
-            #[cfg(feature = "vo_bit")]
-            return crate::util::metadata::vo_bit::is_vo_bit_set(o);
-            #[cfg(not(feature = "vo_bit"))]
-            return true;
-        };
-        // Collect VALIDATED refs and hand them UNTRACED to the packet:
-        // ProcessModBufSATB's tracer performs mark-test-and-scan, and it
-        // only SCANS objects it newly marks -- pre-tracing here would
-        // mark them without scanning, so their children would never be
-        // traced (measured as under-retention: reachable objects swept,
-        // Java-level BootstrapMethodError fallout).
-        let mut rescued: Vec<ObjectReference> = Vec::new();
-        for o in nodes {
-            let a = o.to_raw_address();
-            // Alignment first: raw snapshot data can decode to misaligned
-            // values that ALIAS a genuine start's alloc-map bit (8-byte
-            // bit granularity: 0x...01 shares the bit with 0x...00) --
-            // measured as a garbage ObjectReference traced into the LOS
-            // treadmill and crashing later enumeration.
+        // Value filter for rescue TARGETS (seeds and children): the
+        // "live object's fields are genuine" argument fails for
+        // Reference.referent slots -- mark-start referents can be dead-
+        // at-mark-start, swept last cycle, memory reused (measured NULL-
+        // klass crash).  Validate targets with the alloc snapshot + the
+        // klass oracle.  Crucially, the fixpoint's marked-AND-snapshot
+        // extraction gate makes oracle leaks DECAY instead of compound:
+        // a leaked mark enters VO at sweep, but marks reset each cycle,
+        // so the poisoned entry fails is_live next cycle and is never
+        // extracted -- no self-sustaining loop.
+        let in_any = |a: crate::util::Address| {
             if !a.is_aligned_to(8) {
-                continue;
+                return false;
             }
-            let keep = if plan.immix_space.address_in_space(a) {
-                t.in_alloc_map(a)
+            if plan.immix_space.address_in_space(a) {
+                t.in_alloc_map(a) && t.klass_plausible(a)
             } else if los.address_in_space(a)
                 || immortal.address_in_space(a)
                 || nonmoving.address_in_space(a)
             {
-                vo_ok(o)
+                t.klass_plausible(a)
             } else {
                 false
-            };
-            if keep {
-                rescued.push(o);
             }
-        }
-        // VALIDATING closure over the rescued set: extraction sources
-        // include intact-dead objects (stale VO under lazy sweep), whose
-        // slot values can be stale; ProcessModBufSATB scans children
-        // unvalidated, so a single stale ref reaches iterate_fields on
-        // recycled memory (measured).  Validate EVERY hop with the same
-        // predicate as the seeds; children failing it are either garbage
-        // or allocate-black (already live).  Marks only ever land on
-        // validated genuine starts, so the CopyFromMarkBits->VO feedback
-        // stays a true allocation map (unlike the conservative-era
-        // poisoning).  Intact-dead survivors become bounded floating
-        // garbage.
-        {
-            use crate::plan::tracing::SlotIterator;
-            use crate::vm::slot::Slot;
-            let validate = |o: ObjectReference| -> bool {
-                let a = o.to_raw_address();
-                if !a.is_aligned_to(8) {
-                    return false;
-                }
-                if plan.immix_space.address_in_space(a) {
-                    t.in_alloc_map(a) && vo_ok(o) && t.klass_plausible(a)
-                } else if los.address_in_space(a)
-                    || immortal.address_in_space(a)
-                    || nonmoving.address_in_space(a)
-                {
-                    vo_ok(o) && t.klass_plausible(a)
-                } else {
-                    false
-                }
-            };
+        };
+        let mut trace_all = |seeds: Vec<ObjectReference>, worker: &mut GCWorker<VM>| {
             let mut queue = CollectQueue(Vec::new());
-            let (mut n_ok, mut n_align, mut n_space, mut n_am, mut n_vo, mut n_klass) =
-                (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-            for o in rescued {
-                // instrumented validate (same predicate, counted)
-                let a = o.to_raw_address();
-                if !a.is_aligned_to(8) {
-                    n_align += 1;
-                    continue;
-                }
-                let in_immix = plan.immix_space.address_in_space(a);
-                let in_other = los.address_in_space(a)
-                    || immortal.address_in_space(a)
-                    || nonmoving.address_in_space(a);
-                if !in_immix && !in_other {
-                    n_space += 1;
-                    continue;
-                }
-                if in_immix && !t.in_alloc_map(a) {
-                    n_am += 1;
-                    continue;
-                }
-                if !vo_ok(o) {
-                    n_vo += 1;
-                    continue;
-                }
-                if !t.klass_plausible(a) {
-                    n_klass += 1;
-                    continue;
-                }
-                n_ok += 1;
-                if std::env::var_os("MMTK_SATB_TRACE").is_some() {
-                    eprintln!("[vt] seed {:?}", o);
-                }
-                plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
-            }
-            if dbg {
-                eprintln!(
-                    "[val] ok={} align={} space={} am={} vo={} klass={}",
-                    n_ok, n_align, n_space, n_am, n_vo, n_klass
-                );
-            }
-            // Wholesale rescan, split by seed liveness certainty:
-            //  - immortal (live by definition) and LOS to_space (traced
-            //    this cycle => live): children are genuine current refs;
-            //    scan them in PARALLEL via ProcessModBufSATB.
-            //  - nonmoving (an immix-like space whose enumeration
-            //    includes INTACT-DEAD objects with stale slot values):
-            //    seed THIS validating closure so children are checked.
-            {
-                use crate::util::object_enum::ClosureObjectEnumerator;
-                let mut live_roots: Vec<ObjectReference> = Vec::new();
-                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
-                    live_roots.push(obj);
-                });
-                plan.common().get_immortal().enumerate_objects(&mut en);
-                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
-                    live_roots.push(obj);
-                });
-                plan.common().get_los().enumerate_to_space_objects(&mut en);
-                let mut stale_suspect: Vec<ObjectReference> = Vec::new();
-                let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| {
-                    stale_suspect.push(obj);
-                });
-                plan.common().get_nonmoving().enumerate_objects(&mut en);
-                if dbg {
-                    eprintln!(
-                        "[drain] wholesale live={} suspect={}",
-                        live_roots.len(),
-                        stale_suspect.len()
-                    );
-                }
-                if !live_roots.is_empty() {
-                    mmtk.scheduler.work_buckets[WorkBucketStage::Closure].add(
-                        ProcessModBufSATB::<VM, ConcurrentImmix<VM>, TRACE_KIND_FAST>::new(
-                            live_roots,
-                        ),
-                    );
-                }
-                for o in stale_suspect {
+            for o in seeds {
+                if in_any(o.to_raw_address()) {
                     plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, o, worker);
                 }
             }
-            let vt = std::env::var_os("MMTK_SATB_TRACE").is_some();
             while let Some(obj) = queue.0.pop() {
-                if vt {
-                    let a = obj.to_raw_address();
-                    let narrow = unsafe { (a + 8usize).load::<u32>() };
-                    eprintln!("[vt] scan {:?} narrow={:#x}", obj, narrow);
+                if std::env::var_os("MMTK_SATB_TRACE").is_some() {
+                    eprintln!("[ta] scan {:?}", obj);
                 }
                 let mut children: Vec<ObjectReference> = Vec::new();
                 SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
-                    // Same in-span slot gate as the extraction: a bogus
-                    // validated object yields garbage oop-map slot
-                    // addresses; never dereference those.
+                    // same space-backed guard as extraction: bogus slot
+                    // addresses fault at the committed-heap edge
                     if let Some(sa) = s.slot_address() {
-                        if sa < t.heap_base() || sa >= t.heap_base() + t.heap_span() {
+                        if crate::mmtk::SFT_MAP.get_checked(sa).name()
+                            == crate::policy::sft::EMPTY_SFT_NAME
+                        {
                             return;
                         }
                     }
@@ -576,18 +338,144 @@ impl<VM: VMBinding> GCWork<VM> for SatbFinalDrain<VM> {
                     }
                 });
                 for c in children {
-                    if validate(c) {
-                        if vt {
-                            eprintln!("[vt] child {:?} (of {:?})", c, obj);
-                        }
+                    if in_any(c.to_raw_address()) {
                         plan.trace_object::<CollectQueue, TRACE_KIND_FAST>(&mut queue, c, worker);
                     }
                 }
                 plan.post_scan_object(obj);
             }
+        };
+
+        // 1. Wholesale un-armed-space rescan FIRST (its marks feed the
+        //    fixpoint): immortal (live by definition), LOS to_space
+        //    (traced => live), nonmoving via its own liveness below.
+        {
+            use crate::util::object_enum::ClosureObjectEnumerator;
+            let mut roots: Vec<ObjectReference> = Vec::new();
+            let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| roots.push(obj));
+            plan.common().get_immortal().enumerate_objects(&mut en);
+            let mut en = ClosureObjectEnumerator::<_, VM>::new(|obj| roots.push(obj));
+            plan.common().get_los().enumerate_to_space_objects(&mut en);
+            if dbg {
+                eprintln!("[drain] wholesale roots={}", roots.len());
+            }
+            trace_all(roots, worker);
+        }
+
+        // 2. FIXPOINT extraction from LIVE objects only (SFT is_live:
+        //    immix mark bit / LOS treadmill / immortal always-live).
+        //    Mark-start reachability is covered inductively: every
+        //    rescue chain link is marked before its snapshot slots are
+        //    needed.  NOTHING unverified is ever iterated, dissolving
+        //    the klass-alias problem entirely (no oracle can beat ASCII
+        //    data aliasing narrow-klass values; measured families 0x1,
+        //    0x1770, 0x3030, 0x303030).  This packet MUST run as the
+        //    Closure sentinel so round 1 sees the quiesced mark set.
+        // extracted set as a bitmap over 8-byte grains (HashSet insert
+        // was on the per-object hot path)
+        let ngrains = t.heap_span() >> 3;
+        let mut extracted_bm = vec![0u64; ngrains.div_ceil(64)];
+        let mut extracted_count = 0usize;
+        let mut rounds = 0u32;
+        loop {
+            rounds += 1;
+            let mut round_nodes: Vec<ObjectReference> = Vec::new();
+            for &idx in &flagged {
+                let pstart = base + (idx << satb_pages::LOG_BYTES_IN_PAGE);
+                let snap = t.snapshot_page(idx);
+                let mut objs: Vec<ObjectReference> = Vec::new();
+                {
+                    let mut consider = |a: crate::util::Address| {
+                        let Some(o) = ObjectReference::from_raw_address(a) else {
+                            return;
+                        };
+                        let g = (a - base) >> 3;
+                        if (extracted_bm[g >> 6] >> (g & 63)) & 1 == 1 {
+                            return;
+                        }
+                        let sft = crate::mmtk::SFT_MAP.get_checked(a);
+                        // stale alloc-map slices (full clear removed for
+                        // arm cost) can yield addresses in FREED chunks:
+                        // EmptySpaceSFT::is_live panics by design.
+                        if sft.name() == crate::policy::sft::EMPTY_SFT_NAME {
+                            return;
+                        }
+                        if !sft.is_live(o) {
+                            return;
+                        }
+                        extracted_bm[g >> 6] |= 1 << (g & 63);
+                        extracted_count += 1;
+                        objs.push(o);
+                    };
+                    // No boundary guard: the marked-only gate supersedes
+                    // the oracle-era bogus-head problem, and skipping a
+                    // genuine >=24-byte object at pstart-8 loses its
+                    // on-page slots (retention gap compounding with page
+                    // count).
+                    if let Some(h) = t.prev_start(pstart, 64 << 20) {
+                        consider(h);
+                    }
+                    t.alloc_map_starts(pstart, satb_pages::BYTES_IN_PAGE, |a| consider(a));
+                }
+                for obj in objs {
+                    if std::env::var_os("MMTK_SATB_TRACE").is_some() {
+                        eprintln!("[fx] extract {:?}", obj);
+                    }
+                    SlotIterator::<VM>::iterate_fields(obj, worker.tls.0, |s| {
+                        let Some(sa) = s.slot_address() else { return };
+                        if sa < base || sa >= base + t.heap_span() {
+                            return;
+                        }
+                        let v: u32 = if t.page_index_of(sa) == idx {
+                            unsafe { *(snap.add(sa - pstart) as *const u32) }
+                        } else if in_snap(sa, &flagged, t) {
+                            let oidx = t.page_index_of(sa);
+                            unsafe {
+                                *(t.snapshot_page(oidx).add(
+                                    sa - (base + (oidx << satb_pages::LOG_BYTES_IN_PAGE)),
+                                ) as *const u32)
+                            }
+                        } else {
+                            // live-load only from space-backed pages: the
+                            // VA-span gate admits garbage slot addresses
+                            // beyond COMMITTED memory (measured MAPERR at
+                            // the heap edge from a bogus oop-map walk)
+                            if crate::mmtk::SFT_MAP.get_checked(sa).name()
+                                == crate::policy::sft::EMPTY_SFT_NAME
+                            {
+                                return;
+                            }
+                            match s.load() {
+                                Some(o) => {
+                                    round_nodes.push(o);
+                                    return;
+                                }
+                                None => return,
+                            }
+                        };
+                        if v == 0 {
+                            return;
+                        }
+                        let addr = unsafe { crate::util::Address::from_usize(v as usize) };
+                        if let Some(o) = ObjectReference::from_raw_address(addr) {
+                            round_nodes.push(o);
+                        }
+                    });
+                }
+            }
+            if round_nodes.is_empty() {
+                break;
+            }
+            trace_all(round_nodes, worker);
         }
         if dbg {
-            eprintln!("[drain] trace-filter done");
+            eprintln!(
+                "[drain] fixpoint rounds={} extracted={} flagged={} drain={}us",
+                rounds,
+                extracted_count,
+                flagged.len(),
+                drain_t0.elapsed().as_micros()
+            );
         }
         t.reset_cursor();
     }

@@ -98,6 +98,8 @@ pub(crate) struct SatbPages {
     /// edges, measured as downstream heap corruption).
     drain_stop: AtomicBool,
     drainer_running: AtomicBool,
+    /// last cycle's armed ranges (targeted stale-slice clearing)
+    prev_armed: std::sync::Mutex<Vec<(Address, usize)>>,
     /// VO-bitmap snapshot taken at InitialMark, BEFORE any of this cycle's
     /// marking.  Conservative candidates are validated against THIS map:
     /// the live VO map is poisoned by our own conservative marks at the
@@ -159,6 +161,7 @@ impl SatbPages {
             stash: std::sync::Mutex::new(Vec::new()),
             drain_stop: AtomicBool::new(false),
             drainer_running: AtomicBool::new(false),
+            prev_armed: std::sync::Mutex::new(Vec::new()),
             alloc_map: unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -208,7 +211,47 @@ impl SatbPages {
         }
         if std::env::var_os("MMTK_SATB_UFFD").is_some() {
             self.uffd_arm(start, bytes);
+        } else if std::env::var_os("MMTK_SATB_NOWP").is_none()
+            && std::env::var("MMTK_SATB_SPARSE").as_deref() != Ok("0")
+        {
+            // Occupied-only arming: a page with no mark-start objects
+            // (alloc-snapshot slice all zero -- fresh TLAB pages, empty
+            // blocks) has no mark-start slots to rescue, so WP-arming it
+            // only buys faults.  Profile: lusearch faulted 482k pages/run
+            // at ~9us each with whole-chunk arming; allocation-heavy
+            // workloads write mostly fresh pages.
+            let mut run_start: Option<usize> = None;
+            let pages = bytes >> LOG_BYTES_IN_PAGE;
+            for p in 0..=pages {
+                let occupied = p < pages && {
+                    let off = (start + (p << LOG_BYTES_IN_PAGE)) - self.base;
+                    let map_off = off >> 6;
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(self.alloc_map.add(map_off), 64)
+                    };
+                    slice.iter().any(|&b| b != 0)
+                };
+                match (occupied, run_start) {
+                    (true, None) => run_start = Some(p),
+                    (false, Some(s)) => {
+                        // Extend the run by 4 pages: a page with no
+                        // STARTS can still be interior to a spanning
+                        // immix object (<=16KB = 4 pages); its slots are
+                        // mark-start slots too (measured: xalan's DOM
+                        // arrays broke under start-only occupancy).
+                        // LOS/immortal runs arm whole-object via
+                        // arm_pages and don't take this path.
+                        let e = (p + 3).min(pages);
+                        let rs = start + (s << LOG_BYTES_IN_PAGE);
+                        let rb = (e - s) << LOG_BYTES_IN_PAGE;
+                        assert_eq!(self.shim.wp(rs, rb, true), 0, "gcsatb wp on");
+                        run_start = None;
+                    }
+                    _ => {}
+                }
+            }
         } else if std::env::var_os("MMTK_SATB_NOWP").is_none() {
+            // MMTK_SATB_SPARSE=0: whole-chunk arming (dense fallback)
             assert_eq!(self.shim.wp(start, bytes, true), 0, "gcsatb wp on");
         }
         self.armed.lock().unwrap().push((start, bytes));
@@ -348,6 +391,7 @@ impl SatbPages {
     /// clears the remainder.  Chunks allocated DURING marking were never
     /// armed (their objects allocate black), so they are not touched.
     pub fn disarm_all(&self) {
+        self.remember_armed();
         for (start, bytes) in self.armed.lock().unwrap().drain(..) {
             assert_eq!(self.shim.wp(start, bytes, false), 0, "gcsatb wp off");
         }
@@ -603,6 +647,26 @@ impl SatbPages {
             }
         }
         None
+    }
+
+    /// InitialMark: zero the alloc-map slices of LAST cycle's armed
+    /// ranges (targeted stale-slice clearing: ~armed-set/64 bytes, vs
+    /// the removed 48MB full-span memset).  Ranges re-armed this cycle
+    /// get re-copied immediately after.
+    pub fn clear_prev_armed_slices(&self) {
+        let prev = self.prev_armed.lock().unwrap().clone();
+        for (start, bytes) in prev {
+            unsafe {
+                std::ptr::write_bytes(self.alloc_map.add((start - self.base) >> 6), 0, bytes >> 6);
+            }
+        }
+    }
+
+    /// FinalMark: remember this cycle's armed ranges for the next
+    /// InitialMark's targeted slice clearing.
+    pub fn remember_armed(&self) {
+        let armed = self.armed.lock().unwrap().clone();
+        *self.prev_armed.lock().unwrap() = armed;
     }
 
     /// InitialMark (before any marking): snapshot the VO bitmap slice for

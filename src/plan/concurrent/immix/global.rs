@@ -207,6 +207,7 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                 if let Some(t) = crate::util::satb_pages::satb_pages() {
                     use crate::util::heap::chunk_map::Chunk;
                     use crate::util::linear_scan::Region;
+                    let arm_t0 = std::time::Instant::now();
                     let phase = std::env::var("MMTK_SATB_ARMPHASE")
                         .unwrap_or_else(|_| "initial".into());
                     if phase == "final" {
@@ -217,7 +218,12 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     t.reset_cursor();
                     t.clear_young();
                     t.allow_drainer();
-                    t.clear_alloc_map();
+                    t.clear_prev_armed_slices();
+                    // No full-span alloc-map clear (~48MB memset/cycle,
+                    // measured in the 24ms arm cost): armed slices are
+                    // overwritten below, and stale slices from chunks no
+                    // longer armed only loosen the VALUE filter, whose
+                    // leaks decay through the is_live extraction gate.
                     if phase != "final" {
                     // bisect gates
                     let noarm = std::env::var_os("MMTK_SATB_NOARM").is_some();
@@ -294,6 +300,9 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     if phase == "pulse" {
                         // PTE-churn-only probe: no delayed mutator stores.
                         t.disarm_all();
+                    }
+                    if std::env::var_os("MMTK_SATB_COMMS").is_some() {
+                        eprintln!("[perf] arm={}us", arm_t0.elapsed().as_micros());
                     }
                 }
                 self.immix_space.prepare(
@@ -542,8 +551,12 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
     fn schedule_concurrent_marking_final_pause(&'static self, scheduler: &GCWorkScheduler<VM>) {
         self.set_ref_closure_buckets_enabled(true);
         if crate::util::satb_pages::satb_pages_active() {
+            // SENTINEL: the fixpoint drain must see the QUIESCED mark set
+            // (extract-from-live-only); sentinels run when the bucket is
+            // otherwise drained, and the bucket reopens if the sentinel
+            // adds work.
             scheduler.work_buckets[WorkBucketStage::Closure]
-                .add(super::gc_work::SatbFinalDrain::<VM>::new());
+                .set_sentinel(Box::new(super::gc_work::SatbFinalDrain::<VM>::new()));
         }
 
         // Skip root scanning in the final mark.  (A page-mode FinalMark

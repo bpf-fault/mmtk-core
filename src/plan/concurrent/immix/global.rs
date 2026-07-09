@@ -234,21 +234,25 @@ impl<VM: VMBinding> Plan for ConcurrentImmix<VM> {
                     // MMTK_SATB_FRAC=N: arm only every Nth chunk (race
                     // sensitivity probe -- does corruption need broad
                     // slowdown or do a few slow writes suffice?)
-                    let frac: usize = std::env::var("MMTK_SATB_FRAC")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1);
-                    for (i, chunk) in self.immix_space.chunk_map.all_chunks().enumerate() {
-                        if i % frac != 0 {
-                            continue;
+                    // PARALLEL arming: batch chunks into packets on the
+                    // Prepare bucket (still open while this Prepare
+                    // packet runs; the pause cannot end before the
+                    // bucket drains).  Single-threaded arming was the
+                    // dominant pause cost (~24ms/cycle).
+                    {
+                        let mut all: Vec<crate::util::Address> = Vec::new();
+                        for chunk in self.immix_space.chunk_map.all_chunks() {
+                            all.push(chunk.start());
                         }
-                        t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
-                        t.arm(chunk.start(), Chunk::BYTES);
-                    }
-                    // Nonmoving is an immix space too: arm its chunks.
-                    for chunk in self.common.get_nonmoving().chunk_map.all_chunks() {
-                        t.snapshot_alloc_map_range(chunk.start(), Chunk::BYTES);
-                        t.arm(chunk.start(), Chunk::BYTES);
+                        for chunk in self.common.get_nonmoving().chunk_map.all_chunks() {
+                            all.push(chunk.start());
+                        }
+                        let per = all.len().div_ceil(8).max(1);
+                        let scheduler = &self.common.base.scheduler;
+                        for batch in all.chunks(per) {
+                            scheduler.work_buckets[crate::scheduler::WorkBucketStage::Prepare]
+                                .add(super::gc_work::ArmChunks::<VM>::new(batch.to_vec()));
+                        }
                     }
                     if !no_los {
                     // LOS + immortal: arm live-object page runs.  Their

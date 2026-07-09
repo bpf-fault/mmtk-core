@@ -41,6 +41,19 @@ pub fn satb_verify() -> bool {
     VERIFY.load(Ordering::Relaxed)
 }
 
+/// Cross-firing state for the re-firing sentinel drain (one extraction
+/// round per Closure quiesce; parallel TraceRescued packets in between).
+pub struct DrainState {
+    pub flagged: Vec<usize>,
+    pub flag_bm: Vec<u64>,
+    pub extracted_bm: Vec<u64>,
+    pub extracted_count: usize,
+    pub rounds: u32,
+    pub t0: std::time::Instant,
+}
+
+pub static DRAIN_STATE: std::sync::Mutex<Option<DrainState>> = std::sync::Mutex::new(None);
+
 pub(crate) fn satb_pages() -> Option<&'static SatbPages> {
     TRACKER.get()
 }

@@ -356,7 +356,16 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 } else {
                     let alias_new = shift(new_object);
                     VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
-                    self.update_references_staged(tls, alias_new, cf, delta);
+                    if crate::util::compact_faults::defer_forward() {
+                        self.update_references_staged(tls, alias_new, cf, delta);
+                    } else {
+                        // Without deferred forwarding the reference bitmap
+                        // is never consumed at install time; recording it
+                        // is a per-slot side-metadata pass that regressed
+                        // concurrent staging ~3x on h2. Forward eagerly,
+                        // as B.1 did.
+                        self.update_references(tls, alias_new);
+                    }
                 }
             });
         let staged_end = to.align_up(BYTES_IN_PAGE);

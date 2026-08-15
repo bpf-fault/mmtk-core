@@ -655,6 +655,12 @@ impl CompactFaults {
                 };
                 assert!(r != libc::MAP_FAILED, "uffd flip mremap failed");
                 uffd_register_missing(self.uffd, start, bytes);
+                let mut a = start;
+                while a < start + bytes {
+                    self.registered[self.region_index(a)]
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    a = a + REGION_BYTES;
+                }
             }
             CompactFaultsBackend::None => unreachable!(),
         }
@@ -748,8 +754,30 @@ impl CompactFaults {
     /// reach it; then (uffd) install the page.  Returns true if the fault
     /// was ours.  Runs in signal context.
     fn handle_window_fault(&self, page: Address) -> bool {
-        if !self.window_active() || !self.in_span(page) {
+        if !self.in_span(page) {
             return false;
+        }
+        // SIGBUS delivery is asynchronous: a fault raised while this
+        // page's region was still uffd-registered can reach us after the
+        // region was unregistered (or the whole window closed).  The
+        // mapping is normal anonymous memory by then, so the right
+        // response is to retry the instruction, which will zero-fill and
+        // proceed.  Bounded per-thread so a genuine wild SIGBUS into the
+        // heap span still crashes instead of spinning.
+        if !self.window_active()
+            || !self.registered[self.region_index(page)]
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            thread_local! {
+                static RETRY: std::cell::Cell<(usize, u32)> =
+                    const { std::cell::Cell::new((0, 0)) };
+            }
+            return RETRY.with(|r| {
+                let (last, n) = r.get();
+                let n = if last == page.as_usize() { n + 1 } else { 0 };
+                r.set((page.as_usize(), n));
+                n < 1024
+            });
         }
         WINDOW_FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.page_state(page) == STATE_PENDING {
@@ -886,6 +914,12 @@ impl CompactFaults {
             };
             let r = unsafe { libc::ioctl(self.uffd, UFFDIO_UNREGISTER, &mut range) };
             assert_eq!(r, 0, "UFFDIO_UNREGISTER({}, {}) failed", start, bytes);
+            let mut a = start;
+            while a < start + bytes {
+                self.registered[self.region_index(a)]
+                    .store(false, std::sync::atomic::Ordering::Release);
+                a = a + REGION_BYTES;
+            }
         }
     }
 

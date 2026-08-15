@@ -83,12 +83,41 @@ pub fn defer_forward() -> bool {
 /// from UN-SLID from-space (no userspace slide-compact); the GC only flips and
 /// emits metadata (live-word bitmap, per-page first-source index, reference
 /// bitmap at OLD positions, forward table).  MMTK_COMPACT_INKERNEL.
+/// R1: alias slots whose release is deferred to the next pause (see
+/// finish_region).
+static DEFERRED_RELEASE: std::sync::Mutex<Vec<(Address, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// R1: release alias slots deferred by finish_region.  Call from a pause
+/// (mutators stopped, no fault handlers in flight).
+pub fn release_deferred_alias() {
+    let mut v = DEFERRED_RELEASE.lock().unwrap();
+    for (slot, bytes) in v.drain(..) {
+        let r = unsafe {
+            libc::madvise(slot.to_mut_ptr::<libc::c_void>(), bytes,
+                          libc::MADV_DONTNEED)
+        };
+        debug_assert_eq!(r, 0);
+    }
+}
+
 static INKERNEL_COMPACT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Whether full in-kernel compaction (R1) is active.
 pub fn inkernel_compact() -> bool {
     INKERNEL_COMPACT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// R1 verification mode (MMTK_R1_VERIFY): execute the v2 userspace path
+/// (so the run is correct) while also emitting R1 metadata and diffing a
+/// userspace emulation of the in-kernel page builder against the staged
+/// truth for every region.
+static R1_VERIFY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn r1_verify() -> bool {
+    R1_VERIFY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Compressed-oops base/shift, set by the VM binding so the in-kernel (bpf)
@@ -121,6 +150,10 @@ pub(crate) fn init_compact_faults(
         return;
     }
     if std::env::var_os("MMTK_COMPACT_DEFER_FORWARD").is_some() {
+        DEFER_FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if std::env::var_os("MMTK_R1_VERIFY").is_some() {
+        R1_VERIFY.store(true, std::sync::atomic::Ordering::Relaxed);
         DEFER_FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if std::env::var_os("MMTK_COMPACT_INKERNEL").is_some() {
@@ -388,7 +421,9 @@ impl CompactFaults {
             let p = self.refbitmap.add(byte);
             *p |= 1u8 << bit;
         }
-        REFBITS_POPULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // NOTE: no per-slot global counter here -- a shared atomic
+        // fetch_add on every reference slot ping-pongs its cacheline
+        // across all staging workers and dominated the window.
     }
 
     /// Read the reference bit for a to-space slot address (4-byte granularity).
@@ -408,6 +443,107 @@ impl CompactFaults {
         let lb = (last + 7) >> 3;
         unsafe {
             std::ptr::write_bytes(self.refbitmap.add(fb), 0, lb - fb);
+        }
+    }
+
+    /// Heap span base covered by this window.
+    pub fn space_base(&self) -> Address {
+        self.space_base
+    }
+
+    /// R1 debug: emulate the in-kernel page builder for to-space `page`,
+    /// reading from-space words from `snapshot` (indexed by region-local
+    /// word). `region_w0` is the region's first heap word index. Mirrors
+    /// gc_b0_ops.bpf.c exactly.
+    pub fn r1_emulate_page(&self, page: usize, snapshot: &[u64],
+                            region_w0: usize) -> [u64; 512] {
+        const REGION_WORDS: usize = 1 << 17;
+        let mut out = [0u64; 512];
+        let shift = COOPS_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+        let base = COOPS_BASE.load(std::sync::atomic::Ordering::Relaxed);
+        let total_words = self.span >> 3;
+        let mut srcw = unsafe { *self.first_src.add(page) } as usize;
+        let mut region_end = ((srcw / REGION_WORDS) + 1) * REGION_WORDS;
+        if region_end > total_words {
+            region_end = total_words;
+        }
+        let mut outw = 0;
+        while outw < 512 && srcw < region_end {
+            let live = unsafe {
+                (*self.livebits.add(srcw >> 3) >> (srcw & 7)) & 1 == 1
+            };
+            if !live {
+                srcw += 1;
+                continue;
+            }
+            let mut word = if srcw >= region_w0
+                && srcw - region_w0 < snapshot.len()
+            {
+                snapshot[srcw - region_w0]
+            } else {
+                0xdead_dead_dead_deadu64 // source outside snapshot: flag it
+            };
+            for h in 0..2 {
+                let slot = (srcw << 1) | h;
+                let rb = unsafe {
+                    (*self.refbitmap.add(slot >> 3) >> (slot & 7)) & 1 == 1
+                };
+                if !rb {
+                    continue;
+                }
+                let v = if h == 0 { word as u32 } else { (word >> 32) as u32 };
+                if v == 0 {
+                    continue;
+                }
+                let old = base.wrapping_add((v as usize) << shift);
+                let rel = old.wrapping_sub(self.space_base.as_usize());
+                if rel >= self.span {
+                    continue;
+                }
+                let nv = unsafe { *self.fwdtable.add(rel >> 3) };
+                if nv == 0 {
+                    continue;
+                }
+                if h == 0 {
+                    word = (word & !0xffff_ffffu64) | nv as u64;
+                } else {
+                    word = (word & 0xffff_ffffu64) | ((nv as u64) << 32);
+                }
+            }
+            out[outw] = word;
+            outw += 1;
+            srcw += 1;
+        }
+        out
+    }
+
+    /// R1 debug: (first_src[page], live bit at that word) as userspace
+    /// reads them through the arena mmap.
+    pub fn r1_page_meta(&self, page: usize) -> (u32, bool) {
+        unsafe {
+            let fs = *self.first_src.add(page);
+            let live = (*self.livebits.add((fs as usize) >> 3)
+                        >> (fs & 7)) & 1 == 1;
+            (fs, live)
+        }
+    }
+
+    /// R1: clear the live-word bitmap and per-page first-source indexes for
+    /// a region before calculate_offset_vector re-emits them.  Neither is
+    /// consumed after the window closes, but without clearing, stale bits
+    /// and stale page mappings from earlier GC cycles leak into the
+    /// in-kernel page builder.
+    pub fn clear_r1_meta(&self, start: Address, bytes: usize) {
+        let w0 = (start - self.space_base) >> 3;
+        let w1 = (start + bytes - self.space_base).div_ceil(8);
+        unsafe {
+            std::ptr::write_bytes(self.livebits.add(w0 >> 3), 0,
+                                  ((w1 + 7) >> 3) - (w0 >> 3));
+        }
+        let p0 = (start - self.space_base) >> LOG_BYTES_IN_PAGE;
+        let p1 = (start + bytes - self.space_base) >> LOG_BYTES_IN_PAGE;
+        for p in p0..p1 {
+            unsafe { *self.first_src.add(p) = 0; }
         }
     }
 
@@ -583,7 +719,9 @@ impl CompactFaults {
                 shim.set_forward(
                     COOPS_BASE.load(std::sync::atomic::Ordering::Relaxed),
                     COOPS_SHIFT.load(std::sync::atomic::Ordering::Relaxed),
-                    defer_forward(),
+                    // Verify mode forwards eagerly in userspace; the kernel
+                    // must not re-forward at install time.
+                    defer_forward() && !r1_verify(),
                     inkernel_compact(),
                 );
             }
@@ -740,6 +878,19 @@ impl CompactFaults {
         // arena address by HotSpot's resume-time DerivedPointerTable update
         // (a UAF crash); DONTNEED keeps the VMA, freeing only the pages.
         {
+            // R1: an in-flight mutator fault may still be building from
+            // this alias (its handler started before install() touched the
+            // page and races finish_region); releasing now zero-fills its
+            // remaining sub-reads and the broken page can win the PTE
+            // install.  Defer the release to the next pause, when mutators
+            // are stopped and no handler can be in flight.
+            if inkernel_compact() {
+                DEFERRED_RELEASE
+                    .lock()
+                    .unwrap()
+                    .push((self.alias_of(start), bytes));
+                return;
+            }
             let slot = self.alias_of(start);
             let r = unsafe {
                 libc::madvise(

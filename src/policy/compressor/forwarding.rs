@@ -185,7 +185,21 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         } else {
             None
         };
-        let r1 = crate::util::compact_faults::inkernel_compact();
+        let r1 = crate::util::compact_faults::inkernel_compact()
+            || crate::util::compact_faults::r1_verify();
+        if r1 {
+            if let Some(cf) = cf {
+                // Stale live bits / first_src from earlier cycles must not
+                // leak into this cycle's in-kernel page builds.
+                // Clear the region's FULL span, not just up to the current
+                // cursor: stale live bits from an earlier, fuller cycle
+                // above today's cursor read as phantom live words in the
+                // kernel builder (harmless -- they land in the dead gap
+                // below the preset allocation cursor -- but they cost
+                // fallback reloads on the non-resident tail).
+                cf.clear_r1_meta(region.start(), CompressorRegion::BYTES);
+            }
+        }
         let mut obj_ostart = Address::ZERO;
         let mut obj_nstart = Address::ZERO;
         for block in RegionIterator::<Block>::new(first_block, last_block) {

@@ -259,10 +259,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         use crate::util::compact_faults::BYTES_IN_PAGE;
         let cf = crate::util::compact_faults::compact_faults().unwrap();
         let region_bytes = forwarding::CompressorRegion::BYTES;
-        // R1: release alias slots whose DONTNEED was deferred by
-        // finish_region (mutators are stopped here, so no in-flight kernel
-        // build can be reading them).
-        crate::util::compact_faults::release_deferred_alias();
         // Mark all regions non-claimable (DONE); each live region is marked
         // claimable (UNSTAGED) below.  This is the steal-mode coordination.
         cf.reset_region_staging();

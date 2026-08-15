@@ -83,24 +83,6 @@ pub fn defer_forward() -> bool {
 /// from UN-SLID from-space (no userspace slide-compact); the GC only flips and
 /// emits metadata (live-word bitmap, per-page first-source index, reference
 /// bitmap at OLD positions, forward table).  MMTK_COMPACT_INKERNEL.
-/// R1: alias slots whose release is deferred to the next pause (see
-/// finish_region).
-static DEFERRED_RELEASE: std::sync::Mutex<Vec<(Address, usize)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// R1: release alias slots deferred by finish_region.  Call from a pause
-/// (mutators stopped, no fault handlers in flight).
-pub fn release_deferred_alias() {
-    let mut v = DEFERRED_RELEASE.lock().unwrap();
-    for (slot, bytes) in v.drain(..) {
-        let r = unsafe {
-            libc::madvise(slot.to_mut_ptr::<libc::c_void>(), bytes,
-                          libc::MADV_DONTNEED)
-        };
-        debug_assert_eq!(r, 0);
-    }
-}
-
 static INKERNEL_COMPACT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -880,16 +862,29 @@ impl CompactFaults {
         {
             // R1: an in-flight mutator fault may still be building from
             // this alias (its handler started before install() touched the
-            // page and races finish_region); releasing now zero-fills its
-            // remaining sub-reads and the broken page can win the PTE
-            // install.  Defer the release to the next pause, when mutators
-            // are stopped and no handler can be in flight.
+            // page and races finish_region); releasing under it zero-fills
+            // its remaining sub-reads and the broken page can win the PTE
+            // install.  All pages are installed by now, so no NEW build can
+            // start; quiesce on the region's in-flight counter, then
+            // release concurrently.  (Deferring the release to the next
+            // pause is correct too, but a ~500MB MADV_DONTNEED in the
+            // pause cost ~30ms of pause time.)
             if inkernel_compact() {
-                DEFERRED_RELEASE
-                    .lock()
-                    .unwrap()
-                    .push((self.alias_of(start), bytes));
-                return;
+                let busy = unsafe {
+                    self.shim
+                        .as_ref()
+                        .unwrap()
+                        .region_busy_base()
+                        .add(self.region_index(start))
+                };
+                let mut spins = 0u64;
+                while unsafe { std::ptr::read_volatile(busy) } != 0 {
+                    std::hint::spin_loop();
+                    spins += 1;
+                    if spins > 200_000_000 {
+                        panic!("finish_region: in-flight build never quiesced");
+                    }
+                }
             }
             let slot = self.alias_of(start);
             let r = unsafe {
@@ -1074,6 +1069,7 @@ mod bpf_shim {
         refbits_base: BaseFn,
         livebits_base: BaseFn,
         first_src_base: BaseFn,
+        region_busy: BaseFn,
         compact_words: CountFn,
         prefail: CountFn,
         dbg_print: VoidFn,
@@ -1106,6 +1102,7 @@ mod bpf_shim {
                     refbits_base: std::mem::transmute(sym("gcb0_refbits_base")),
                     livebits_base: std::mem::transmute(sym("gcb0_livebits_base")),
                     first_src_base: std::mem::transmute(sym("gcb0_first_src_base")),
+                    region_busy: std::mem::transmute(sym("gcb0_region_busy")),
                     compact_words: std::mem::transmute(sym("gcb0_compact_words")),
                     prefail: std::mem::transmute(sym("gcb0_prefail")),
                     dbg_print: std::mem::transmute(sym("gcb0_dbg_print")),
@@ -1152,6 +1149,11 @@ mod bpf_shim {
         }
 
         /// Userspace base of the per-page first-source index (R1, in the arena).
+        /// R1: per-region in-flight build counter array (u64 per region).
+        pub fn region_busy_base(&self) -> *const u64 {
+            unsafe { (self.region_busy)() as *const u64 }
+        }
+
         pub fn first_src_base(&self) -> *mut u32 {
             unsafe { (self.first_src_base)() as *mut u32 }
         }

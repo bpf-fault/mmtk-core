@@ -335,20 +335,67 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::bzero_vo_bit(start, region_bytes);
         // Class B v2: clear last cycle's reference bits for this region before
-        // re-recording them at the new staged positions.
+        // re-recording them.
         cf.clear_ref_bits(start, region_bytes);
+        let r1 = crate::util::compact_faults::inkernel_compact();
+        let verify = crate::util::compact_faults::r1_verify();
+        // Verify mode: snapshot from-space (the alias) before the v2 copy
+        // destroys the sources the emulated builder reads.
+        let snapshot: Option<Vec<u64>> = if verify {
+            let n = region_bytes >> 3;
+            let src = (start + delta).to_ptr::<u64>();
+            let mut v = vec![0u64; n];
+            unsafe { std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n) };
+            Some(v)
+        } else {
+            None
+        };
         let mut to = start;
         self.forwarding
             .scan_marked_objects(start, start + region_bytes, &mut |obj: ObjectReference| {
                 let alias_obj = shift(obj);
                 let copied_size = VM::VMObjectModel::get_size_when_copied(alias_obj);
-                let new_object = self.forward(obj, false);
-                let alias_new = shift(new_object);
-                VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
+                let new_object = if r1 && !verify {
+                    // Sliding compaction within a region is strictly
+                    // sequential: the running cursor IS the forwarding
+                    // address.  forward() per object (offset-vector decode +
+                    // mark-bit popcount) was ~20% of the whole window.
+                    let n = unsafe { ObjectReference::from_raw_address_unchecked(to) };
+                    debug_assert_eq!(n, self.forward(obj, false));
+                    n
+                } else {
+                    self.forward(obj, false)
+                };
+                to = new_object.to_object_start::<VM>() + copied_size;
                 #[cfg(feature = "vo_bit")]
                 vo_bit::set_vo_bit(new_object);
-                to = new_object.to_object_start::<VM>() + copied_size;
-                self.update_references_staged(tls, alias_new, cf, delta);
+                if verify {
+                    // Verify mode: v2 eager copy = ground truth, plus the
+                    // R1 old-position reference bits for the emulation.
+                    self.record_ref_bits_old(tls, alias_obj, cf, delta);
+                    let alias_new = shift(new_object);
+                    VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
+                    self.update_references(tls, alias_new);
+                } else if r1 {
+                    // R1: NO slide-compact copy.  The handler builds the to-space
+                    // page from un-slid from-space.  Just record the reference
+                    // slots at their OLD positions (scan the un-forwarded alias;
+                    // old slot addr = alias_slot - delta).
+                    self.record_ref_bits_old(tls, alias_obj, cf, delta);
+                } else {
+                    let alias_new = shift(new_object);
+                    VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
+                    if crate::util::compact_faults::defer_forward() {
+                        self.update_references_staged(tls, alias_new, cf, delta);
+                    } else {
+                        // Without deferred forwarding the reference bitmap
+                        // is never consumed at install time; recording it
+                        // is a per-slot side-metadata pass that regressed
+                        // concurrent staging ~3x on h2. Forward eagerly,
+                        // as B.1 did.
+                        self.update_references(tls, alias_new);
+                    }
+                }
             });
         let staged_end = to.align_up(BYTES_IN_PAGE);
         assert!(
@@ -360,7 +407,90 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         );
         if staged_end > start {
             cf.stage(start, staged_end - start);
+            if let Some(snap) = &snapshot {
+                let base = cf.space_base();
+                let region_w0 = (start - base) >> 3;
+                let p0 = (start - base) >> 12;
+                let np = (staged_end - start) >> 12;
+                for p in p0..p0 + np {
+                    let mine = cf.r1_emulate_page(p, snap, region_w0);
+                    let truth = unsafe {
+                        std::slice::from_raw_parts(
+                            (base + (p << 12) + delta).to_ptr::<u64>(), 512)
+                    };
+                    // Compare only live words: past `to`, the truth page
+                    // holds unspecified stale alias bytes.
+                    let page_addr = base + (p << 12);
+                    let cap = if page_addr + BYTES_IN_PAGE <= to {
+                        512
+                    } else if to > page_addr {
+                        (to - page_addr) >> 3
+                    } else {
+                        0
+                    };
+                    for w in 0..cap {
+                        if mine[w] != truth[w] {
+                            let (fs, live) = cf.r1_page_meta(p);
+                            eprintln!(
+                                "[r1diff] page={p} word={w} mine={:#x} truth={:#x} first_src={fs} live={live}",
+                                mine[w], truth[w]);
+                            break;
+                        }
+                    }
+                }
+            }
+            if r1 && std::env::var_os("MMTK_R1_DEBUG").is_some() {
+                let p0 = (start - cf.space_base()) >> 12;
+                let (fs, live) = cf.r1_page_meta(p0);
+                eprintln!("[r1us] region@{start} page={p0} first_src={fs} live={live}");
+            }
+            // R1 kernel-build cross-check (MMTK_R1_KCHECK): after install
+            // builds every page in-kernel, emulate each build in userspace
+            // straight from the (unmodified) alias and diff the results.
+            let kcheck = r1 && std::env::var_os("MMTK_R1_KCHECK").is_some();
+            // R1 included: install() (Bpf) touches each staged page, and
+            // with inkernel=1 each touch faults into the handler, which
+            // BUILDS the page from from-space -- still zero userspace
+            // copying.  Skipping this was the R1 correctness bug:
+            // finish_region unregisters the region right below, after
+            // which untouched staged pages silently kernel-zero-fill on
+            // access (no handler), yielding null references.  Mutator
+            // faults during staging still build lazily in-kernel; this
+            // materializes the remainder before unregister.
             cf.install(start, staged_end - start);
+            if kcheck {
+                let base = cf.space_base();
+                let region_w0 = (start - base) >> 3;
+                let alias = unsafe {
+                    std::slice::from_raw_parts(
+                        (start + delta).to_ptr::<u64>(), region_bytes >> 3)
+                };
+                let p0 = (start - base) >> 12;
+                let np = (staged_end - start) >> 12;
+                for p in p0..p0 + np {
+                    let mine = cf.r1_emulate_page(p, alias, region_w0);
+                    let built = unsafe {
+                        std::slice::from_raw_parts(
+                            (base + (p << 12)).to_ptr::<u64>(), 512)
+                    };
+                    let page_addr = base + (p << 12);
+                    let cap = if page_addr + crate::util::compact_faults::BYTES_IN_PAGE <= to {
+                        512
+                    } else if to > page_addr {
+                        (to - page_addr) >> 3
+                    } else {
+                        0
+                    };
+                    for w in 0..cap {
+                        if mine[w] != built[w] {
+                            eprintln!(
+                                "[r1kdiff] page={p} word={w} emu={:#x} kernel={:#x}",
+                                mine[w], built[w]);
+                            break;
+                        }
+                    }
+                }
+            }
         }
         // Clear any pending pages we predicted but did not stage, so no
         // mutator waits forever on them.
@@ -554,6 +684,31 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
+    /// R1: record each reference slot of `alias_obj` (the un-forwarded
+    /// arena alias of an object) in the reference bitmap at its OLD address
+    /// (`alias_slot - delta`).  No forwarding, no copy.
+    fn record_ref_bits_old(
+        &self,
+        tls: crate::util::VMWorkerThread,
+        alias_obj: ObjectReference,
+        cf: &crate::util::compact_faults::CompactFaults,
+        delta: isize,
+    ) {
+        if VM::VMScanning::support_slot_enqueuing(tls, alias_obj) {
+            VM::VMScanning::scan_object(tls, alias_obj, &mut |s: VM::VMSlot| {
+                // No s.load() null check: a ref bit on a null slot is
+                // harmless (the kernel forwarder leaves 0 unchanged), and
+                // skipping the load avoids touching the slot value at all.
+                if let Some(sa) = s.slot_address() {
+                    let old = unsafe {
+                        Address::from_usize((sa.as_usize() as isize - delta) as usize)
+                    };
+                    cf.set_ref_bit(old);
+                }
+            });
+        }
+    }
+
     fn update_references(&self, tls: crate::util::VMWorkerThread, object: ObjectReference) {
         if VM::VMScanning::support_slot_enqueuing(tls, object) {
             VM::VMScanning::scan_object(tls, object, &mut |s: VM::VMSlot| {
@@ -574,6 +729,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         if std::env::var_os("MMTK_REFBITS_DEBUG").is_some() {
             let n = crate::util::compact_faults::REFBITS_POPULATED.swap(0, Ordering::Relaxed);
             eprintln!("[refbits] reference slots recorded this cycle: {}", n);
+        }
+        if std::env::var_os("MMTK_R1_DEBUG").is_some() {
+            let (cw, pf) = cf.r1_stats();
+            eprintln!("[r1] compact_words(total)={} prefail={}", cw, pf);
+            cf.r1_dbg();
         }
         self.forwarding.release();
         cf.close_window();
@@ -669,6 +829,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 if staged_end > start {
                     cf.stage(start, staged_end - start);
                     cf.install(start, staged_end - start);
+
                 }
                 cf.finish_region(start, region_bytes);
             }

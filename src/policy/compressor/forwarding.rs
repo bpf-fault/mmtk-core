@@ -177,11 +177,31 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         let last_block = Block::from_aligned_address(cursor);
         // Class B v2: while we visit each object's start/end mark bits, also
         // record old->new in the forward table for the in-kernel handler.
+        // R1: additionally emit the live-word bitmap (old positions) and the
+        // per-page first-source index, so the handler can build pages from
+        // un-slid from-space.
         let cf = if crate::util::compact_faults::defer_forward() {
             crate::util::compact_faults::compact_faults()
         } else {
             None
         };
+        let r1 = crate::util::compact_faults::inkernel_compact()
+            || crate::util::compact_faults::r1_verify();
+        if r1 {
+            if let Some(cf) = cf {
+                // Stale live bits / first_src from earlier cycles must not
+                // leak into this cycle's in-kernel page builds.
+                // Clear the region's FULL span, not just up to the current
+                // cursor: stale live bits from an earlier, fuller cycle
+                // above today's cursor read as phantom live words in the
+                // kernel builder (harmless -- they land in the dead gap
+                // below the preset allocation cursor -- but they cost
+                // fallback reloads on the non-resident tail).
+                cf.clear_r1_meta(region.start(), CompressorRegion::BYTES);
+            }
+        }
+        let mut obj_ostart = Address::ZERO;
+        let mut obj_nstart = Address::ZERO;
         for block in RegionIterator::<Block>::new(first_block, last_block) {
             OFFSET_VECTOR_SPEC.store_atomic::<usize>(
                 block.start(),
@@ -195,10 +215,28 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     // A start bit transitions in_object false->true; at that
                     // point state.to is this object's post-compact start.
                     let starting = !state.in_object;
+                    if starting {
+                        obj_ostart = addr;
+                        obj_nstart = state.to;
+                    }
                     state.visit_mark_bit(addr);
                     if starting {
                         if let Some(cf) = cf {
                             cf.set_fwd(addr, state.to);
+                        }
+                    } else if r1 {
+                        // end bit: object occupies old [obj_ostart, addr],
+                        // i.e. words [obj_ostart..=addr]; new start obj_nstart.
+                        if let Some(cf) = cf {
+                            let mut w = obj_ostart;
+                            while w <= addr {
+                                cf.set_live_word(w);
+                                w += BYTES_IN_WORD;
+                            }
+                            // first_src for to-space page boundaries the object's
+                            // new range crosses.
+                            let nwords = (addr - obj_ostart) / BYTES_IN_WORD + 1;
+                            cf.record_first_src(obj_ostart, obj_nstart, nwords);
                         }
                     }
                 },

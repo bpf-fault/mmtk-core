@@ -33,6 +33,8 @@ pub enum DirtyTracking {
     /// Page write protection via userfaultfd-WP with a handler thread; no
     /// compiled barrier.
     Uffd,
+    /// Page write protection via mprotect + SIGSEGV; no compiled barrier.
+    Segv,
 }
 
 /// Select a GC plan for MMTk.

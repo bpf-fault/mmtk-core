@@ -8,8 +8,10 @@
 //! a dirty bitmap and lifts the protection.  At the start of the next nursery
 //! GC the dirty pages are the remembered set.
 //!
-//! The `Uffd` backend uses userfaultfd write-protect mode with a dedicated
-//! handler thread (WP faults cannot use SIGBUS self-service).
+//! Two backends are provided:
+//! - `Uffd`: userfaultfd write-protect mode with a dedicated handler thread
+//!   (WP faults cannot use SIGBUS self-service).
+//! - `Segv`: mprotect(PROT_READ) + a chained SIGSEGV handler.
 
 use crate::util::options::DirtyTracking;
 use crate::util::Address;
@@ -54,7 +56,8 @@ pub(crate) struct DirtyTracker {
     backend: DirtyTracking,
     span_start: Address,
     span_pages: usize,
-    /// Dirty bitmap, written by the uffd handler thread.
+    /// Dirty bitmap, written by the uffd handler thread and the SIGSEGV
+    /// handler.
     user_bitmap: Vec<AtomicU64>,
     /// Page-range starts (chunk granularity) already registered with the
     /// kernel mechanism.
@@ -71,7 +74,7 @@ impl DirtyTracker {
         let span_pages = (end - start) >> LOG_BYTES_IN_PAGE;
         let words = span_pages.div_ceil(64);
         let mut user_bitmap = Vec::new();
-        if backend == DirtyTracking::Uffd {
+        if matches!(backend, DirtyTracking::Uffd | DirtyTracking::Segv) {
             user_bitmap.resize_with(words, || AtomicU64::new(0));
         }
         let tracker = Self {
@@ -86,6 +89,9 @@ impl DirtyTracker {
                 uffd::UffdState::disabled()
             },
         };
+        if backend == DirtyTracking::Segv {
+            segv::install_handler();
+        }
         info!(
             "dirty tracking: backend={:?} span={}..{} ({} pages)",
             backend, start, end, span_pages
@@ -116,6 +122,9 @@ impl DirtyTracker {
     /// Ranges are tracked by their start address; callers must pass stable
     /// (chunk-aligned) ranges.
     pub(crate) fn ensure_registered(&self, start: Address, bytes: usize) {
+        if self.backend == DirtyTracking::Segv {
+            return; // mprotect needs no registration
+        }
         let mut reg = self.registered.lock().unwrap();
         if reg.contains(&start) {
             return;
@@ -131,6 +140,7 @@ impl DirtyTracker {
     pub(crate) fn protect(&self, start: Address, bytes: usize) {
         match self.backend {
             DirtyTracking::Uffd => self.uffd.writeprotect(start, bytes, true),
+            DirtyTracking::Segv => segv::set_prot(start, bytes, false),
             _ => unreachable!(),
         }
     }
@@ -139,6 +149,7 @@ impl DirtyTracker {
     pub(crate) fn unprotect(&self, start: Address, bytes: usize) {
         match self.backend {
             DirtyTracking::Uffd => self.uffd.writeprotect(start, bytes, false),
+            DirtyTracking::Segv => segv::set_prot(start, bytes, true),
             _ => unreachable!(),
         }
     }
@@ -313,5 +324,81 @@ mod uffd {
 
     fn errno() -> i32 {
         unsafe { *libc::__errno_location() }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  SIGSEGV + mprotect backend                                         */
+/* ------------------------------------------------------------------ */
+
+mod segv {
+    use super::*;
+    use std::mem::MaybeUninit;
+    use std::sync::atomic::AtomicBool;
+
+    static OLD_ACTION: Mutex<Option<libc::sigaction>> = Mutex::new(None);
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    // The signal handler cannot take locks; keep a raw copy for it.
+    // Written once at install time (before any fault can occur), read-only
+    // afterwards.
+    #[allow(static_mut_refs)]
+    static mut OLD_ACTION_RAW: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
+
+    pub(super) fn install_handler() {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as usize;
+            sa.sa_flags = libc::SA_SIGINFO;
+            libc::sigemptyset(&mut sa.sa_mask);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            let r = libc::sigaction(libc::SIGSEGV, &sa, &mut old);
+            assert_eq!(r, 0, "sigaction(SIGSEGV) failed");
+            OLD_ACTION_RAW.write(old);
+            *OLD_ACTION.lock().unwrap() = Some(old);
+            INSTALLED.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn set_prot(start: Address, bytes: usize, writable: bool) {
+        let prot = if writable {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        let r = unsafe { libc::mprotect(start.to_mut_ptr(), bytes, prot) };
+        assert_eq!(r, 0, "mprotect({}, {}, {}) failed", start, bytes, writable);
+    }
+
+    extern "C" fn handler(
+        sig: libc::c_int,
+        info: *mut libc::siginfo_t,
+        ctx: *mut libc::c_void,
+    ) {
+        unsafe {
+            let addr = Address::from_usize((*info).si_addr() as usize);
+            if let Some(tracker) = dirty_tracker() {
+                let page = addr.align_down(BYTES_IN_PAGE);
+                if tracker.in_span(page) {
+                    // Note: only writes can fault here (pages are PROT_READ),
+                    // so any fault in span is a write barrier hit.
+                    tracker.mark_dirty(page);
+                    set_prot(page, BYTES_IN_PAGE, true);
+                    return;
+                }
+            }
+            // Not ours: chain to the previously installed handler (HotSpot's).
+            let old = OLD_ACTION_RAW.assume_init_ref();
+            if old.sa_flags & libc::SA_SIGINFO != 0 {
+                let f: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+                    std::mem::transmute(old.sa_sigaction);
+                f(sig, info, ctx);
+            } else if old.sa_sigaction == libc::SIG_DFL {
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::raise(libc::SIGSEGV);
+            } else if old.sa_sigaction != libc::SIG_IGN {
+                let f: extern "C" fn(libc::c_int) = std::mem::transmute(old.sa_sigaction);
+                f(sig);
+            }
+        }
     }
 }

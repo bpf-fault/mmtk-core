@@ -218,6 +218,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let local_specs = extract_side_metadata(&[
             MetadataSpec::OnSide(forwarding::MARK_SPEC),
             MetadataSpec::OnSide(forwarding::OFFSET_VECTOR_SPEC),
+            MetadataSpec::OnSide(forwarding::REFBITS_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
@@ -333,6 +334,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         };
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::bzero_vo_bit(start, region_bytes);
+        // Class B v2: clear last cycle's reference bits for this region before
+        // re-recording them at the new staged positions.
+        cf.clear_ref_bits(start, region_bytes);
         let mut to = start;
         self.forwarding
             .scan_marked_objects(start, start + region_bytes, &mut |obj: ObjectReference| {
@@ -344,7 +348,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 #[cfg(feature = "vo_bit")]
                 vo_bit::set_vo_bit(new_object);
                 to = new_object.to_object_start::<VM>() + copied_size;
-                self.update_references(tls, alias_new);
+                self.update_references_staged(tls, alias_new, cf, delta);
             });
         let staged_end = to.align_up(BYTES_IN_PAGE);
         assert!(
@@ -490,6 +494,66 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         ObjectReference::from_raw_address(self.forwarding.forward(object.to_raw_address())).unwrap()
     }
 
+    /// Like [`Self::update_references`], but also records each reference
+    /// slot's *to-space* (post-compaction) address in the Class B v2 reference
+    /// bitmap.  `alias_new` is the object at its arena alias position; the real
+    /// to-space slot address is `alias_slot - delta`.
+    fn update_references_staged(
+        &self,
+        tls: crate::util::VMWorkerThread,
+        alias_new: ObjectReference,
+        cf: &crate::util::compact_faults::CompactFaults,
+        delta: isize,
+    ) {
+        let defer = crate::util::compact_faults::defer_forward();
+        if VM::VMScanning::support_slot_enqueuing(tls, alias_new) {
+            VM::VMScanning::scan_object(tls, alias_new, &mut |s: VM::VMSlot| {
+                if let Some(o) = s.load() {
+                    if let Some(sa) = s.slot_address() {
+                        let to = unsafe {
+                            Address::from_usize((sa.as_usize() as isize - delta) as usize)
+                        };
+                        cf.set_ref_bit(to);
+                    }
+                    // When deferring, leave the (old) reference in the arena;
+                    // forward_page rewrites it at install time via the bitmap.
+                    if !defer {
+                        s.store(self.forward(o, false));
+                    }
+                }
+            });
+        } else {
+            // No per-slot addresses here, so the bitmap can't cover this
+            // object; forward eagerly regardless of defer mode.
+            VM::VMScanning::scan_object_and_trace_edges(tls, alias_new, &mut |o| {
+                self.forward(o, false)
+            });
+        }
+    }
+
+    /// Class B v2 deferred forward: `buf` is a private copy of the staged
+    /// arena page backing to-space `to_page`.  Rewrite each reference slot in
+    /// `buf` (located via the reference bitmap) to its forwarded value.  The
+    /// arena stays un-forwarded, so re-running this on a fresh copy is
+    /// idempotent (safe under concurrent faults).
+    pub fn forward_buf(&self, to_page: Address, buf: Address) {
+        use crate::util::compact_faults::BYTES_IN_PAGE;
+        let cf = crate::util::compact_faults::compact_faults().unwrap();
+        let mut off = 0usize;
+        while off < BYTES_IN_PAGE {
+            let to_slot = to_page + off;
+            if cf.ref_bit(to_slot) {
+                let slot_in_buf = buf + off;
+                if let Some(s) = <VM::VMSlot as crate::vm::slot::Slot>::from_address(slot_in_buf) {
+                    if let Some(o) = s.load() {
+                        s.store(self.forward(o, false));
+                    }
+                }
+            }
+            off += 4; // 4-byte (compressed-oop) slot granularity
+        }
+    }
+
     fn update_references(&self, tls: crate::util::VMWorkerThread, object: ObjectReference) {
         if VM::VMScanning::support_slot_enqueuing(tls, object) {
             VM::VMScanning::scan_object(tls, object, &mut |s: VM::VMSlot| {
@@ -507,6 +571,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// Close the concurrent window: release forwarding metadata.
     pub fn close_window(&self) {
         let cf = crate::util::compact_faults::compact_faults().unwrap();
+        if std::env::var_os("MMTK_REFBITS_DEBUG").is_some() {
+            let n = crate::util::compact_faults::REFBITS_POPULATED.swap(0, Ordering::Relaxed);
+            eprintln!("[refbits] reference slots recorded this cycle: {}", n);
+        }
         self.forwarding.release();
         cf.close_window();
     }
@@ -675,6 +743,9 @@ impl<VM: VMBinding> crate::util::compact_faults::StealHandler for CompressorStea
         // stage with an uninitialized one.
         let tls = crate::util::VMWorkerThread(crate::util::VMThread::UNINITIALIZED);
         self.0.stage_region_idx(tls, region_index);
+    }
+    fn forward_buf(&self, to_page: crate::util::Address, buf: crate::util::Address) {
+        self.0.forward_buf(to_page, buf);
     }
 }
 

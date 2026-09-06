@@ -1,6 +1,8 @@
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::{Region, RegionIterator};
-use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR};
+use crate::util::metadata::side_metadata::spec_defs::{
+    COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_REFBITS,
+};
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
@@ -118,6 +120,21 @@ impl Region for Block {
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
+pub(crate) const REFBITS_SPEC: SideMetadataSpec = COMPRESSOR_REFBITS;
+
+/// Mark `slot` (a reference field's address) as a reference word in the
+/// Class B v2 reference bitmap, so the in-kernel fixup handler can forward it.
+///
+/// NOTE (integration, 2026-06-13): not yet wired into the staging flow. The
+/// B.1 `stage_region_idx` path forwards via `update_references` on *aliased*
+/// objects (shifted into the staging arena), whose addresses fall outside
+/// this side-metadata's mapped range — so the bitmap must instead live in the
+/// staging arena and be populated at staged positions (see class-b-design.md).
+#[allow(dead_code)]
+#[inline(always)]
+pub(crate) fn mark_reference_slot(slot: Address) {
+    REFBITS_SPEC.store_atomic::<u8>(slot, 1, Ordering::Relaxed);
+}
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn new() -> ForwardingMetadata<VM> {
@@ -158,6 +175,13 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         let mut state = Transducer::new(region.start());
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
+        // Class B v2: while we visit each object's start/end mark bits, also
+        // record old->new in the forward table for the in-kernel handler.
+        let cf = if crate::util::compact_faults::defer_forward() {
+            crate::util::compact_faults::compact_faults()
+        } else {
+            None
+        };
         for block in RegionIterator::<Block>::new(first_block, last_block) {
             OFFSET_VECTOR_SPEC.store_atomic::<usize>(
                 block.start(),
@@ -168,7 +192,15 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
+                    // A start bit transitions in_object false->true; at that
+                    // point state.to is this object's post-compact start.
+                    let starting = !state.in_object;
                     state.visit_mark_bit(addr);
+                    if starting {
+                        if let Some(cf) = cf {
+                            cf.set_fwd(addr, state.to);
+                        }
+                    }
                 },
             );
         }

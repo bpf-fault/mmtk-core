@@ -45,6 +45,12 @@ const REGION_DONE: u8 = 2;
 /// Compressor staging when a mutator faults a not-yet-staged region.
 pub trait StealHandler: Send + Sync {
     fn stage(&self, region_index: usize);
+    /// Class B v2 deferred forward: `buf` is a private copy of the staged
+    /// arena page backing to-space `to_page`; rewrite its reference slots
+    /// (located via the reference bitmap) to their forwarded values, in place.
+    /// The arena itself stays un-forwarded, so this is idempotent across
+    /// concurrent faults.  Only called when `defer_forward()` is set.
+    fn forward_buf(&self, to_page: Address, buf: Address);
 }
 
 static STEAL: OnceLock<Box<dyn StealHandler>> = OnceLock::new();
@@ -61,6 +67,28 @@ static WINDOW_REMAINING: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static WINDOW_FAULTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WINDOW_SPIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Class B v2 reference bits set this cycle (telemetry/verification).
+pub(crate) static REFBITS_POPULATED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Class B v2: defer reference forwarding from staging to install time,
+/// driven by the reference bitmap (MMTK_COMPACT_DEFER_FORWARD).
+static DEFER_FORWARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether reference forwarding is deferred to install time (Class B v2).
+pub fn defer_forward() -> bool {
+    DEFER_FORWARD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Compressed-oops base/shift, set by the VM binding so the in-kernel (bpf)
+/// fixup handler can decode/encode narrow references.
+static COOPS_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static COOPS_SHIFT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Provide the VM's compressed-oops base and shift (Class B v2 / bpf backend).
+pub fn set_compressed_oops(base: usize, shift: u32) {
+    COOPS_BASE.store(base, std::sync::atomic::Ordering::Relaxed);
+    COOPS_SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
+}
 
 static TRACKER: OnceLock<CompactFaults> = OnceLock::new();
 
@@ -79,6 +107,9 @@ pub(crate) fn init_compact_faults(
 ) {
     if backend == CompactFaultsBackend::None {
         return;
+    }
+    if std::env::var_os("MMTK_COMPACT_DEFER_FORWARD").is_some() {
+        DEFER_FORWARD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let span = end - start;
     assert!(
@@ -113,6 +144,19 @@ pub(crate) struct CompactFaults {
     region_cursor: Vec<std::sync::atomic::AtomicUsize>,
     uffd: i32,
     shim: Option<bpf_shim::Shim>,
+    /// Class B v2 reference bitmap: 1 bit per 4-byte (compressed-oop) slot of
+    /// the span, indexed by `(to_space_addr - space_base) >> 2`.  Populated at
+    /// staged positions during `stage_region_idx`, so the in-kernel fixup
+    /// handler can forward references without object-layout knowledge.  Lives
+    /// in its own mapping (NOT MMTk side metadata, whose range does not cover
+    /// the staging-arena alias addresses used during compaction).
+    refbitmap: *mut u8,
+    /// Class B v2 forward table: one u32 (new compressed-oop) per old slot,
+    /// indexed by `(old_addr - space_base) >> coops_shift`.  Filled by the GC
+    /// during `calculate_offset_vector` (each object's new position is known
+    /// there for free); the in-kernel handler does a single direct lookup
+    /// instead of an offset-vector transducer scan + side-metadata reads.
+    fwdtable: *mut u32,
 }
 
 unsafe impl Sync for CompactFaults {}
@@ -120,12 +164,55 @@ unsafe impl Send for CompactFaults {}
 
 impl CompactFaults {
     fn new(backend: CompactFaultsBackend, space_base: Address, span: usize) -> Self {
+        // Reference bitmap: 1 bit per 4-byte slot = span/32 bytes, lazily
+        // committed.  Shared by both backends.
+        let refbitmap = {
+            let bytes = (span / 32 + BYTES_IN_PAGE - 1) & !(BYTES_IN_PAGE - 1);
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED, "refbitmap mmap failed");
+            p as *mut u8
+        };
+        // Forward table: u32 per 8-byte slot of the span (assumes compressed-
+        // oops shift >= 3), = span/2 bytes, lazily committed.
+        let fwdtable = {
+            let bytes = ((span >> 3) * 4 + BYTES_IN_PAGE - 1) & !(BYTES_IN_PAGE - 1);
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    bytes,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert!(p != libc::MAP_FAILED, "fwdtable mmap failed");
+            p as *mut u32
+        };
         match backend {
             CompactFaultsBackend::Bpf => {
                 let shim = bpf_shim::Shim::load();
                 let arena = shim.init(space_base, span);
                 assert!(!arena.is_zero(), "gcb0_init failed");
                 let state = shim.state();
+                // The forward table AND reference bitmap live in the shim's BPF
+                // arena (the GC writes them; the in-kernel handler reads them
+                // directly).  The anonymous mmaps above are unused for Bpf.
+                let fwdtable = shim.fwdtable_base();
+                let refbitmap = shim.refbits_base();
+                assert!(
+                    !fwdtable.is_null() && !refbitmap.is_null(),
+                    "gcb0 arena bases failed"
+                );
                 Self {
                     backend,
                     space_base,
@@ -143,6 +230,8 @@ impl CompactFaults {
                         .collect(),
                     uffd: -1,
                     shim: Some(shim),
+                    refbitmap,
+                    fwdtable,
                 }
             }
             CompactFaultsBackend::Uffd => {
@@ -189,6 +278,8 @@ impl CompactFaults {
                         .collect(),
                     uffd,
                     shim: None,
+                    refbitmap,
+                    fwdtable,
                 }
             }
             CompactFaultsBackend::None => unreachable!(),
@@ -254,6 +345,73 @@ impl CompactFaults {
 
     pub fn alias_of(&self, addr: Address) -> Address {
         self.arena_base + (addr - self.space_base)
+    }
+
+    /// Set the Class B v2 reference bit for a (to-space) reference-slot
+    /// address.  `to_addr` is a real heap address inside the span (the staged
+    /// slot's post-compaction location), at 4-byte granularity.
+    #[inline]
+    pub fn set_ref_bit(&self, to_addr: Address) {
+        debug_assert!(to_addr >= self.space_base && to_addr < self.space_base + self.span);
+        let slot = (to_addr - self.space_base) >> 2; // 4-byte slots
+        let byte = slot >> 3;
+        let bit = (slot & 7) as u8;
+        unsafe {
+            let p = self.refbitmap.add(byte);
+            *p |= 1u8 << bit;
+        }
+        REFBITS_POPULATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the reference bit for a to-space slot address (4-byte granularity).
+    #[inline]
+    pub fn ref_bit(&self, to_addr: Address) -> bool {
+        let slot = (to_addr - self.space_base) >> 2;
+        let byte = slot >> 3;
+        let bit = (slot & 7) as u8;
+        unsafe { (*self.refbitmap.add(byte) >> bit) & 1 == 1 }
+    }
+
+    /// Clear reference bits covering a to-space byte range [start, start+bytes).
+    pub fn clear_ref_bits(&self, start: Address, bytes: usize) {
+        let first = (start - self.space_base) >> 2;
+        let last = (start + bytes - self.space_base).div_ceil(4);
+        let fb = first >> 3;
+        let lb = (last + 7) >> 3;
+        unsafe {
+            std::ptr::write_bytes(self.refbitmap.add(fb), 0, lb - fb);
+        }
+    }
+
+    /// Base of the reference bitmap (for the bpf shim / in-kernel handler).
+    pub fn refbitmap_base(&self) -> Address {
+        Address::from_mut_ptr(self.refbitmap)
+    }
+
+    /// Class B v2: record an object's forward (old -> new) in the forward
+    /// table, indexed by `(old_addr - space_base) >> coops_shift`, value =
+    /// the new compressed-oop.  Called for each live object while the offset
+    /// vector is computed.
+    #[inline]
+    pub fn set_fwd(&self, old_addr: Address, new_addr: Address) {
+        let shift = COOPS_SHIFT.load(std::sync::atomic::Ordering::Relaxed);
+        let base = COOPS_BASE.load(std::sync::atomic::Ordering::Relaxed);
+        let rel = old_addr.as_usize().wrapping_sub(self.space_base.as_usize());
+        if rel >= self.span {
+            return;
+        }
+        // Index by word (objects are 8-byte aligned) so the table is dense
+        // regardless of the compressed-oops shift (which is 0 for <=4 GiB heaps).
+        let idx = rel >> 3;
+        let new_narrow = ((new_addr.as_usize() - base) >> shift) as u32;
+        unsafe {
+            *self.fwdtable.add(idx) = new_narrow;
+        }
+    }
+
+    /// Base of the forward table (for the bpf shim / in-kernel handler).
+    pub fn fwdtable_base(&self) -> Address {
+        Address::from_mut_ptr(self.fwdtable)
     }
 
     /// Flip a region: move its pages to the arena and register the emptied
@@ -343,6 +501,17 @@ impl CompactFaults {
     }
 
     pub fn open_window(&self, regions: usize) {
+        // Class B v2 (bpf backend): hand the in-kernel handler the params it
+        // needs to forward references during page materialization.
+        if self.backend == CompactFaultsBackend::Bpf {
+            if let Some(shim) = self.shim.as_ref() {
+                shim.set_forward(
+                    COOPS_BASE.load(std::sync::atomic::Ordering::Relaxed),
+                    COOPS_SHIFT.load(std::sync::atomic::Ordering::Relaxed),
+                    defer_forward(),
+                );
+            }
+        }
         WINDOW_REMAINING.store(regions, std::sync::atomic::Ordering::SeqCst);
         WINDOW_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -410,7 +579,7 @@ impl CompactFaults {
         // uffd we install here (idempotent: EEXIST tolerated).
         if self.backend == CompactFaultsBackend::Uffd {
             match self.page_state(page) {
-                STATE_STAGED => uffd_copy(self.uffd, page, self.alias_of(page), BYTES_IN_PAGE),
+                STATE_STAGED => self.install_page_uffd(page),
                 _ => uffd_zeropage(self.uffd, page, BYTES_IN_PAGE),
             }
         }
@@ -433,11 +602,34 @@ impl CompactFaults {
             CompactFaultsBackend::Uffd => {
                 let mut a = start;
                 while a < start + bytes {
-                    uffd_copy(self.uffd, a, self.alias_of(a), BYTES_IN_PAGE);
+                    self.install_page_uffd(a);
                     a = a + BYTES_IN_PAGE;
                 }
             }
             CompactFaultsBackend::None => unreachable!(),
+        }
+    }
+
+    /// Install one staged page via uffd.  When deferring forwarding (Class B
+    /// v2), forward a private copy of the arena page first so the install is
+    /// idempotent across concurrent faults; otherwise copy the arena directly.
+    fn install_page_uffd(&self, page: Address) {
+        if defer_forward() {
+            let mut buf = [0u8; BYTES_IN_PAGE];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.alias_of(page).to_ptr::<u8>(),
+                    buf.as_mut_ptr(),
+                    BYTES_IN_PAGE,
+                );
+            }
+            let bufaddr = Address::from_ptr(buf.as_ptr());
+            if let Some(s) = STEAL.get() {
+                s.forward_buf(page, bufaddr);
+            }
+            uffd_copy(self.uffd, page, bufaddr, BYTES_IN_PAGE);
+        } else {
+            uffd_copy(self.uffd, page, self.alias_of(page), BYTES_IN_PAGE);
         }
     }
 
@@ -637,6 +829,9 @@ mod bpf_shim {
     type FlipFn = unsafe extern "C" fn(u64, u64, i32) -> i32;
     type RangeFn = unsafe extern "C" fn(u64, u64) -> i32;
     type StateFn = unsafe extern "C" fn() -> *mut u64;
+    type SetFwdFn = unsafe extern "C" fn(u64, u32, u32);
+    type CountFn = unsafe extern "C" fn() -> u64;
+    type BaseFn = unsafe extern "C" fn() -> u64;
 
     pub(super) struct Shim {
         init: InitFn,
@@ -645,6 +840,10 @@ mod bpf_shim {
         register: RangeFn,
         unregister: RangeFn,
         state: StateFn,
+        set_forward: SetFwdFn,
+        refs_forwarded: CountFn,
+        fwdtable_base: BaseFn,
+        refbits_base: BaseFn,
     }
 
     impl Shim {
@@ -668,8 +867,30 @@ mod bpf_shim {
                     register: std::mem::transmute(sym("gcb0_register")),
                     unregister: std::mem::transmute(sym("gcb0_unregister")),
                     state: std::mem::transmute(sym("gcb0_state")),
+                    set_forward: std::mem::transmute(sym("gcb0_set_forward")),
+                    refs_forwarded: std::mem::transmute(sym("gcb0_refs_forwarded")),
+                    fwdtable_base: std::mem::transmute(sym("gcb0_fwdtable_base")),
+                    refbits_base: std::mem::transmute(sym("gcb0_refbits_base")),
                 }
             }
+        }
+
+        pub fn set_forward(&self, coops_base: usize, coops_shift: u32, defer: bool) {
+            unsafe { (self.set_forward)(coops_base as u64, coops_shift, defer as u32) }
+        }
+
+        pub fn refs_forwarded(&self) -> u64 {
+            unsafe { (self.refs_forwarded)() }
+        }
+
+        /// Userspace base of the forward-table arena (the GC writes here).
+        pub fn fwdtable_base(&self) -> *mut u32 {
+            unsafe { (self.fwdtable_base)() as *mut u32 }
+        }
+
+        /// Userspace base of the reference bitmap (in the arena).
+        pub fn refbits_base(&self) -> *mut u8 {
+            unsafe { (self.refbits_base)() as *mut u8 }
         }
 
         pub fn init(&self, base: Address, span: usize) -> Address {

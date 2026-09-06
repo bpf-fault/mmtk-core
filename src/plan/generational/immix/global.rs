@@ -56,6 +56,9 @@ pub struct GenImmix<VM: VMBinding> {
     /// (LOS/immortal/nonmoving): filled in `prepare()` while the LOS
     /// treadmill is still quiescent, consumed by `ScanDirtyStash` in Closure.
     pub(super) dirty_stash: std::sync::Mutex<Vec<ObjectReference>>,
+    /// Coalesced page ranges of LOS objects protected at the last
+    /// `end_of_gc`, to be unprotected at the next `prepare`.
+    los_protected: std::sync::Mutex<Vec<(Address, usize)>>,
 }
 
 /// The plan constraints for the generational immix plan.
@@ -154,10 +157,21 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
         // (promotion into recycled blocks, defrag) never fault.  Mutators are
         // already suspended; the dirty set is drained later in Closure.
         if let Some(tracker) = crate::util::dirty_track::dirty_tracker() {
+            // Unprotect the whole mature space so GC-time writes (promotion
+            // into recycled blocks, forwarding) never fault.  Measured
+            // alternatives are not cheaper: leaving pages protected trades
+            // this O(mature) unprotect for an equally-large O(promoted)
+            // GC-time fault bill (recycled immix blocks land in protected
+            // chunks).  The per-GC O(mature-space) re-arming cost is
+            // fundamental to page-granularity barriers and dominates at high
+            // GC frequency (tight heaps) — see the heap-size sweep.
             self.for_each_mature_chunk(|start, bytes| tracker.unprotect(start, bytes));
-            // Build the conservative remembered set for spaces without page
-            // dirty tracking.  This must happen before `gen.prepare()` flips
-            // the LOS treadmill (enumeration is invalid afterwards).
+            for (start, bytes) in self.los_protected.lock().unwrap().drain(..) {
+                tracker.unprotect(start, bytes);
+            }
+            // Conservative remembered set for the remaining non-tracked
+            // spaces (the LOS is page-WP-tracked like the immix space).
+            // Must run before `gen.prepare()` (space prepare may race).
             if !full_heap {
                 use crate::util::object_enum::ClosureObjectEnumerator;
                 let mut stash = self.dirty_stash.lock().unwrap();
@@ -165,9 +179,12 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
                 let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
                     stash.push(obj);
                 });
-                self.gen.common.los.enumerate_objects(&mut enumerator);
                 self.gen.common.immortal.enumerate_objects(&mut enumerator);
+                let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    stash.push(obj);
+                });
                 self.gen.common.nonmoving.enumerate_objects(&mut enumerator);
+                probe!(mmtk, stash_size, stash.len());
             }
         }
         self.gen.prepare(tls);
@@ -219,6 +236,38 @@ impl<VM: VMBinding> Plan for GenImmix<VM> {
                 tracker.ensure_registered(start, bytes);
                 tracker.protect(start, bytes);
             });
+            // Protect the pages of all live LOS objects (coalesced runs).
+            // The treadmill is quiescent here (post-release).
+            {
+                use crate::util::object_enum::ClosureObjectEnumerator;
+                const PAGE: usize = crate::util::dirty_track::BYTES_IN_PAGE;
+                let mut page_ranges: Vec<(Address, usize)> = Vec::new();
+                let mut enumerator = ClosureObjectEnumerator::<_, VM>::new(|obj| {
+                    let start = obj.to_object_start::<VM>().align_down(PAGE);
+                    let end = (obj.to_object_start::<VM>()
+                        + VM::VMObjectModel::get_current_size(obj))
+                    .align_up(PAGE);
+                    page_ranges.push((start, end - start));
+                });
+                self.gen.common.los.enumerate_objects(&mut enumerator);
+                page_ranges.sort_unstable_by_key(|r| r.0);
+                let mut coalesced: Vec<(Address, usize)> = Vec::new();
+                for (start, bytes) in page_ranges {
+                    match coalesced.last_mut() {
+                        Some(last) if start <= last.0 + last.1 => {
+                            let end = std::cmp::max(last.0 + last.1, start + bytes);
+                            last.1 = end - last.0;
+                        }
+                        _ => coalesced.push((start, bytes)),
+                    }
+                }
+                probe!(mmtk, los_protect_ranges, coalesced.len());
+                for &(start, bytes) in &coalesced {
+                    tracker.ensure_registered_range(start, bytes);
+                    tracker.protect(start, bytes);
+                }
+                *self.los_protected.lock().unwrap() = coalesced;
+            }
         }
     }
 
@@ -343,6 +392,7 @@ impl<VM: VMBinding> GenImmix<VM> {
             last_gc_was_defrag: AtomicBool::new(false),
             last_gc_was_full_heap: AtomicBool::new(false),
             dirty_stash: std::sync::Mutex::new(Vec::new()),
+            los_protected: std::sync::Mutex::new(Vec::new()),
         }
     }
 

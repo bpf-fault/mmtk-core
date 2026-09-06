@@ -377,6 +377,23 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     });
                 crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
             }
+            // Fault-driven compaction (Class B): flip the region's pages
+            // into the from-space arena; all object reads/writes below then
+            // go through alias addresses (metadata stays at real addresses).
+            let cf = crate::util::compact_faults::compact_faults();
+            let region_bytes = forwarding::CompressorRegion::BYTES;
+            if let Some(cf) = cf {
+                cf.reset_region_state(start, region_bytes);
+                cf.flip(start, region_bytes);
+            }
+            let delta = cf.map_or(0isize, |c| c.alias_delta());
+            let shift = |o: ObjectReference| -> ObjectReference {
+                unsafe {
+                    ObjectReference::from_raw_address_unchecked(Address::from_usize(
+                        (o.to_raw_address().as_usize() as isize + delta) as usize,
+                    ))
+                }
+            };
             let mut to = start;
             self.forwarding
                 .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
@@ -384,25 +401,41 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     // marked, and we compute the live data and thus the forwarding
                     // addresses based on those sizes. The forwarding addresses would be
                     // incorrect if the sizes of objects were to change.
-                    let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
+                    let alias_obj = shift(obj);
+                    let copied_size = VM::VMObjectModel::get_size_when_copied(alias_obj);
+                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(alias_obj));
                     let new_object = self.forward(obj, false);
                     debug_assert!(
                         new_object.to_raw_address() >= to,
                         "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
                         new_object.to_raw_address()
                     );
-                    // copy object
+                    // copy object (within the arena when fault-driven)
                     trace!(" copy from {} to {}", obj, new_object);
+                    let alias_new = shift(new_object);
                     let end_of_new_object =
-                        VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
+                        VM::VMObjectModel::copy_to(alias_obj, alias_new, Address::ZERO);
                     // update VO bit
                     #[cfg(feature = "vo_bit")]
                     vo_bit::set_vo_bit(new_object);
                     to = new_object.to_object_start::<VM>() + copied_size;
-                    debug_assert_eq!(end_of_new_object, to);
-                    self.update_references(worker, new_object);
+                    debug_assert_eq!(
+                        end_of_new_object,
+                        unsafe {
+                            Address::from_usize((to.as_usize() as isize + delta) as usize)
+                        }
+                    );
+                    self.update_references(worker, alias_new);
                 });
+            if let Some(cf) = cf {
+                use crate::util::compact_faults::BYTES_IN_PAGE;
+                let staged_end = to.align_up(BYTES_IN_PAGE);
+                if staged_end > start {
+                    cf.stage(start, staged_end - start);
+                    cf.install(start, staged_end - start);
+                }
+                cf.finish_region(start, region_bytes);
+            }
             self.pr.reset_cursor(r, to);
         });
     }

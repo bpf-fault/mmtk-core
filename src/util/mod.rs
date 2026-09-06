@@ -21,6 +21,8 @@ pub mod conversions;
 pub mod copy;
 /// VM page-protection dirty tracking (write-barrier replacement).
 pub mod dirty_track;
+/// Fault-driven Compressor compaction (Class B).
+pub mod compact_faults;
 /// Heap implementation, including page resource, mmapper, etc.
 pub mod heap;
 /// Checking if an address is an valid MMTk object.

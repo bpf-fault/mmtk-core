@@ -181,6 +181,15 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
 impl<VM: VMBinding> Compressor<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        {
+            let backend = *args.options.compact_faults;
+            let vm_layout = crate::util::heap::layout::vm_layout::vm_layout();
+            crate::util::compact_faults::init_compact_faults(
+                backend,
+                vm_layout.heap_start,
+                vm_layout.heap_end,
+            );
+        }
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &COMPRESSOR_CONSTRAINTS,

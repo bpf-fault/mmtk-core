@@ -8,7 +8,11 @@
 //! a dirty bitmap and lifts the protection.  At the start of the next nursery
 //! GC the dirty pages are the remembered set.
 //!
-//! Two backends are provided:
+//! Three backends are provided:
+//! - `Bpf`: bpf_fault — an in-kernel eBPF handler sets the dirty bit and
+//!   resumes the write (no signal, no handler thread).  Loaded via a small
+//!   C shim library (dlopen, `MMTK_BPF_SHIM` env var) so that mmtk-core does
+//!   not link libbpf directly.
 //! - `Uffd`: userfaultfd write-protect mode with a dedicated handler thread
 //!   (WP faults cannot use SIGBUS self-service).
 //! - `Segv`: mprotect(PROT_READ) + a chained SIGSEGV handler.
@@ -56,13 +60,14 @@ pub(crate) struct DirtyTracker {
     backend: DirtyTracking,
     span_start: Address,
     span_pages: usize,
-    /// Dirty bitmap, written by the uffd handler thread and the SIGSEGV
-    /// handler.
+    /// Dirty bitmap for the Uffd/Segv backends (Bpf reads the shim's mmaped
+    /// BPF map instead).
     user_bitmap: Vec<AtomicU64>,
     /// Page-range starts (chunk granularity) already registered with the
     /// kernel mechanism.
     registered: Mutex<HashSet<Address>>,
     uffd: uffd::UffdState,
+    bpf: bpf::BpfShim,
 }
 
 // The shim/uffd fds and pointers are only used in thread-safe ways.
@@ -87,6 +92,11 @@ impl DirtyTracker {
                 uffd::UffdState::open()
             } else {
                 uffd::UffdState::disabled()
+            },
+            bpf: if backend == DirtyTracking::Bpf {
+                bpf::BpfShim::load(start, end - start)
+            } else {
+                bpf::BpfShim::disabled()
             },
         };
         if backend == DirtyTracking::Segv {
@@ -131,6 +141,7 @@ impl DirtyTracker {
         }
         match self.backend {
             DirtyTracking::Uffd => self.uffd.register(start, bytes),
+            DirtyTracking::Bpf => self.bpf.register(start, bytes),
             _ => unreachable!(),
         }
         reg.insert(start);
@@ -140,6 +151,7 @@ impl DirtyTracker {
     pub(crate) fn protect(&self, start: Address, bytes: usize) {
         match self.backend {
             DirtyTracking::Uffd => self.uffd.writeprotect(start, bytes, true),
+            DirtyTracking::Bpf => self.bpf.writeprotect(start, bytes, true),
             DirtyTracking::Segv => segv::set_prot(start, bytes, false),
             _ => unreachable!(),
         }
@@ -149,6 +161,7 @@ impl DirtyTracker {
     pub(crate) fn unprotect(&self, start: Address, bytes: usize) {
         match self.backend {
             DirtyTracking::Uffd => self.uffd.writeprotect(start, bytes, false),
+            DirtyTracking::Bpf => self.bpf.writeprotect(start, bytes, false),
             DirtyTracking::Segv => segv::set_prot(start, bytes, true),
             _ => unreachable!(),
         }
@@ -161,7 +174,10 @@ impl DirtyTracker {
         let mut count = 0;
         let words = self.span_pages.div_ceil(64);
         for w in 0..words {
-            let val = self.user_bitmap[w].swap(0, Ordering::Relaxed);
+            let val = match self.backend {
+                DirtyTracking::Bpf => self.bpf.take_bitmap_word(w),
+                _ => self.user_bitmap[w].swap(0, Ordering::Relaxed),
+            };
             let mut v = val;
             while v != 0 {
                 let bit = v.trailing_zeros() as usize;
@@ -398,6 +414,95 @@ mod segv {
             } else if old.sa_sigaction != libc::SIG_IGN {
                 let f: extern "C" fn(libc::c_int) = std::mem::transmute(old.sa_sigaction);
                 f(sig);
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  bpf_fault backend (via dlopen'ed C shim)                           */
+/* ------------------------------------------------------------------ */
+
+mod bpf {
+    use super::*;
+    use std::ffi::CString;
+
+    type InitFn = unsafe extern "C" fn(u64, u64) -> i32;
+    type RangeFn = unsafe extern "C" fn(u64, u64) -> i32;
+    type WpFn = unsafe extern "C" fn(u64, u64, i32) -> i32;
+    type BitmapFn = unsafe extern "C" fn() -> *mut u64;
+
+    pub(super) struct BpfShim {
+        register: Option<RangeFn>,
+        wp: Option<WpFn>,
+        bitmap: *mut u64,
+    }
+
+    impl BpfShim {
+        pub fn disabled() -> Self {
+            Self {
+                register: None,
+                wp: None,
+                bitmap: std::ptr::null_mut(),
+            }
+        }
+
+        pub fn load(span_start: Address, span_bytes: usize) -> Self {
+            let path = std::env::var("MMTK_BPF_SHIM")
+                .unwrap_or_else(|_| "libgcbpf.so".to_string());
+            let cpath = CString::new(path.clone()).unwrap();
+            let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW) };
+            assert!(
+                !handle.is_null(),
+                "dirty tracking: failed to dlopen bpf shim at {}",
+                path
+            );
+            let sym = |name: &str| -> *mut libc::c_void {
+                let cname = CString::new(name).unwrap();
+                let p = unsafe { libc::dlsym(handle, cname.as_ptr()) };
+                assert!(!p.is_null(), "bpf shim: missing symbol {}", name);
+                p
+            };
+            unsafe {
+                let init: InitFn = std::mem::transmute(sym("gcbpf_init"));
+                let register: RangeFn = std::mem::transmute(sym("gcbpf_register"));
+                let wp: WpFn = std::mem::transmute(sym("gcbpf_wp"));
+                let bitmap_fn: BitmapFn = std::mem::transmute(sym("gcbpf_bitmap"));
+                let r = init(span_start.as_usize() as u64, span_bytes as u64);
+                assert_eq!(r, 0, "gcbpf_init failed: {}", r);
+                let bitmap = bitmap_fn();
+                assert!(!bitmap.is_null(), "gcbpf_bitmap returned NULL");
+                Self {
+                    register: Some(register),
+                    wp: Some(wp),
+                    bitmap,
+                }
+            }
+        }
+
+        pub fn register(&self, start: Address, bytes: usize) {
+            let r = unsafe {
+                (self.register.unwrap())(start.as_usize() as u64, bytes as u64)
+            };
+            assert_eq!(r, 0, "gcbpf_register({}, {}) failed: {}", start, bytes, r);
+        }
+
+        pub fn writeprotect(&self, start: Address, bytes: usize, enable: bool) {
+            let r = unsafe {
+                (self.wp.unwrap())(start.as_usize() as u64, bytes as u64, enable as i32)
+            };
+            assert_eq!(r, 0, "gcbpf_wp({}, {}, {}) failed: {}", start, bytes, enable, r);
+        }
+
+        /// Read-and-clear one word of the shim's mmaped dirty bitmap.
+        pub fn take_bitmap_word(&self, word: usize) -> u64 {
+            unsafe {
+                let p = self.bitmap.add(word);
+                let v = std::ptr::read_volatile(p);
+                if v != 0 {
+                    std::ptr::write_volatile(p, 0);
+                }
+                v
             }
         }
     }

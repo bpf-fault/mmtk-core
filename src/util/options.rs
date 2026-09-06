@@ -30,6 +30,9 @@ pub enum NurseryZeroingOptions {
 pub enum DirtyTracking {
     /// The compiled object-logging write barrier (default).
     Barrier,
+    /// Page write protection handled in-kernel by bpf_fault; no compiled
+    /// barrier.
+    Bpf,
     /// Page write protection via userfaultfd-WP with a handler thread; no
     /// compiled barrier.
     Uffd,

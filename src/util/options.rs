@@ -24,6 +24,17 @@ pub enum NurseryZeroingOptions {
     Adaptive,
 }
 
+/// Select how generational plans track old-to-young pointers created by
+/// mutators ("the write barrier").
+#[derive(Copy, Clone, EnumString, Debug, PartialEq, Eq)]
+pub enum DirtyTracking {
+    /// The compiled object-logging write barrier (default).
+    Barrier,
+    /// Page write protection via userfaultfd-WP with a handler thread; no
+    /// compiled barrier.
+    Uffd,
+}
+
 /// Select a GC plan for MMTk.
 #[derive(Copy, Clone, EnumString, Debug, PartialEq, Eq)]
 pub enum PlanSelector {
@@ -876,6 +887,10 @@ mod gc_trigger_tests {
 options! {
     /// The GC plan to use.
     plan:                   PlanSelector            [always_valid] = PlanSelector::GenImmix,
+    /// How generational plans track old->young pointers: the compiled write
+    /// barrier (Barrier, default) or VM page-protection dirty tracking
+    /// (Bpf | Uffd | Segv), which disables the compiled barrier entirely.
+    dirty_tracking:         DirtyTracking           [always_valid] = DirtyTracking::Barrier,
     /// Number of GC worker threads.
     threads:                usize                   [|v: &usize| *v > 0] = num_cpus::get(),
     /// Enable an optimization that only scans the part of the stack that has changed since the last GC (not supported)

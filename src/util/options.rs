@@ -46,6 +46,9 @@ pub enum DirtyTracking {
 pub enum CompactFaults {
     /// Normal STW copying (default).
     None,
+    /// Flip regions aside with mremap and install pages via bpf_fault
+    /// missing-fault handling (in-kernel copy from the arena).
+    Bpf,
     /// Flip regions aside and install via userfaultfd UFFDIO_COPY.
     Uffd,
 }

@@ -10,9 +10,10 @@
 //!    writes go to alias addresses; all forwarding metadata is queried with
 //!    real heap addresses), and each compacted page's state is set to
 //!    `Staged`.
-//! 3. *Install*: a staged page materializes on first access, which the
-//!    uffd backend resolves with `UFFDIO_COPY`.  Pages beyond the
-//!    compacted cursor stay state-0 and zero-fill on demand.
+//! 3. *Install*: a staged page materializes on first access — the bpf
+//!    backend copies arena→page in-kernel inside the fault; the uffd
+//!    backend installs via `UFFDIO_COPY`.  Pages beyond the compacted
+//!    cursor stay state-0 and zero-fill on demand.
 //!
 //! B.0 (current): installation happens immediately, still inside the STW
 //! pause, validating the mechanism.  B.1 will resume mutators after the
@@ -63,10 +64,11 @@ pub(crate) struct CompactFaults {
     space_base: Address,
     span: usize,
     arena_base: Address,
-    /// Per-page state array: staged pages hold their final contents in
-    /// the arena, state-0 pages zero-fill.
+    /// bpf: pointer into the shim's mmaped page_state map.
+    /// uffd: our own state array.
     state: *mut u64,
     uffd: i32,
+    shim: Option<bpf_shim::Shim>,
 }
 
 unsafe impl Sync for CompactFaults {}
@@ -74,30 +76,51 @@ unsafe impl Send for CompactFaults {}
 
 impl CompactFaults {
     fn new(backend: CompactFaultsBackend, space_base: Address, span: usize) -> Self {
-        let arena = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                span,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        assert!(arena != libc::MAP_FAILED, "uffd arena mmap failed");
-        let pages = span >> LOG_BYTES_IN_PAGE;
-        let state = unsafe {
-            libc::calloc(pages, std::mem::size_of::<u64>()) as *mut u64
-        };
-        assert!(!state.is_null());
-        let uffd = uffd_open();
-        Self {
-            backend,
-            space_base,
-            span,
-            arena_base: Address::from_mut_ptr(arena),
-            state,
-            uffd,
+        match backend {
+            CompactFaultsBackend::Bpf => {
+                let shim = bpf_shim::Shim::load();
+                let arena = shim.init(space_base, span);
+                assert!(!arena.is_zero(), "gcb0_init failed");
+                let state = shim.state();
+                Self {
+                    backend,
+                    space_base,
+                    span,
+                    arena_base: arena,
+                    state,
+                    uffd: -1,
+                    shim: Some(shim),
+                }
+            }
+            CompactFaultsBackend::Uffd => {
+                let arena = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        span,
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                        -1,
+                        0,
+                    )
+                };
+                assert!(arena != libc::MAP_FAILED, "uffd arena mmap failed");
+                let pages = span >> LOG_BYTES_IN_PAGE;
+                let state = unsafe {
+                    libc::calloc(pages, std::mem::size_of::<u64>()) as *mut u64
+                };
+                assert!(!state.is_null());
+                let uffd = uffd_open();
+                Self {
+                    backend,
+                    space_base,
+                    span,
+                    arena_base: Address::from_mut_ptr(arena),
+                    state,
+                    uffd,
+                    shim: None,
+                }
+            }
+            CompactFaultsBackend::None => unreachable!(),
         }
     }
 
@@ -114,18 +137,27 @@ impl CompactFaults {
     /// range for missing faults.
     pub fn flip(&self, start: Address, bytes: usize) {
         debug_assert!(start >= self.space_base && start + bytes <= self.space_base + self.span);
-        let dst = self.alias_of(start);
-        let r = unsafe {
-            libc::mremap(
-                start.to_mut_ptr::<libc::c_void>(),
-                bytes,
-                bytes,
-                libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED | MREMAP_DONTUNMAP,
-                dst.to_mut_ptr::<libc::c_void>(),
-            )
-        };
-        assert!(r != libc::MAP_FAILED, "uffd flip mremap failed");
-        uffd_register_missing(self.uffd, start, bytes);
+        match self.backend {
+            CompactFaultsBackend::Bpf => {
+                let r = self.shim.as_ref().unwrap().flip(start, bytes);
+                assert_eq!(r, 0, "gcb0_flip({}, {}) failed", start, bytes);
+            }
+            CompactFaultsBackend::Uffd => {
+                let dst = self.alias_of(start);
+                let r = unsafe {
+                    libc::mremap(
+                        start.to_mut_ptr::<libc::c_void>(),
+                        bytes,
+                        bytes,
+                        libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED | MREMAP_DONTUNMAP,
+                        dst.to_mut_ptr::<libc::c_void>(),
+                    )
+                };
+                assert!(r != libc::MAP_FAILED, "uffd flip mremap failed");
+                uffd_register_missing(self.uffd, start, bytes);
+            }
+            CompactFaultsBackend::None => unreachable!(),
+        }
     }
 
     /// Mark pages [start, start+bytes) as staged (arena holds final
@@ -140,18 +172,34 @@ impl CompactFaults {
         }
     }
 
-    /// Install staged pages now (B.0 STW mode) via UFFDIO_COPY.
+    /// Install staged pages now (B.0 STW mode): bpf touches each page (the
+    /// in-kernel handler copies from the arena); uffd UFFDIO_COPYs.
     pub fn install(&self, start: Address, bytes: usize) {
-        let mut a = start;
-        while a < start + bytes {
-            uffd_copy(self.uffd, a, self.alias_of(a), BYTES_IN_PAGE);
-            a = a + BYTES_IN_PAGE;
+        match self.backend {
+            CompactFaultsBackend::Bpf => {
+                let mut a = start;
+                while a < start + bytes {
+                    unsafe {
+                        std::ptr::read_volatile(a.to_ptr::<u8>());
+                    }
+                    a = a + BYTES_IN_PAGE;
+                }
+            }
+            CompactFaultsBackend::Uffd => {
+                let mut a = start;
+                while a < start + bytes {
+                    uffd_copy(self.uffd, a, self.alias_of(a), BYTES_IN_PAGE);
+                    a = a + BYTES_IN_PAGE;
+                }
+            }
+            CompactFaultsBackend::None => unreachable!(),
         }
     }
 
     /// Region finished installing (B.0): restore stock fault semantics.
     /// uffd must unregister — with UFFD_FEATURE_SIGBUS, touching an
     /// uninstalled (beyond-cursor) page would SIGBUS instead of zero-fill.
+    /// bpf needs nothing: state-0 pages zero-fill in the handler.
     pub fn finish_region(&self, start: Address, bytes: usize) {
         if self.backend == CompactFaultsBackend::Uffd {
             let mut range = UffdioRange {
@@ -256,5 +304,57 @@ fn uffd_copy(fd: i32, dst: Address, src: Address, bytes: usize) {
         let errno = unsafe { *libc::__errno_location() };
         // EEXIST: page already present (e.g. raced install) — fine.
         assert_eq!(errno, libc::EEXIST, "UFFDIO_COPY({}) failed: {}", dst, errno);
+    }
+}
+
+/* ---------------- bpf shim (dlopen) ---------------- */
+
+mod bpf_shim {
+    use super::*;
+    use std::ffi::CString;
+
+    type InitFn = unsafe extern "C" fn(u64, u64) -> u64;
+    type FlipFn = unsafe extern "C" fn(u64, u64) -> i32;
+    type StateFn = unsafe extern "C" fn() -> *mut u64;
+
+    pub(super) struct Shim {
+        init: InitFn,
+        flip: FlipFn,
+        state: StateFn,
+    }
+
+    impl Shim {
+        pub fn load() -> Self {
+            let path = std::env::var("MMTK_BPF_SHIM")
+                .unwrap_or_else(|_| "libgcbpf.so".to_string());
+            let cpath = CString::new(path.clone()).unwrap();
+            let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW) };
+            assert!(!handle.is_null(), "compact_faults: dlopen {} failed", path);
+            let sym = |name: &str| {
+                let cname = CString::new(name).unwrap();
+                let p = unsafe { libc::dlsym(handle, cname.as_ptr()) };
+                assert!(!p.is_null(), "shim: missing symbol {}", name);
+                p
+            };
+            unsafe {
+                Self {
+                    init: std::mem::transmute(sym("gcb0_init")),
+                    flip: std::mem::transmute(sym("gcb0_flip")),
+                    state: std::mem::transmute(sym("gcb0_state")),
+                }
+            }
+        }
+
+        pub fn init(&self, base: Address, span: usize) -> Address {
+            unsafe { Address::from_usize((self.init)(base.as_usize() as u64, span as u64) as usize) }
+        }
+
+        pub fn flip(&self, start: Address, bytes: usize) -> i32 {
+            unsafe { (self.flip)(start.as_usize() as u64, bytes as u64) }
+        }
+
+        pub fn state(&self) -> *mut u64 {
+            unsafe { (self.state)() }
+        }
     }
 }
